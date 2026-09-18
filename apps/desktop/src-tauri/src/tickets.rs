@@ -15,12 +15,15 @@ use crate::integration_secrets;
 
 const PROVIDERS: [&str; 3] = ["Linear", "Jira", "Asana"];
 const LINEAR_API: &str = "https://api.linear.app/graphql";
+const ASANA_API: &str = "https://app.asana.com/api/1.0";
 const DEFAULT_LIMIT: u32 = 20;
 const MAX_LIMIT: u32 = 50;
 /// An empty search is the picker opening. It needs a list long enough to be
 /// worth looking at, whatever limit the window asked for.
 const RECENT_LIMIT: u32 = 10;
 const JIRA_SITE: &str = "Enter a Jira Cloud site URL and account email.";
+const ASANA_WORKSPACE: &str = "Add your Asana workspace GID in settings.";
+const ASANA_FIELDS: &str = "gid,name,notes,permalink_url,completed,modified_at";
 
 /// One issue as Berdloop shows it, whether it came from a search or from
 /// reading a single reference.
@@ -43,6 +46,7 @@ struct Connection {
     token: String,
     jira_site: String,
     jira_email: String,
+    asana_workspace: String,
 }
 
 /// The one refusal the window has to be able to tell apart, so it can offer
@@ -71,6 +75,11 @@ fn connection(
         token,
         jira_site: settings.jira_site.unwrap_or_default().trim().to_string(),
         jira_email: settings.jira_email.unwrap_or_default().trim().to_string(),
+        asana_workspace: settings
+            .asana_workspace
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
     };
     // Jira cannot be reached by token alone, so a half-filled connection is
     // an unconnected one.
@@ -97,6 +106,12 @@ fn jira_host(site: &str, email: &str) -> Result<String, String> {
         return Err(JIRA_SITE.to_string());
     }
     Ok(host)
+}
+
+/// Jira Cloud takes an API token as the password of a basic-auth pair.
+fn jira_auth(email: &str, token: &str) -> String {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{email}:{token}"));
+    format!("Basic {encoded}")
 }
 
 fn client() -> Result<reqwest::Client, String> {
@@ -199,12 +214,11 @@ pub async fn fetch_external_issue(
         }
         "Jira" => {
             let host = jira_host(&connection.jira_site, &connection.jira_email)?;
-            let auth = base64::engine::general_purpose::STANDARD
-                .encode(format!("{}:{token}", connection.jira_email));
+            let auth = jira_auth(&connection.jira_email, token);
             jira_site_host = host.clone();
             client
                 .get(format!("https://{host}/rest/api/3/issue/{reference}"))
-                .header("Authorization", format!("Basic {auth}"))
+                .header("Authorization", auth)
                 .query(&[("fields", "summary,description,status,updated")])
                 .send()
                 .await
@@ -341,6 +355,235 @@ async fn search_linear(token: &str, query: &str, first: u32) -> Result<Vec<Exter
     parse_linear_search(&body)
 }
 
+const JIRA_FIELDS: &str = "summary,description,status,updated";
+
+/// JQL carries the search term inside a quoted string, so a quote or a
+/// backslash in what a person typed could end that string and let them write
+/// the rest of the query. Both are escaped the way JQL asks, the backslash
+/// first so an escape is never escaped twice.
+fn jira_escape(query: &str) -> String {
+    query.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// `key = "..."` is an error in JQL unless the term really is an issue key,
+/// so the exact-key half of the search is only asked for when it could match.
+fn looks_like_issue_key(query: &str) -> bool {
+    match query.split_once('-') {
+        Some((project, number)) => {
+            project.chars().any(|c| c.is_ascii_alphabetic())
+                && project
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && !number.is_empty()
+                && number.chars().all(|c| c.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
+fn jira_jql(query: &str) -> String {
+    if query.is_empty() {
+        return "order by created DESC".to_string();
+    }
+    let term = jira_escape(query);
+    if looks_like_issue_key(query) {
+        format!("(key = \"{term}\" OR text ~ \"{term}\") order by created DESC")
+    } else {
+        format!("text ~ \"{term}\" order by created DESC")
+    }
+}
+
+fn jira_issue(issue: &Value, host: &str) -> Option<ExternalIssue> {
+    let key = optional_string(issue, "key")?;
+    let fields = &issue["fields"];
+    Some(ExternalIssue {
+        provider: "Jira".to_string(),
+        id: optional_string(issue, "id")?,
+        url: format!("https://{host}/browse/{key}"),
+        key,
+        title: optional_string(fields, "summary")?,
+        description: plain_text(&fields["description"]),
+        status: fields["status"]["name"].as_str().unwrap_or("").to_string(),
+        updated_at: fields["updated"].as_str().unwrap_or("").to_string(),
+    })
+}
+
+/// Jira answers a search and a recent list the same way, under `issues`. An
+/// issue the provider left incomplete is skipped rather than failing the
+/// list, as with Linear.
+fn parse_jira_search(body: &Value, host: &str) -> Result<Vec<ExternalIssue>, String> {
+    if body["errorMessages"]
+        .as_array()
+        .is_some_and(|messages| !messages.is_empty())
+    {
+        return Err("Jira could not run this search.".to_string());
+    }
+    let issues = body["issues"]
+        .as_array()
+        .ok_or("Provider response is missing issues.")?;
+    Ok(issues
+        .iter()
+        .filter_map(|issue| jira_issue(issue, host))
+        .collect())
+}
+
+async fn search_jira(
+    connection: &Connection,
+    query: &str,
+    first: u32,
+) -> Result<Vec<ExternalIssue>, String> {
+    let host = jira_host(&connection.jira_site, &connection.jira_email)?;
+    let max_results = first.to_string();
+    let response = client()?
+        .get(format!("https://{host}/rest/api/3/search"))
+        .header(
+            "Authorization",
+            jira_auth(&connection.jira_email, &connection.token),
+        )
+        .query(&[
+            ("jql", jira_jql(query).as_str()),
+            ("maxResults", max_results.as_str()),
+            ("fields", JIRA_FIELDS),
+        ])
+        .send()
+        .await
+        .map_err(|_| "Could not reach the task provider.".to_string())?;
+    if !response.status().is_success() {
+        return Err(http_error(response.status()));
+    }
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|_| "Provider returned invalid JSON.".to_string())?;
+    parse_jira_search(&body, &host)
+}
+
+fn asana_task(task: &Value) -> Option<ExternalIssue> {
+    let gid = optional_string(task, "gid")?;
+    Some(ExternalIssue {
+        provider: "Asana".to_string(),
+        id: gid.clone(),
+        key: gid,
+        url: optional_string(task, "permalink_url")?,
+        title: optional_string(task, "name")?,
+        description: task["notes"].as_str().unwrap_or("").to_string(),
+        status: if task["completed"].as_bool().unwrap_or(false) {
+            "Complete"
+        } else {
+            "Open"
+        }
+        .to_string(),
+        updated_at: task["modified_at"].as_str().unwrap_or("").to_string(),
+    })
+}
+
+/// Asana answers both the task list and the search under `data`, in an order
+/// of its own, so newest first is settled here on the time it reports.
+fn parse_asana_search(body: &Value) -> Result<Vec<ExternalIssue>, String> {
+    if body["errors"]
+        .as_array()
+        .is_some_and(|errors| !errors.is_empty())
+    {
+        return Err("Asana could not run this search.".to_string());
+    }
+    let data = body["data"]
+        .as_array()
+        .ok_or("Provider response is missing data.")?;
+    let mut tasks: Vec<ExternalIssue> = data.iter().filter_map(asana_task).collect();
+    tasks.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    Ok(tasks)
+}
+
+/// Searching Asana needs a paid plan. Rather than show a person a failure
+/// they cannot act on, the recent list they can already see is filtered here,
+/// on the two things they would type: the task name and its GID.
+fn asana_filter(tasks: Vec<ExternalIssue>, query: &str, first: u32) -> Vec<ExternalIssue> {
+    let needle = query.to_lowercase();
+    tasks
+        .into_iter()
+        .filter(|task| {
+            task.title.to_lowercase().contains(&needle) || task.key.to_lowercase().contains(&needle)
+        })
+        .take(first as usize)
+        .collect()
+}
+
+async fn asana_json(request: reqwest::RequestBuilder) -> Result<Value, String> {
+    let response = request
+        .send()
+        .await
+        .map_err(|_| "Could not reach the task provider.".to_string())?;
+    if !response.status().is_success() {
+        return Err(http_error(response.status()));
+    }
+    response
+        .json()
+        .await
+        .map_err(|_| "Provider returned invalid JSON.".to_string())
+}
+
+/// Asana only lists tasks for a workspace together with an assignee, so the
+/// recent list is the signed-in person's own tasks in that workspace.
+async fn asana_recent(
+    connection: &Connection,
+    workspace: &str,
+    first: u32,
+) -> Result<Vec<ExternalIssue>, String> {
+    let limit = first.to_string();
+    let body = asana_json(
+        client()?
+            .get(format!("{ASANA_API}/tasks"))
+            .bearer_auth(&connection.token)
+            .query(&[
+                ("workspace", workspace),
+                ("assignee", "me"),
+                ("opt_fields", ASANA_FIELDS),
+                ("limit", limit.as_str()),
+            ]),
+    )
+    .await?;
+    parse_asana_search(&body)
+}
+
+async fn search_asana(
+    connection: &Connection,
+    query: &str,
+    first: u32,
+) -> Result<Vec<ExternalIssue>, String> {
+    let workspace = connection.asana_workspace.as_str();
+    if workspace.is_empty() || !workspace.chars().all(|c| c.is_ascii_digit()) {
+        return Err(ASANA_WORKSPACE.to_string());
+    }
+    if query.is_empty() {
+        return asana_recent(connection, workspace, first).await;
+    }
+    let limit = first.to_string();
+    let searched = asana_json(
+        client()?
+            .get(format!("{ASANA_API}/workspaces/{workspace}/tasks/search"))
+            .bearer_auth(&connection.token)
+            .query(&[
+                ("text", query),
+                ("opt_fields", ASANA_FIELDS),
+                ("sort_by", "modified_at"),
+                ("limit", limit.as_str()),
+            ]),
+    )
+    .await
+    .and_then(|body| parse_asana_search(&body));
+    match searched {
+        Ok(tasks) => Ok(tasks),
+        // The search endpoint answers 402 or 403 on a plan without it. That
+        // is a limit of the plan, not a failure of the search, so the recent
+        // list is filtered here instead and nothing is reported.
+        Err(_) => Ok(asana_filter(
+            asana_recent(connection, workspace, first).await?,
+            query,
+            first,
+        )),
+    }
+}
+
 #[tauri::command]
 pub async fn search_external_issues(
     app: tauri::AppHandle,
@@ -364,9 +607,8 @@ pub async fn search_external_issues(
     let connection = connection(&app, &organization_id, &project_id, &provider)?;
     match provider.as_str() {
         "Linear" => search_linear(&connection.token, &query, first).await,
-        // STUB: Jira and Asana search land in a follow-up task. Reading one
-        // issue by reference already works for both.
-        "Jira" | "Asana" => Err("Search is not available for this provider yet.".to_string()),
+        "Jira" => search_jira(&connection, &query, first).await,
+        "Asana" => search_asana(&connection, &query, first).await,
         _ => unreachable!(),
     }
 }
@@ -467,6 +709,152 @@ mod tests {
         let failed = json!({ "errors": [{ "message": "Authentication required" }] });
         assert!(parse_linear_search(&failed).is_err());
         assert!(parse_linear_search(&json!({ "data": {} })).is_err());
+    }
+
+    #[test]
+    fn a_jira_search_response_becomes_issues() {
+        let body = json!({
+            "issues": [
+                {
+                    "id": "10042",
+                    "key": "BRD-128",
+                    "fields": {
+                        "summary": "Searchable ticket import",
+                        "description": {
+                            "type": "doc",
+                            "content": [{ "type": "paragraph", "content": [
+                                { "type": "text", "text": "Hand the picked ticket to the agent." }
+                            ] }]
+                        },
+                        "status": { "name": "In Progress" },
+                        "updated": "2026-09-17T10:04:00.000+0000"
+                    }
+                },
+                {
+                    "id": "10043",
+                    "key": "BRD-129",
+                    "fields": { "summary": "Second issue" }
+                },
+                { "id": "10044", "fields": { "summary": "No key, so skipped" } }
+            ]
+        });
+        let issues = parse_jira_search(&body, "team.atlassian.net").unwrap();
+        assert_eq!(issues.len(), 2);
+        assert_eq!(
+            issues[0],
+            ExternalIssue {
+                provider: "Jira".to_string(),
+                id: "10042".to_string(),
+                key: "BRD-128".to_string(),
+                url: "https://team.atlassian.net/browse/BRD-128".to_string(),
+                title: "Searchable ticket import".to_string(),
+                description: "Hand the picked ticket to the agent.".to_string(),
+                status: "In Progress".to_string(),
+                updated_at: "2026-09-17T10:04:00.000+0000".to_string(),
+            }
+        );
+        assert_eq!(issues[1].url, "https://team.atlassian.net/browse/BRD-129");
+        assert_eq!(issues[1].status, "");
+        assert_eq!(issues[1].updated_at, "");
+        assert!(parse_jira_search(
+            &json!({ "errorMessages": ["Bad JQL"] }),
+            "team.atlassian.net"
+        )
+        .is_err());
+        assert!(parse_jira_search(&json!({}), "team.atlassian.net").is_err());
+    }
+
+    #[test]
+    fn a_search_term_cannot_break_out_of_the_jql_string() {
+        assert_eq!(jira_jql(""), "order by created DESC");
+        assert_eq!(
+            jira_jql("import"),
+            "text ~ \"import\" order by created DESC"
+        );
+        assert_eq!(
+            jira_jql("BRD-128"),
+            "(key = \"BRD-128\" OR text ~ \"BRD-128\") order by created DESC"
+        );
+        // A quote is escaped, not passed on, so the term stays one string.
+        assert_eq!(
+            jira_jql("a\" OR key = \"BRD-1"),
+            "text ~ \"a\\\" OR key = \\\"BRD-1\" order by created DESC"
+        );
+        assert_eq!(
+            jira_jql("back\\slash"),
+            "text ~ \"back\\\\slash\" order by created DESC"
+        );
+        // Anything that is not an issue key never asks Jira for a key match,
+        // which Jira would refuse as an invalid key.
+        assert!(!looks_like_issue_key("plain words"));
+        assert!(!looks_like_issue_key("BRD-"));
+        assert!(!looks_like_issue_key("12-34"));
+        assert!(looks_like_issue_key("BRD-128"));
+    }
+
+    fn asana_response() -> Value {
+        json!({ "data": [
+            {
+                "gid": "1209",
+                "name": "Second task",
+                "notes": "",
+                "permalink_url": "https://app.asana.com/0/1/1209",
+                "completed": true,
+                "modified_at": "2026-09-16T08:00:00.000Z"
+            },
+            {
+                "gid": "1208",
+                "name": "Searchable ticket import",
+                "notes": "Hand the picked ticket to the agent.",
+                "permalink_url": "https://app.asana.com/0/1/1208",
+                "completed": false,
+                "modified_at": "2026-09-17T10:04:00.000Z"
+            },
+            { "gid": "1210", "name": "No permalink, so skipped" }
+        ] })
+    }
+
+    #[test]
+    fn an_asana_response_becomes_issues_newest_first() {
+        let issues = parse_asana_search(&asana_response()).unwrap();
+        assert_eq!(issues.len(), 2);
+        assert_eq!(
+            issues[0],
+            ExternalIssue {
+                provider: "Asana".to_string(),
+                id: "1208".to_string(),
+                key: "1208".to_string(),
+                url: "https://app.asana.com/0/1/1208".to_string(),
+                title: "Searchable ticket import".to_string(),
+                description: "Hand the picked ticket to the agent.".to_string(),
+                status: "Open".to_string(),
+                updated_at: "2026-09-17T10:04:00.000Z".to_string(),
+            }
+        );
+        assert_eq!(issues[1].key, "1209");
+        assert_eq!(issues[1].status, "Complete");
+        assert!(
+            parse_asana_search(&json!({ "errors": [{ "message": "Not Authorized" }] })).is_err()
+        );
+        assert!(parse_asana_search(&json!({})).is_err());
+    }
+
+    #[test]
+    fn the_asana_fallback_filters_the_recent_list_without_regard_to_case() {
+        let recent = parse_asana_search(&asana_response()).unwrap();
+        let matched = asana_filter(recent.clone(), "SEARCHABLE", 20);
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].key, "1208");
+        // A GID matches too, and everything else is dropped.
+        assert_eq!(asana_filter(recent.clone(), "1209", 20).len(), 1);
+        assert!(asana_filter(recent.clone(), "nothing here", 20).is_empty());
+        // The limit the window asked for still holds.
+        assert_eq!(asana_filter(recent, "task", 1).len(), 1);
+    }
+
+    #[test]
+    fn a_missing_asana_workspace_says_what_to_fill_in() {
+        assert_eq!(ASANA_WORKSPACE, "Add your Asana workspace GID in settings.");
     }
 
     #[test]
