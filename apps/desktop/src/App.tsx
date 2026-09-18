@@ -62,7 +62,7 @@ import {
   type RolePreference,
 } from "./agent-preferences";
 import {
-  needsConnection,
+  settingsFix,
   recentFirst,
   searchDebounceMs,
   searchSequence,
@@ -404,7 +404,7 @@ function TicketPicker({
     }
   }
 
-  const connect = needsConnection(error, provider);
+  const fixInSettings = settingsFix(error);
   return (
     <div className="ticket-picker" onKeyDown={onKeyDown}>
       <TextInput
@@ -420,9 +420,9 @@ function TicketPicker({
         <p className="ticket-picker-note">
           <Loader size="xs" /> Asking {provider}…
         </p>
-      ) : connect ? (
+      ) : fixInSettings ? (
         <div className="ticket-picker-note">
-          <p>{error}</p>
+          <p>{fixInSettings}</p>
           <Button size="xs" variant="subtle" onClick={onOpenSettings}>
             Open settings
           </Button>

@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { ExternalIssue } from "@berdloop/core";
 import {
-  needsConnection,
+  settingsFix,
   recentFirst,
   searchSequence,
   ticketAgentPrompt,
@@ -82,17 +82,30 @@ describe("updated label", () => {
   });
 });
 
-describe("needs connection", () => {
-  test("the host's refusal is told apart from any other failure", () => {
-    expect(needsConnection("Connect Linear in settings first.", "Linear")).toBe(
-      true,
+describe("settings fix", () => {
+  test("an unconnected provider is offered settings, and reads without the mark", () => {
+    expect(settingsFix("Settings: Connect Linear in settings first.")).toBe(
+      "Connect Linear in settings first.",
     );
-    expect(needsConnection("Connect Jira in settings first.", "Linear")).toBe(
-      false,
+    expect(settingsFix("Settings: Connect Jira in settings first.")).toBe(
+      "Connect Jira in settings first.",
     );
-    expect(needsConnection("Provider returned HTTP 401.", "Linear")).toBe(
-      false,
-    );
+  });
+
+  test("a missing Asana workspace is offered settings too", () => {
+    expect(
+      settingsFix("Settings: Add your Asana workspace GID in settings."),
+    ).toBe("Add your Asana workspace GID in settings.");
+    expect(
+      settingsFix("Settings: Enter a Jira Cloud site URL and account email."),
+    ).toBe("Enter a Jira Cloud site URL and account email.");
+  });
+
+  test("a failure settings cannot fix is left as a failure", () => {
+    expect(settingsFix("Provider returned HTTP 401.")).toBe("");
+    // The wording alone is not the mark: only the host may say a refusal is
+    // one settings can fix.
+    expect(settingsFix("Connect Linear in settings first.")).toBe("");
   });
 });
 

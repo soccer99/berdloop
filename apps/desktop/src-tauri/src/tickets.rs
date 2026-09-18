@@ -55,10 +55,21 @@ struct Connection {
     asana_workspace: String,
 }
 
-/// The one refusal the window has to be able to tell apart, so it can offer
-/// to open settings instead of showing a failure.
+/// The mark on every refusal a person fixes in settings rather than by
+/// trying again. The window matches the mark, not the sentence, so a new
+/// refusal of this kind is offered the same way out without the window
+/// having to learn its wording.
+const SETTINGS_PREFIX: &str = "Settings: ";
+
+/// Mark a refusal as one settings can fix. The sentence is still readable on
+/// its own, so anywhere that does not know the mark loses nothing.
+fn settings_fix(message: &str) -> String {
+    format!("{SETTINGS_PREFIX}{message}")
+}
+
+/// The commonest of those refusals: nobody has saved a connection yet.
 fn not_connected(provider: &str) -> String {
-    format!("Connect {provider} in settings first.")
+    settings_fix(&format!("Connect {provider} in settings first."))
 }
 
 fn connection(
@@ -99,7 +110,7 @@ fn connection(
 /// it: HTTPS, an Atlassian Cloud site, and nothing smuggled into the URL.
 fn jira_host(site: &str, email: &str) -> Result<String, String> {
     let url = reqwest::Url::parse(site)
-        .map_err(|_| "Enter the full HTTPS Jira Cloud site URL.".to_string())?;
+        .map_err(|_| settings_fix("Enter the full HTTPS Jira Cloud site URL."))?;
     let host = url.host_str().unwrap_or("").to_string();
     if url.scheme() != "https"
         || !host.ends_with(".atlassian.net")
@@ -109,7 +120,7 @@ fn jira_host(site: &str, email: &str) -> Result<String, String> {
         || !url.username().is_empty()
         || email.is_empty()
     {
-        return Err(JIRA_SITE.to_string());
+        return Err(settings_fix(JIRA_SITE));
     }
     Ok(host)
 }
@@ -585,7 +596,7 @@ async fn search_asana(
 ) -> Result<Vec<ExternalIssue>, String> {
     let workspace = connection.asana_workspace.as_str();
     if workspace.is_empty() || !workspace.chars().all(|c| c.is_ascii_digit()) {
-        return Err(ASANA_WORKSPACE.to_string());
+        return Err(settings_fix(ASANA_WORKSPACE));
     }
     if query.is_empty() {
         return Ok(asana_newest(
@@ -948,8 +959,42 @@ mod tests {
 
     #[test]
     fn an_unconnected_provider_is_told_apart_from_any_other_failure() {
-        assert_eq!(not_connected("Linear"), "Connect Linear in settings first.");
-        assert_eq!(not_connected("Jira"), "Connect Jira in settings first.");
+        assert_eq!(
+            not_connected("Linear"),
+            "Settings: Connect Linear in settings first."
+        );
+        assert_eq!(
+            not_connected("Jira"),
+            "Settings: Connect Jira in settings first."
+        );
+    }
+
+    #[test]
+    fn every_refusal_settings_can_fix_carries_the_same_mark() {
+        // Each of these is a person filling something in, not a failure to
+        // retry, so each is marked and the window offers settings for all of
+        // them rather than for the connection one alone.
+        for marked in [
+            not_connected("Asana"),
+            settings_fix(JIRA_SITE),
+            settings_fix(ASANA_WORKSPACE),
+        ] {
+            assert!(marked.starts_with(SETTINGS_PREFIX), "{marked}");
+        }
+        // The sentence survives the mark, so anywhere that does not strip it
+        // still reads.
+        assert!(settings_fix(ASANA_WORKSPACE).ends_with(ASANA_WORKSPACE));
+    }
+
+    #[test]
+    fn a_jira_site_a_person_typed_is_sent_back_to_settings() {
+        for refused in [
+            jira_host("http://team.atlassian.net", "person@example.com"),
+            jira_host("not a url", "person@example.com"),
+            jira_host("https://team.atlassian.net", ""),
+        ] {
+            assert!(refused.unwrap_err().starts_with(SETTINGS_PREFIX));
+        }
     }
 
     #[test]

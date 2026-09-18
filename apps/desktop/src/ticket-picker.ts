@@ -2,7 +2,7 @@
 // read and tested on their own. Everything here is about one question: which
 // answer from the provider is the one a person is still waiting for.
 
-import type { ExternalIssue, ExternalProvider } from "@berdloop/core";
+import type { ExternalIssue } from "@berdloop/core";
 
 /** How long typing rests before the provider is asked again. */
 export const searchDebounceMs = 250;
@@ -64,16 +64,24 @@ export function updatedLabel(issue: ExternalIssue): string {
   });
 }
 
+/** The mark the host puts on a refusal a person fixes in settings. */
+const settingsPrefix = "Settings: ";
+
 /**
- * The one refusal the picker answers with a way out rather than a failure:
- * nobody has saved a connection for this provider yet. The host writes it
- * word for word, so the picker matches it word for word.
+ * The refusals the picker answers with a way out rather than a failure: the
+ * provider is unconnected, the Jira site is unusable, the Asana workspace is
+ * missing. None of them is retryable and all of them are one visit to
+ * settings away from fixed.
+ *
+ * The picker reads the host's mark rather than any one sentence, so a
+ * refusal of this kind the picker has never seen is still offered the way
+ * out. The answer is the sentence to show, without the mark, and empty when
+ * the failure is not one settings can fix.
  */
-export function needsConnection(
-  error: string,
-  provider: ExternalProvider,
-): boolean {
-  return error.trim() === `Connect ${provider} in settings first.`;
+export function settingsFix(error: string): string {
+  const text = error.trim();
+  if (!text.startsWith(settingsPrefix)) return "";
+  return text.slice(settingsPrefix.length).trim();
 }
 
 /**
