@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import {
+  Badge,
   Button,
   Modal,
   MultiSelect,
@@ -44,8 +45,11 @@ import type { WorkspaceView } from "./layout/types";
 import {
   agentRoles,
   emptyAgentPreferences,
+  patchIntegration,
   type AgentPreferences,
   type AgentRoleSetting,
+  type IntegrationScope,
+  type IntegrationSettings,
   type RolePreference,
 } from "./agent-preferences";
 
@@ -82,6 +86,225 @@ const emptyDraft: Draft = {
   ticket: "",
   criteria: "",
 };
+
+const ticketProviders: ExternalProvider[] = ["Linear", "Jira", "Asana"];
+
+interface ConnectionField {
+  name: string;
+  label: string;
+  placeholder: string;
+  read: (settings: IntegrationSettings | undefined) => string;
+  write: (value: string) => Partial<IntegrationSettings>;
+}
+
+// What a provider needs besides its token. The token is deliberately missing:
+// it never travels through the preferences, and it is never read back.
+const connectionFields: Record<ExternalProvider, ConnectionField[]> = {
+  Linear: [],
+  Jira: [
+    {
+      name: "site",
+      label: "Jira Cloud site",
+      placeholder: "https://your-team.atlassian.net",
+      read: (settings) => settings?.jiraSite ?? "",
+      write: (value) => ({ jiraSite: value }),
+    },
+    {
+      name: "email",
+      label: "Atlassian account email",
+      placeholder: "you@your-team.com",
+      read: (settings) => settings?.jiraEmail ?? "",
+      write: (value) => ({ jiraEmail: value }),
+    },
+  ],
+  Asana: [
+    {
+      name: "workspace",
+      label: "Asana workspace GID",
+      placeholder: "1200123456789",
+      read: (settings) => settings?.asanaWorkspace ?? "",
+      write: (value) => ({ asanaWorkspace: value }),
+    },
+  ],
+};
+
+const tokenLabels: Record<ExternalProvider, string> = {
+  Linear: "Linear API token",
+  Jira: "Atlassian API token",
+  Asana: "Asana API token",
+};
+
+// One provider's connection at one scope. Everything except the token is a
+// preference; the token goes straight to the host, which only ever tells us
+// whether one is there.
+function ProviderConnection({
+  provider,
+  scope,
+  scopeId,
+  settings,
+  inherited,
+  inheritedFrom,
+  onPatch,
+  onConnected,
+  onUseOrganization,
+}: {
+  provider: ExternalProvider;
+  scope: IntegrationScope;
+  scopeId: string;
+  settings: IntegrationSettings | undefined;
+  inherited: IntegrationSettings | undefined;
+  inheritedFrom: string;
+  onPatch: (patch: Partial<IntegrationSettings>) => void;
+  onConnected: (connected: boolean) => void;
+  onUseOrganization: (() => Promise<void>) | null;
+}) {
+  const [token, setToken] = useState("");
+  const [editing, setEditing] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const connected = settings?.connected ?? false;
+
+  async function run(work: () => Promise<void>) {
+    setBusy(true);
+    try {
+      await work();
+      setError("");
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function saveToken() {
+    return run(async () => {
+      if (!isTauri())
+        throw new Error("Saving a token needs the Berdloop desktop app.");
+      await invoke("save_integration_secret", {
+        scope,
+        scopeId,
+        provider,
+        token,
+      });
+      onConnected(true);
+      setToken("");
+      setEditing(false);
+    });
+  }
+
+  function disconnect() {
+    return run(async () => {
+      if (!isTauri())
+        throw new Error("Clearing a token needs the Berdloop desktop app.");
+      await invoke("clear_integration_secret", { scope, scopeId, provider });
+      onConnected(false);
+      setToken("");
+      setEditing(false);
+    });
+  }
+
+  return (
+    <div className="provider-connection">
+      <div className="provider-connection-heading">
+        <h3>{provider}</h3>
+        <Badge variant="light" color={connected ? "lime" : "gray"}>
+          {connected ? "Connected" : "Not connected"}
+        </Badge>
+      </div>
+      {!connected && inherited?.connected && (
+        <p className="provider-connection-note">
+          Using the token from {inheritedFrom}.
+        </p>
+      )}
+      {connectionFields[provider].map((field) => {
+        const value = field.read(settings);
+        const inheritedValue = field.read(inherited);
+        return (
+          <TextInput
+            key={field.name}
+            mt="sm"
+            label={field.label}
+            placeholder={inheritedValue || field.placeholder}
+            description={
+              !value && inheritedValue
+                ? `Inherited from ${inheritedFrom}`
+                : undefined
+            }
+            value={value}
+            onChange={(event) =>
+              onPatch(field.write(event.currentTarget.value))
+            }
+          />
+        );
+      })}
+      {editing ? (
+        <>
+          <TextInput
+            mt="sm"
+            type="password"
+            autoComplete="off"
+            label={tokenLabels[provider]}
+            description="Kept in a file only your account can read, and never shown again."
+            value={token}
+            onChange={(event) => setToken(event.currentTarget.value)}
+          />
+          <div className="provider-connection-actions">
+            <Button
+              size="xs"
+              loading={busy}
+              disabled={!token.trim()}
+              onClick={() => void saveToken()}
+            >
+              Save token
+            </Button>
+            <Button
+              size="xs"
+              variant="subtle"
+              onClick={() => {
+                setEditing(false);
+                setToken("");
+              }}
+            >
+              Cancel
+            </Button>
+          </div>
+        </>
+      ) : (
+        <div className="provider-connection-actions">
+          <Button size="xs" variant="subtle" onClick={() => setEditing(true)}>
+            {connected ? "Replace token" : "Add token"}
+          </Button>
+          {connected && (
+            <Button
+              size="xs"
+              variant="subtle"
+              color="red"
+              loading={busy}
+              onClick={() => void disconnect()}
+            >
+              Disconnect
+            </Button>
+          )}
+          {onUseOrganization && (
+            <Button
+              size="xs"
+              variant="subtle"
+              loading={busy}
+              onClick={() => void run(onUseOrganization)}
+            >
+              Use organization connection
+            </Button>
+          )}
+        </div>
+      )}
+      {error && (
+        <p className="task-error" role="alert">
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}
 
 export default function App() {
   const [accessMode, setAccessMode] = useLocalStorage<"local" | null>({
@@ -290,6 +513,60 @@ export default function App() {
       if (sources === null) delete next[id];
       else next[id] = sources;
       return { ...current, ticketSources: { ...settings, [scope]: next } };
+    });
+  }
+  const integrationSettings =
+    agentPreferences.integrations ?? emptyAgentPreferences.integrations;
+  // Connections are edited at whichever scope the settings screen is showing.
+  const connectionScope: IntegrationScope = sourceSettingsProjectId
+    ? "projects"
+    : "organizations";
+  const connectionScopeId = sourceSettingsProjectId || (organization?.id ?? "");
+  function connectionAt(
+    scope: IntegrationScope,
+    scopeId: string,
+    provider: ExternalProvider,
+  ): IntegrationSettings | undefined {
+    return integrationSettings[scope][scopeId]?.[provider];
+  }
+  function setConnection(
+    provider: ExternalProvider,
+    patch: Partial<IntegrationSettings>,
+  ) {
+    if (!connectionScopeId) return;
+    setAgentPreferences((current) =>
+      patchIntegration(
+        current,
+        connectionScope,
+        connectionScopeId,
+        provider,
+        patch,
+      ),
+    );
+  }
+  // Drop a project's own connection so the organization's applies again. Its
+  // token goes with it, or the host would keep a secret nothing points at.
+  async function useOrganizationConnection(provider: ExternalProvider) {
+    const scopeId = sourceSettingsProjectId;
+    if (!scopeId) return;
+    if (connectionAt("projects", scopeId, provider)?.connected && isTauri())
+      await invoke("clear_integration_secret", {
+        scope: "projects",
+        scopeId,
+        provider,
+      });
+    setAgentPreferences((current) => {
+      const integrations =
+        current.integrations ?? emptyAgentPreferences.integrations;
+      const providers = { ...integrations.projects[scopeId] };
+      delete providers[provider];
+      return {
+        ...current,
+        integrations: {
+          ...integrations,
+          projects: { ...integrations.projects, [scopeId]: providers },
+        },
+      };
     });
   }
   const organizationProjectIds = new Set(
@@ -744,12 +1021,12 @@ export default function App() {
               <p className="app-eyebrow">TICKET SOURCES</p>
               <h2>Import buttons</h2>
               <p>
-                Only selected sources appear above the ticket queue. Credentials
-                are entered during import.
+                Only selected sources appear above the ticket queue. Each source
+                searches with the connection set below.
               </p>
               <MultiSelect
                 label="Visible sources"
-                data={["Linear", "Jira", "Asana"]}
+                data={ticketProviders}
                 value={visibleSettingsSources}
                 onChange={(value) => {
                   if (sourceSettingsProjectId)
@@ -783,6 +1060,55 @@ export default function App() {
                     Use organization sources
                   </Button>
                 )}
+              {connectionScopeId && (
+                <>
+                  <h2>Connections</h2>
+                  <p>
+                    {sourceSettingsProjectId
+                      ? `Anything left blank falls back to ${organization?.name ?? "the organization"}.`
+                      : "Every project in this organization uses these unless it sets its own."}
+                  </p>
+                  <div className="provider-connections">
+                    {ticketProviders.map((provider) => (
+                      <ProviderConnection
+                        key={provider}
+                        provider={provider}
+                        scope={connectionScope}
+                        scopeId={connectionScopeId}
+                        settings={connectionAt(
+                          connectionScope,
+                          connectionScopeId,
+                          provider,
+                        )}
+                        inherited={
+                          sourceSettingsProjectId
+                            ? connectionAt(
+                                "organizations",
+                                organization?.id ?? "",
+                                provider,
+                              )
+                            : undefined
+                        }
+                        inheritedFrom={organization?.name ?? "the organization"}
+                        onPatch={(patch) => setConnection(provider, patch)}
+                        onConnected={(connected) =>
+                          setConnection(provider, { connected })
+                        }
+                        onUseOrganization={
+                          sourceSettingsProjectId &&
+                          connectionAt(
+                            "projects",
+                            sourceSettingsProjectId,
+                            provider,
+                          )
+                            ? () => useOrganizationConnection(provider)
+                            : null
+                        }
+                      />
+                    ))}
+                  </div>
+                </>
+              )}
             </section>
             <div className="agent-preferences-grid">
               {agentRoles.map(({ id, label }) => {

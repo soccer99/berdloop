@@ -258,6 +258,40 @@ button {
   margin: 0 0 20px;
   font-size: 12px;
 }
+.provider-connections {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 16px;
+  margin-bottom: 4px;
+}
+.provider-connection {
+  border: 1px solid #2c3928;
+  border-radius: 8px;
+  padding: 12px 14px 14px;
+}
+.provider-connection-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.provider-connection-heading h3 {
+  font-size: 14px;
+  font-weight: 500;
+  margin: 0;
+}
+.provider-connection-note {
+  color: #91a486;
+  font-size: 12px;
+  margin: 8px 0 0;
+}
+.provider-connection-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
 .agent-preferences-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
