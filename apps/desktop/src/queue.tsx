@@ -509,11 +509,13 @@ export function QueueView({
   onPrepareAgent,
   beta = false,
 }: QueueProps) {
+  /** What the view is scoped to: one project, or a whole organization. */
+  const projectScope = projectId || `organization:${organizationId}`;
   const [selectedTaskId, setSelectedTaskId] = useState("");
   const dragging = useRef<{ kind: "ticket" | "task"; id: string } | null>(null);
   const threadPanel = useRef<HTMLElement>(null);
   const [step, setStep] = useState("work");
-  const [search, setSearch] = useState("");
+  const [search, setSearch] = useDraft(`ticket-search:${projectScope}`);
   const [notice, setNotice] = useState("");
   const [quote, setQuote] = useState<{ id: number; text: string }>();
   const [editTicket, setEditTicket] = useState(false);
@@ -554,7 +556,7 @@ export function QueueView({
         .map((item) => item.id))
     : [];
   const connected = !!runtime?.connected;
-  const ticketAgentKey = `ticket-agent:${projectId || `organization:${organizationId}`}`;
+  const ticketAgentKey = `ticket-agent:${projectScope}`;
   const plannerKey = `planner:${ticket?.id ?? ""}`;
   const visibleTickets = tickets.filter((item) =>
     `${item.title} ${item.ticket}`.toLowerCase().includes(search.toLowerCase()),
@@ -1747,8 +1749,18 @@ function TicketEditor({
   onClose: () => void;
   onSave: (title: string, criteria: string) => void;
 }) {
-  const [title, setTitle] = useState(ticket.title);
-  const [criteria, setCriteria] = useState(ticket.criteria);
+  // Each seed doubles as its own base, so a draft is kept until the field it
+  // was taken from moves: the ticket agent can rewrite requirements through
+  // ticket_requirements while this modal sits closed, and a draft written
+  // against the old wording would be answering a question nobody asked.
+  const [title, setTitle, clearTitle] = useDraft(
+    `ticket-editor:${ticket.id}:title`,
+    { seed: ticket.title },
+  );
+  const [criteria, setCriteria, clearCriteria] = useDraft(
+    `ticket-editor:${ticket.id}:criteria`,
+    { seed: ticket.criteria },
+  );
   return (
     <Modal
       opened={opened}
@@ -1761,6 +1773,8 @@ function TicketEditor({
         onSubmit={(event) => {
           event.preventDefault();
           onSave(title.trim(), criteria.trim());
+          clearTitle();
+          clearCriteria();
         }}
       >
         <TextInput
@@ -1789,6 +1803,27 @@ function TicketEditor({
     </Modal>
   );
 }
+/**
+ * A draft holds text, so the dependency multi-select travels as JSON. An empty
+ * list has to survive too, which is why it is `[]` and not the empty string:
+ * blank text is never stored, so clearing every dependency would otherwise read
+ * back as the saved list.
+ */
+function packIds(ids: string[]) {
+  return JSON.stringify(ids);
+}
+
+function unpackIds(value: string): string[] {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return Array.isArray(parsed)
+      ? parsed.filter((id): id is string => typeof id === "string")
+      : [];
+  } catch {
+    return [];
+  }
+}
+
 function TaskEditor({
   opened,
   task,
@@ -1814,13 +1849,30 @@ function TaskEditor({
     prompt: string,
   ) => void;
 }) {
-  const [title, setTitle] = useState(task?.title ?? "");
-  const [criteria, setCriteria] = useState(task?.criteria ?? "");
-  const [instruction, setInstruction] = useState(
-    prompt ?? (task ? `${task.title}\n\n${task.criteria}` : ""),
+  // One subject per task, and the create form is its own. Every seed doubles
+  // as its own base, so a draft is dropped once the saved field it was written
+  // against has moved on.
+  const subject = `task-editor:${task?.id ?? "new"}`;
+  const [title, setTitle, clearTitle] = useDraft(`${subject}:title`, {
+    seed: task?.title ?? "",
+  });
+  const [criteria, setCriteria, clearCriteria] = useDraft(
+    `${subject}:criteria`,
+    { seed: task?.criteria ?? "" },
   );
-  const [dependencies, setDependencies] = useState(task?.dependencyIds ?? []);
-  const [assignee, setAssignee] = useState(task?.assigneeId ?? "");
+  const [instruction, setInstruction, clearInstruction] = useDraft(
+    `${subject}:instruction`,
+    { seed: prompt ?? (task ? `${task.title}\n\n${task.criteria}` : "") },
+  );
+  const [packedDependencies, setDependencies, clearDependencies] = useDraft(
+    `${subject}:dependencies`,
+    { seed: packIds(task?.dependencyIds ?? []) },
+  );
+  const [assignee, setAssignee, clearAssignee] = useDraft(
+    `${subject}:assignee`,
+    { seed: task?.assigneeId ?? "" },
+  );
+  const dependencies = unpackIds(packedDependencies);
   const [error, setError] = useState("");
   // Exclude descendants as dependencies so editing cannot introduce a cycle.
   const excluded = new Set(task ? [task.id] : []);
@@ -1849,6 +1901,11 @@ function TaskEditor({
               },
               instruction.trim() || `${title.trim()}\n\n${criteria.trim()}`,
             );
+            clearTitle();
+            clearCriteria();
+            clearInstruction();
+            clearDependencies();
+            clearAssignee();
           } catch (cause) {
             setError(String(cause));
           }
@@ -1886,7 +1943,7 @@ function TaskEditor({
             .filter((item) => !excluded.has(item.id))
             .map((item) => ({ value: item.id, label: item.title }))}
           value={dependencies}
-          onChange={setDependencies}
+          onChange={(ids) => setDependencies(packIds(ids))}
         />
         <TextInput
           mt="md"
