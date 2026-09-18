@@ -167,7 +167,15 @@ impl Staging {
         if git(&bare, &["rev-parse", "--verify", "--quiet", &branch]).is_err() {
             return Ok(false);
         }
-        Ok(git_try(&bare, &["merge-base", "--is-ancestor", &branch, &target]).0)
+        let revision = git(&bare, &["rev-parse", &branch])?;
+        let marker = self
+            .root
+            .join("tasks")
+            .join(format!("{}.landed", safe_ref(task_id)));
+        Ok(std::fs::read_to_string(marker)
+            .ok()
+            .is_some_and(|saved| saved.trim() == revision)
+            && git_try(&bare, &["merge-base", "--is-ancestor", &branch, &target]).0)
     }
 
     pub fn append_report(
@@ -302,6 +310,7 @@ impl Staging {
                 branch,
             });
         }
+        let _ = std::fs::remove_file(notes.join(format!("{}.landed", safe_ref(task_id))));
         std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
         let from = ticket_branch(ticket);
         git(
@@ -425,6 +434,14 @@ impl Staging {
 
         let branch = task_branch(ticket, task_id);
         let (ok, detail) = git_try(&into, &["merge", "--ff-only", &branch]);
+        if ok {
+            let revision = git(&self.bare(), &["rev-parse", &branch])?;
+            let marker = self
+                .root
+                .join("tasks")
+                .join(format!("{}.landed", safe_ref(task_id)));
+            std::fs::write(marker, revision).map_err(|e| e.to_string())?;
+        }
         Ok(MergeOutcome {
             merged: ok,
             conflicts: Vec::new(),
@@ -455,6 +472,11 @@ impl Staging {
         if git(&bare, &["rev-parse", "--verify", "--quiet", &branch]).is_ok() {
             git(&bare, &["branch", "-D", &branch])?;
         }
+        let _ = std::fs::remove_file(
+            self.root
+                .join("tasks")
+                .join(format!("{}.landed", safe_ref(task_id))),
+        );
         Ok(())
     }
 
