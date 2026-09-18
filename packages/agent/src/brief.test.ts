@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { buildTaskBrief, nextTasks, ticketProgress } from "./brief";
+import { standingOrders } from "./harness";
 import {
   emptyTaskWorkspace,
   type AgentTask,
@@ -234,5 +235,38 @@ describe("nextTasks", () => {
     };
     expect(nextTasks(busy, "ticket-1", 2).map((t) => t.id)).toEqual(["a"]);
     expect(nextTasks(busy, "ticket-1", 1)).toEqual([]);
+  });
+});
+
+/**
+ * The brief a role is handed is `standingOrders`, in harness.ts: it renders
+ * the rules that carry that role. These read it from there.
+ */
+describe("the one-message-one-ticket rule", () => {
+  // Matched on the text, not on where the rule sits in the list, so reordering
+  // the rules does not silently pass or fail this.
+  const heading = "One message is one ticket";
+  const phrase =
+    "Two asks sent in two messages are two tickets, even when they touch the same code.";
+
+  test("reaches the ticket agent", () => {
+    const orders = standingOrders("ticket-agent");
+    expect(orders).toContain(heading);
+    expect(orders).toContain(phrase);
+    expect(orders).toContain("Combine only when the person says to combine.");
+    expect(orders).toContain(
+      "A shared file is a sequencing problem, not a reason to merge two tickets.",
+    );
+  });
+
+  test("reaches nobody else", () => {
+    // A worker or a reviewer that read this would apply it to work it does not
+    // own, and the task agent splits one ticket rather than deciding what a
+    // ticket is.
+    for (const role of ["worker", "task-agent", "pr-code-review"] as const) {
+      const orders = standingOrders(role);
+      expect(orders).not.toContain(heading);
+      expect(orders).not.toContain(phrase);
+    }
   });
 });
