@@ -4,6 +4,7 @@ import {
   needsConnection,
   recentFirst,
   searchSequence,
+  ticketAgentPrompt,
   updatedLabel,
 } from "./ticket-picker";
 
@@ -91,6 +92,50 @@ describe("needs connection", () => {
     );
     expect(needsConnection("Provider returned HTTP 401.", "Linear")).toBe(
       false,
+    );
+  });
+});
+
+describe("ticket agent prompt", () => {
+  const picked: ExternalIssue = {
+    provider: "Jira",
+    id: "10042",
+    key: "BRD-12",
+    url: "https://example.atlassian.net/browse/BRD-12",
+    title: "Searchable ticket import",
+    description: "The import modal should search, not ask for an id.",
+    status: "In Progress",
+    updatedAt: "2026-09-17T10:00:00.000Z",
+  };
+
+  test("the prompt names everything the picker knows", () => {
+    const prompt = ticketAgentPrompt(picked);
+    expect(prompt).toContain("Jira");
+    expect(prompt).toContain("BRD-12");
+    expect(prompt).toContain("https://example.atlassian.net/browse/BRD-12");
+    expect(prompt).toContain("Searchable ticket import");
+    expect(prompt).toContain("In Progress");
+    expect(prompt).toContain(
+      "The import modal should search, not ask for an id.",
+    );
+  });
+
+  test("the last line tells the agent what to do", () => {
+    const lines = ticketAgentPrompt(picked).split("\n");
+    expect(lines[lines.length - 1]).toBe(
+      "Import this into Berdloop with ticket_import (provider=Jira, reference=BRD-12), then plan it.",
+    );
+  });
+
+  test("a body the picker never got is left out rather than left empty", () => {
+    const prompt = ticketAgentPrompt({ ...picked, description: "   " });
+    expect(prompt).not.toContain("Description");
+    expect(prompt).toContain("BRD-12");
+  });
+
+  test("a ticket the provider left unstated still says where it stands", () => {
+    expect(ticketAgentPrompt({ ...picked, status: "" })).toContain(
+      "- Status: Unknown",
     );
   });
 });

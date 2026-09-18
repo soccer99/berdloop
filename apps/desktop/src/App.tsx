@@ -15,7 +15,6 @@ import { IconFolder, IconPlus, IconUsers } from "@tabler/icons-react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import {
-  importIssue,
   migrateTasks,
   starterProjectId,
   type AccountSession,
@@ -58,6 +57,7 @@ import {
   recentFirst,
   searchDebounceMs,
   searchSequence,
+  ticketAgentPrompt,
   updatedLabel,
 } from "./ticket-picker";
 
@@ -537,8 +537,12 @@ export default function App() {
   const [importOpened, setImportOpened] = useState(false);
   const [importProvider, setImportProvider] =
     useState<ExternalProvider>("Linear");
-  const [importBusy, setImportBusy] = useState(false);
-  const [importError, setImportError] = useState<string | null>(null);
+  // What a picked ticket left in the ticket agent's chat box. The id rises
+  // with every pick, so picking the same ticket twice writes it again.
+  const [ticketAgentPrefill, setTicketAgentPrefill] = useState<{
+    id: number;
+    text: string;
+  }>();
   const [organizationOpened, setOrganizationOpened] = useState(false);
   const [projectOpened, setProjectOpened] = useState(false);
   const [linkProjectId, setLinkProjectId] = useState<string | null>(null);
@@ -908,33 +912,19 @@ export default function App() {
     setTaskOpened(false);
     setView("loops");
   }
-  // What the picker hands back. The next task sends the pick to the ticket
-  // agent instead; until then it takes the same route an import always did.
-  async function pickIssue(picked: ExternalIssue) {
-    if (!project || !isTauri()) return;
-    setImportBusy(true);
-    setImportError(null);
-    try {
-      const issue = await invoke<ExternalIssue>("fetch_external_issue", {
-        provider: picked.provider,
-        reference: picked.key,
-        organizationId: project.organizationId,
-        projectId: project.id,
-      });
-      let importedId = "";
-      updateWorkspace((current) => {
-        const imported = importIssue(current, issue, project.id);
-        importedId = imported.task.id;
-        return imported.workspace;
-      });
-      setSelectedId(importedId);
-      setImportOpened(false);
-      setView("loops");
-    } catch (cause) {
-      setImportError(String(cause));
-    } finally {
-      setImportBusy(false);
-    }
+  // What the picker hands back. Picking creates nothing: it writes an
+  // opening message into the ticket agent's chat box and takes the person
+  // there, and the agent fetches the real body and makes the ticket once
+  // they send it. The queue's ticket agent only shows while no ticket is
+  // selected, so the pick clears the selection to land them in front of it.
+  function pickIssue(picked: ExternalIssue) {
+    setTicketAgentPrefill((current) => ({
+      id: (current?.id ?? 0) + 1,
+      text: ticketAgentPrompt(picked),
+    }));
+    setImportOpened(false);
+    setSelectedId("");
+    setView("loops");
   }
   function requestCollaboration(target: CollaborationTarget) {
     setCollaborationTarget(target);
@@ -1147,7 +1137,6 @@ export default function App() {
             update={updateWorkspace}
             onNewTicket={() => openTaskDraft()}
             onImportTicket={(provider) => {
-              setImportError(null);
               setImportProvider(provider ?? "Linear");
               setImportOpened(true);
             }}
@@ -1159,6 +1148,7 @@ export default function App() {
               setView("tools");
             }}
             ready={tasksReady}
+            ticketAgentPrefill={ticketAgentPrefill}
           />
         )}
         {view === "tools" && (
@@ -1529,9 +1519,7 @@ export default function App() {
       </Modal>
       <Modal
         opened={importOpened}
-        onClose={() => {
-          if (!importBusy) setImportOpened(false);
-        }}
+        onClose={() => setImportOpened(false)}
         title="Import a source ticket"
         centered
       >
@@ -1543,7 +1531,6 @@ export default function App() {
             allowDeselect={false}
             onChange={(value) => {
               if (!value) return;
-              setImportError(null);
               setImportProvider(value as ExternalProvider);
             }}
           />
@@ -1553,24 +1540,14 @@ export default function App() {
           provider={importProvider}
           organizationId={project?.organizationId ?? ""}
           projectId={project?.id ?? ""}
-          busy={importBusy || !project}
-          onPickIssue={(issue) => void pickIssue(issue)}
+          busy={!project}
+          onPickIssue={pickIssue}
           onOpenSettings={() => {
             setImportOpened(false);
             setSourceSettingsProjectId(projectId);
             setView("tools");
           }}
         />
-        {importBusy && (
-          <p className="ticket-picker-note">
-            <Loader size="xs" /> Importing into {project?.name ?? "project"}…
-          </p>
-        )}
-        {importError && (
-          <p role="alert" className="task-error">
-            {importError}
-          </p>
-        )}
       </Modal>
       <Modal
         opened={taskOpened}

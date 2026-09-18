@@ -66,6 +66,12 @@ interface QueueProps {
   ticketSources: ExternalProvider[];
   onConfigureSources: () => void;
   ready: boolean;
+  /**
+   * An opening message for the ticket agent's chat box, from picking a
+   * source ticket. A new `id` writes it again, so the same ticket picked
+   * twice is not silently ignored.
+   */
+  ticketAgentPrefill?: { id: number; text: string };
   runtime?: Runtime;
   onPrepareAgent?: () => Promise<void>;
 }
@@ -184,6 +190,7 @@ function Composer({
   onSend,
   targets,
   inlineSend = false,
+  quote,
 }: {
   label: string;
   placeholder: string;
@@ -191,11 +198,21 @@ function Composer({
   onSend: (text: string, target: WorkflowAction["target"]) => Promise<void>;
   targets?: { value: string; label: string }[];
   inlineSend?: boolean;
+  /** Text to start a message with. A new `id` writes it again. */
+  quote?: { id: number; text: string };
 }) {
   const [text, setText] = useState("");
   const [target, setTarget] = useState(targets?.[0]?.value ?? "worker");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const input = useRef<HTMLTextAreaElement>(null);
+  // The same ticket picked twice is a new `id`, so the box fills again. The
+  // message is never sent: the person reads it, adds to it, and presses send.
+  useEffect(() => {
+    if (!quote) return;
+    setText(quote.text);
+    input.current?.focus();
+  }, [quote?.id]);
   const sendButton = (
     <Button
       size="xs"
@@ -227,6 +244,7 @@ function Composer({
     >
       <div className="wf-composer-input">
         <Textarea
+          ref={input}
           aria-label={label}
           placeholder={placeholder}
           autosize
@@ -283,6 +301,7 @@ function Coordinator({
   runtime,
   threadKey,
   onSend,
+  quote,
 }: {
   kind: "ticket" | "planner";
   scope: string;
@@ -290,11 +309,17 @@ function Coordinator({
   runtime?: WorkflowRuntime;
   threadKey: string;
   onSend: (text: string, target: WorkflowAction["target"]) => Promise<void>;
+  quote?: { id: number; text: string };
 }) {
   const [expanded, setExpanded] = useLocalStorage({
     key: `berdloop.ui.chat-open.${threadKey}`,
     defaultValue: true,
   });
+  // A chat somebody folded away still has to show what was just written
+  // into it, so a new quote opens it.
+  useEffect(() => {
+    if (quote) setExpanded(true);
+  }, [quote?.id]);
   const thread = runtime?.threads[threadKey];
   const title =
     kind === "ticket" ? "Ticket agent" : "Planning & steering agent";
@@ -345,6 +370,7 @@ function Coordinator({
             streaming={thread?.streaming}
           />
           <Composer
+            quote={quote}
             label={`Message ${title}`}
             placeholder={
               kind === "ticket"
@@ -398,6 +424,7 @@ export function QueueView({
   ticketSources,
   onConfigureSources,
   ready,
+  ticketAgentPrefill,
   runtime,
   onPrepareAgent,
 }: QueueProps) {
@@ -807,6 +834,7 @@ export function QueueView({
             kind="ticket"
             scope={project?.name ?? "All projects"}
             threadKey={ticketAgentKey}
+            quote={ticketAgentPrefill}
             runtime={runtime}
             messages={savedMessages[ticketAgentKey] ?? []}
             onSend={(text, target) => send(ticketAgentKey, text, target)}

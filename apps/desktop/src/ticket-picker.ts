@@ -75,3 +75,32 @@ export function needsConnection(
 ): boolean {
   return error.trim() === `Connect ${provider} in settings first.`;
 }
+
+/**
+ * What a picked ticket puts in the ticket agent's chat box. Picking imports
+ * nothing: it writes the opening message of a conversation and leaves the
+ * send to the person, so they can add to it first.
+ *
+ * The picker's own row is thin — a search answer rarely carries the whole
+ * body — so the prompt hands over what it does know and asks the agent to
+ * fetch the rest. The last line is the instruction, because that is what the
+ * agent acts on.
+ */
+export function ticketAgentPrompt(issue: ExternalIssue): string {
+  const lines = [
+    `I picked this ticket in the ${issue.provider} picker:`,
+    "",
+    `- Provider: ${issue.provider}`,
+    `- Key: ${issue.key}`,
+    `- URL: ${issue.url}`,
+    `- Title: ${issue.title}`,
+    `- Status: ${issue.status.trim() || "Unknown"}`,
+  ];
+  const body = issue.description.trim();
+  if (body) lines.push("", "Description as the picker has it:", "", body);
+  lines.push(
+    "",
+    `Import this into Berdloop with ticket_import (provider=${issue.provider}, reference=${issue.key}), then plan it.`,
+  );
+  return lines.join("\n");
+}
