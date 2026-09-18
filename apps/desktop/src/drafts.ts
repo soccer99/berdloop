@@ -20,6 +20,10 @@
  * - `clearDraft()` drops the stored draft and returns the input to its seed.
  *   Call it after a send succeeds, never before: a draft that survives a
  *   failed send is the whole point.
+ * - `clearIfUnchanged(sent)` is the same thing for a send that was awaited: it
+ *   clears only while the box still holds `sent`, so text typed during an
+ *   in-flight send is kept rather than wiped when the send resolves. Pass the
+ *   value as it stood when the send started, untrimmed.
  *
  * ## Options
  *
@@ -42,7 +46,7 @@
  * `pruneDraftsForOwners(liveIds)` is how the app calls it: it keeps every
  * subject that no ticket or task owns, so only deleted work is forgotten.
  */
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useLocalStorage } from "@mantine/hooks";
 
 /** Namespace every draft shares, so drafts are recognisable and prunable. */
@@ -80,6 +84,7 @@ export type UseDraftResult = [
   value: string,
   setValue: (next: string | ((current: string) => string)) => void,
   clearDraft: () => void,
+  clearIfUnchanged: (sent: string) => boolean,
 ];
 
 function resolveStorage(options: DraftOptions): DraftStorage | null {
@@ -318,6 +323,12 @@ export function useDraft(
     value: readDraft(key, settings),
   }));
 
+  // The live text, readable without waiting for a render. `clearIfUnchanged`
+  // is called from an awaited send handler, whose `value` is the one captured
+  // when the handler started, so it has to ask what is in the box now.
+  const live = useRef(state.value);
+  live.current = state.value;
+
   // A new subject, or a record that moved on underneath the draft, re-reads
   // during render so the input never shows the previous subject's text.
   if (state.storageKey !== storageKey || state.base !== recordBase) {
@@ -357,5 +368,18 @@ export function useDraft(
     setState((current) => ({ ...current, value: seed ?? "" }));
   }, [removeRecord, seed]);
 
-  return [state.value, setValue, clearDraft];
+  const clearIfUnchanged = useCallback(
+    (sent: string) => {
+      // Someone kept typing while the send was in flight. That text was never
+      // sent, so it is still a draft: leave it in the box and in storage.
+      if (live.current !== sent) {
+        return false;
+      }
+      clearDraft();
+      return true;
+    },
+    [clearDraft],
+  );
+
+  return [state.value, setValue, clearDraft, clearIfUnchanged];
 }

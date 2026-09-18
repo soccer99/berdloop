@@ -92,7 +92,7 @@ export function AgentChat({
   onStop,
   placeholder,
 }: AgentChatProps) {
-  const [draft, setDraft, clearDraft] = useDraft(draftKey);
+  const [draft, setDraft, , clearSentDraft] = useDraft(draftKey);
   const [busy, setBusy] = useState(false);
   const tail = useRef<HTMLDivElement>(null);
 
@@ -106,14 +106,16 @@ export function AgentChat({
   }, [messages.length, streaming]);
 
   async function send() {
-    const text = draft.trim();
+    const sent = draft;
+    const text = sent.trim();
     if (!text || busy) return;
     setBusy(true);
     try {
       await onSend(text);
       // Cleared here and nowhere else: a send that threw leaves the typed
-      // text as the only copy of it.
-      clearDraft();
+      // text as the only copy of it. Nothing is disabled while the send is in
+      // flight, so anything typed meanwhile was never sent and is kept.
+      clearSentDraft(sent);
     } finally {
       setBusy(false);
     }

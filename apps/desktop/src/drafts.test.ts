@@ -74,6 +74,15 @@ function mount(key: string, options: Omit<DraftOptions, "storage"> = {}) {
       removeDraft(key, settings);
       value = options.seed ?? "";
     },
+    /** `clearIfUnchanged`: only the text that was actually sent is cleared. */
+    clearIfUnchanged(sent: string) {
+      if (value !== sent) {
+        return false;
+      }
+      removeDraft(key, settings);
+      value = options.seed ?? "";
+      return true;
+    },
   };
 }
 
@@ -99,6 +108,35 @@ describe("a draft outliving its editor", () => {
     expect(stored("worker:task-7")).not.toBeNull();
 
     composer.clear();
+
+    expect(composer.value).toBe("");
+    expect(stored("worker:task-7")).toBeNull();
+    expect(mount("worker:task-7").value).toBe("");
+  });
+
+  test("text typed during an in-flight send survives that send", async () => {
+    const composer = mount("worker:task-7");
+    composer.type("Re-run the failing migration");
+    const sent = composer.value;
+
+    // Nothing is disabled while the send is in flight, so the person carries
+    // on typing the next instruction before the first one has resolved.
+    const send = Promise.resolve();
+    composer.type("And then check the logs");
+    await send;
+    expect(composer.clearIfUnchanged(sent)).toBe(false);
+
+    expect(composer.value).toBe("And then check the logs");
+    expect(mount("worker:task-7").value).toBe("And then check the logs");
+  });
+
+  test("a send nobody typed over clears the box and the storage", async () => {
+    const composer = mount("worker:task-7");
+    composer.type("Re-run the failing migration");
+    const sent = composer.value;
+
+    await Promise.resolve();
+    expect(composer.clearIfUnchanged(sent)).toBe(true);
 
     expect(composer.value).toBe("");
     expect(stored("worker:task-7")).toBeNull();

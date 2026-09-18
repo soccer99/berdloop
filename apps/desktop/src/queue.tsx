@@ -208,7 +208,7 @@ function Composer({
   inlineSend?: boolean;
   quote?: { id: number; text: string };
 }) {
-  const [text, setText, clearDraft] = useDraft(draftKey);
+  const [text, setText, , clearSentDraft] = useDraft(draftKey);
   const [target, setTarget] = useState(targets?.[0]?.value ?? "worker");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -247,13 +247,16 @@ function Composer({
       onSubmit={async (event) => {
         event.preventDefault();
         if (!text.trim()) return;
+        const sent = text;
         setBusy(true);
         setError("");
         try {
-          await onSend(text.trim(), target as WorkflowAction["target"]);
+          await onSend(sent.trim(), target as WorkflowAction["target"]);
           // Only here. The catch below leaves the draft alone, because a send
-          // that failed leaves the typed text as the only copy.
-          clearDraft();
+          // that failed leaves the typed text as the only copy. The box stays
+          // live while the send is in flight, so anything typed meanwhile was
+          // never sent and stays where it is.
+          clearSentDraft(sent);
         } catch (cause) {
           setError(String(cause));
         } finally {
