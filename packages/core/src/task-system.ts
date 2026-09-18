@@ -10,6 +10,8 @@ export interface ExternalIssue {
   title: string;
   description: string;
   status: string;
+  /** When the provider last changed it. Absent when the provider is silent. */
+  updatedAt?: string;
 }
 
 export type AgentTaskStatus =

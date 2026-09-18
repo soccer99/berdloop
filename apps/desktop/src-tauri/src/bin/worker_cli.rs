@@ -94,6 +94,8 @@ fn usage() -> String {
         "    ticket-add ticket-edit ticket-remove ticket-split ticket-merge ticket-reorder",
         "    task-add   task-edit   task-remove   task-split   task-merge   task-reorder",
         "  ticket-pause ticket-resume ticket-replan",
+        "  ticket-import   Put a provider's issue on the queue. --provider and",
+        "                  --reference. The connection comes from settings.",
         "  task-steer task-stop",
         "  pr-review-submit",
         "",

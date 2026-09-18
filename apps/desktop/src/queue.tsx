@@ -70,6 +70,12 @@ interface QueueProps {
   ticketSources: ExternalProvider[];
   onConfigureSources: () => void;
   ready: boolean;
+  /**
+   * An opening message for the ticket agent's chat box, from picking a
+   * source ticket. A new `id` writes it again, so the same ticket picked
+   * twice is not silently ignored.
+   */
+  ticketAgentPrefill?: { id: number; text: string };
   runtime?: Runtime;
   onPrepareAgent?: () => Promise<void>;
   /** Beta: a decision model orders the queues and checks where a message goes. */
@@ -198,6 +204,7 @@ function Composer({
   onSend: (text: string, target: WorkflowAction["target"]) => Promise<void>;
   targets?: { value: string; label: string }[];
   inlineSend?: boolean;
+  /** Text to start a message with. A new `id` adds it to the draft. */
   quote?: { id: number; text: string };
 }) {
   const [text, setText] = useState("");
@@ -347,6 +354,7 @@ function Coordinator({
   runtime,
   threadKey,
   onSend,
+  quote,
 }: {
   kind: "ticket" | "planner";
   scope: string;
@@ -354,6 +362,7 @@ function Coordinator({
   runtime?: WorkflowRuntime;
   threadKey: string;
   onSend: (text: string, target: WorkflowAction["target"]) => Promise<void>;
+  quote?: { id: number; text: string };
 }) {
   const [expanded, setExpanded] = useLocalStorage({
     key: `berdloop.ui.chat-open.${threadKey}`,
@@ -383,6 +392,11 @@ function Coordinator({
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", stop);
   };
+  // A chat somebody folded away still has to show what was just written
+  // into it, so a new quote opens it.
+  useEffect(() => {
+    if (quote) setExpanded(true);
+  }, [quote?.id]);
   const thread = runtime?.threads[threadKey];
   const title =
     kind === "ticket" ? "Ticket agent" : "Planning & steering agent";
@@ -436,6 +450,7 @@ function Coordinator({
           <AgentConversation
             messages={threadMessages(thread?.messages, messages)}
             streaming={thread?.streaming}
+            quote={quote}
             label={`Message ${title}`}
             placeholder={
               kind === "ticket"
@@ -487,6 +502,7 @@ export function QueueView({
   ticketSources,
   onConfigureSources,
   ready,
+  ticketAgentPrefill,
   runtime,
   onPrepareAgent,
   beta = false,
@@ -990,6 +1006,7 @@ export function QueueView({
             kind="ticket"
             scope={project?.name ?? "All projects"}
             threadKey={ticketAgentKey}
+            quote={ticketAgentPrefill}
             runtime={runtime}
             messages={savedMessages[ticketAgentKey] ?? []}
             onSend={(text, target) => send(ticketAgentKey, text, target)}

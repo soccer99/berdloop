@@ -75,13 +75,26 @@ describe("standingOrders", () => {
         .sort();
     const six = ["add", "edit", "merge", "remove", "reorder", "split"];
     expect(operations("ticket-agent", "ticket")).toEqual(
-      [...six, "pause", "replan", "resume"].sort(),
+      [...six, "import", "pause", "replan", "resume"].sort(),
     );
     expect(operations("task-agent", "task")).toEqual(
       [...six, "steer", "stop"].sort(),
     );
     for (const role of ["ticket-agent", "task-agent"] as const)
       expect(standingOrders(role)).toContain("queue_show");
+  });
+
+  test("the ticket agent is told how to import a provider's issue", () => {
+    // The picker hands the agent a provider and a reference and nothing else,
+    // so the brief has to name the command that turns those into a ticket.
+    expect(toolsFor("ticket-agent").map((tool) => tool.name)).toContain(
+      "ticket_import",
+    );
+    const rendered = renderTools(toolsFor("ticket-agent"));
+    expect(rendered).toContain(
+      "berdloop-worker ticket-import --provider <provider> --reference <reference>",
+    );
+    expect(standingOrders("ticket-agent")).toContain("ticket-import");
   });
 
   test("every tool belongs to at least one role", () => {

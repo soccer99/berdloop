@@ -1,6 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import {
+  Badge,
   Button,
+  Loader,
   Modal,
   MultiSelect,
   PasswordInput,
@@ -15,7 +17,6 @@ import { IconFolder, IconPlus, IconUsers } from "@tabler/icons-react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import {
-  importIssue,
   migrateTasks,
   starterProjectId,
   topTicket,
@@ -51,12 +52,23 @@ import type { WorkspaceView } from "./layout/types";
 import {
   agentRoles,
   emptyAgentPreferences,
+  patchIntegration,
   resolveRolePreference,
   patchRolePreference,
   type AgentPreferences,
   type AgentRoleSetting,
+  type IntegrationScope,
+  type IntegrationSettings,
   type RolePreference,
 } from "./agent-preferences";
+import {
+  settingsFix,
+  recentFirst,
+  searchDebounceMs,
+  searchSequence,
+  ticketAgentPrompt,
+  updatedLabel,
+} from "./ticket-picker";
 
 import { HarnessModelSelects } from "./harness-model-selects";
 import { useHarnessCatalog } from "./harness-catalog";
@@ -71,20 +83,6 @@ interface Draft {
   ticket: string;
   criteria: string;
 }
-interface ImportDraft {
-  provider: ExternalProvider;
-  reference: string;
-  token: string;
-  jiraSite: string;
-  jiraEmail: string;
-}
-const emptyImportDraft: ImportDraft = {
-  provider: "Linear",
-  reference: "",
-  token: "",
-  jiraSite: "",
-  jiraEmail: "",
-};
 interface ProjectInfo {
   path: string;
   name: string;
@@ -100,6 +98,381 @@ const emptyDraft: Draft = {
   ticket: "",
   criteria: "",
 };
+
+const ticketProviders: ExternalProvider[] = ["Linear", "Jira", "Asana"];
+
+interface ConnectionField {
+  name: string;
+  label: string;
+  placeholder: string;
+  read: (settings: IntegrationSettings | undefined) => string;
+  write: (value: string) => Partial<IntegrationSettings>;
+}
+
+// What a provider needs besides its token. The token is deliberately missing:
+// it never travels through the preferences, and it is never read back.
+const connectionFields: Record<ExternalProvider, ConnectionField[]> = {
+  Linear: [],
+  Jira: [
+    {
+      name: "site",
+      label: "Jira Cloud site",
+      placeholder: "https://your-team.atlassian.net",
+      read: (settings) => settings?.jiraSite ?? "",
+      write: (value) => ({ jiraSite: value }),
+    },
+    {
+      name: "email",
+      label: "Atlassian account email",
+      placeholder: "you@your-team.com",
+      read: (settings) => settings?.jiraEmail ?? "",
+      write: (value) => ({ jiraEmail: value }),
+    },
+  ],
+  Asana: [
+    {
+      name: "workspace",
+      label: "Asana workspace GID",
+      placeholder: "1200123456789",
+      read: (settings) => settings?.asanaWorkspace ?? "",
+      write: (value) => ({ asanaWorkspace: value }),
+    },
+  ],
+};
+
+const tokenLabels: Record<ExternalProvider, string> = {
+  Linear: "Linear API token",
+  Jira: "Atlassian API token",
+  Asana: "Asana API token",
+};
+
+// One provider's connection at one scope. Everything except the token is a
+// preference; the token goes straight to the host, which only ever tells us
+// whether one is there.
+function ProviderConnection({
+  provider,
+  scope,
+  scopeId,
+  settings,
+  inherited,
+  inheritedFrom,
+  onPatch,
+  onConnected,
+  onUseOrganization,
+}: {
+  provider: ExternalProvider;
+  scope: IntegrationScope;
+  scopeId: string;
+  settings: IntegrationSettings | undefined;
+  inherited: IntegrationSettings | undefined;
+  inheritedFrom: string;
+  onPatch: (patch: Partial<IntegrationSettings>) => void;
+  onConnected: (connected: boolean) => void;
+  onUseOrganization: (() => Promise<void>) | null;
+}) {
+  const [token, setToken] = useState("");
+  const [editing, setEditing] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const connected = settings?.connected ?? false;
+
+  async function run(work: () => Promise<void>) {
+    setBusy(true);
+    try {
+      await work();
+      setError("");
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function saveToken() {
+    return run(async () => {
+      if (!isTauri())
+        throw new Error("Saving a token needs the Berdloop desktop app.");
+      await invoke("save_integration_secret", {
+        scope,
+        scopeId,
+        provider,
+        token,
+      });
+      onConnected(true);
+      setToken("");
+      setEditing(false);
+    });
+  }
+
+  function disconnect() {
+    return run(async () => {
+      if (!isTauri())
+        throw new Error("Clearing a token needs the Berdloop desktop app.");
+      await invoke("clear_integration_secret", { scope, scopeId, provider });
+      onConnected(false);
+      setToken("");
+      setEditing(false);
+    });
+  }
+
+  return (
+    <div className="provider-connection">
+      <div className="provider-connection-heading">
+        <h3>{provider}</h3>
+        <Badge variant="light" color={connected ? "lime" : "gray"}>
+          {connected ? "Connected" : "Not connected"}
+        </Badge>
+      </div>
+      {!connected && inherited?.connected && (
+        <p className="provider-connection-note">
+          Using the token from {inheritedFrom}.
+        </p>
+      )}
+      {connectionFields[provider].map((field) => {
+        const value = field.read(settings);
+        const inheritedValue = field.read(inherited);
+        return (
+          <TextInput
+            key={field.name}
+            mt="sm"
+            label={field.label}
+            placeholder={inheritedValue || field.placeholder}
+            description={
+              !value && inheritedValue
+                ? `Inherited from ${inheritedFrom}`
+                : undefined
+            }
+            value={value}
+            onChange={(event) =>
+              onPatch(field.write(event.currentTarget.value))
+            }
+          />
+        );
+      })}
+      {editing ? (
+        <>
+          <TextInput
+            mt="sm"
+            type="password"
+            autoComplete="off"
+            label={tokenLabels[provider]}
+            description="Kept in a file only your account can read, and never shown again."
+            value={token}
+            onChange={(event) => setToken(event.currentTarget.value)}
+          />
+          <div className="provider-connection-actions">
+            <Button
+              size="xs"
+              loading={busy}
+              disabled={!token.trim()}
+              onClick={() => void saveToken()}
+            >
+              Save token
+            </Button>
+            <Button
+              size="xs"
+              variant="subtle"
+              onClick={() => {
+                setEditing(false);
+                setToken("");
+              }}
+            >
+              Cancel
+            </Button>
+          </div>
+        </>
+      ) : (
+        <div className="provider-connection-actions">
+          <Button size="xs" variant="subtle" onClick={() => setEditing(true)}>
+            {connected ? "Replace token" : "Add token"}
+          </Button>
+          {connected && (
+            <Button
+              size="xs"
+              variant="subtle"
+              color="red"
+              loading={busy}
+              onClick={() => void disconnect()}
+            >
+              Disconnect
+            </Button>
+          )}
+          {onUseOrganization && (
+            <Button
+              size="xs"
+              variant="subtle"
+              loading={busy}
+              onClick={() => void run(onUseOrganization)}
+            >
+              Use organization connection
+            </Button>
+          )}
+        </div>
+      )}
+      {error && (
+        <p className="task-error" role="alert">
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}
+
+// Choosing a ticket to import. The host holds the connection, so the picker
+// only ever names a provider and a scope: it asks for the provider's own
+// recent list the moment it opens, so there is something to choose from
+// before anybody types, and a search replaces that list only while it is
+// still the newest one asked for.
+function TicketPicker({
+  provider,
+  organizationId,
+  projectId,
+  busy,
+  onPickIssue,
+  onOpenSettings,
+}: {
+  provider: ExternalProvider;
+  organizationId: string;
+  projectId: string;
+  busy: boolean;
+  onPickIssue: (issue: ExternalIssue) => void;
+  onOpenSettings: () => void;
+}) {
+  const [query, setQuery] = useState("");
+  const [issues, setIssues] = useState<ExternalIssue[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [active, setActive] = useState(0);
+  const sequence = useRef(searchSequence());
+  const rows = useRef<(HTMLButtonElement | null)[]>([]);
+  const search = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    const term = query.trim();
+    const ticket = sequence.current.start();
+    setLoading(true);
+    // Opening the picker asks at once; waiting would only show an empty
+    // panel. Typing rests first, so a typed word is one search and not one
+    // per letter. Either way the answer is shown only if its ticket is still
+    // the newest, so a slow earlier search cannot overwrite a newer one.
+    const timer = setTimeout(
+      () => {
+        void invoke<ExternalIssue[]>("search_external_issues", {
+          provider,
+          organizationId,
+          projectId,
+          query: term,
+        })
+          .then((found) => {
+            if (!sequence.current.accept(ticket)) return;
+            setIssues(recentFirst(found));
+            setError("");
+            setActive(0);
+            setLoading(false);
+          })
+          .catch((cause) => {
+            if (!sequence.current.accept(ticket)) return;
+            setIssues([]);
+            setError(String(cause));
+            setLoading(false);
+          });
+      },
+      term ? searchDebounceMs : 0,
+    );
+    return () => clearTimeout(timer);
+  }, [provider, organizationId, projectId, query]);
+
+  function move(step: number) {
+    if (issues.length === 0) return;
+    const next = Math.min(Math.max(active + step, 0), issues.length - 1);
+    setActive(next);
+    rows.current[next]?.focus();
+  }
+
+  function onKeyDown(event: KeyboardEvent<HTMLDivElement>) {
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      move(event.key === "ArrowDown" ? 1 : -1);
+      return;
+    }
+    // A row is a real button and answers Enter by itself; this is Enter from
+    // the search field, which takes whichever row the arrows landed on.
+    if (event.key === "Enter" && event.target === search.current) {
+      event.preventDefault();
+      const picked = issues[active];
+      if (picked) onPickIssue(picked);
+    }
+  }
+
+  const fixInSettings = settingsFix(error);
+  return (
+    <div className="ticket-picker" onKeyDown={onKeyDown}>
+      <TextInput
+        ref={search}
+        data-autofocus
+        mt="md"
+        label={`Search ${provider}`}
+        placeholder="A key, a title, or a word from the ticket"
+        value={query}
+        onChange={(event) => setQuery(event.currentTarget.value)}
+      />
+      {loading ? (
+        <p className="ticket-picker-note">
+          <Loader size="xs" /> Asking {provider}…
+        </p>
+      ) : fixInSettings ? (
+        <div className="ticket-picker-note">
+          <p>{fixInSettings}</p>
+          <Button size="xs" variant="subtle" onClick={onOpenSettings}>
+            Open settings
+          </Button>
+        </div>
+      ) : error ? (
+        <p role="alert" className="task-error">
+          {error}
+        </p>
+      ) : issues.length === 0 ? (
+        <p className="ticket-picker-note">No tickets matched</p>
+      ) : (
+        <div
+          className="ticket-picker-list"
+          role="group"
+          aria-label={`${provider} tickets`}
+        >
+          {issues.map((issue, index) => {
+            const updated = updatedLabel(issue);
+            return (
+              <button
+                key={issue.id}
+                type="button"
+                ref={(element) => {
+                  rows.current[index] = element;
+                }}
+                className={`ticket-pick${index === active ? " active" : ""}`}
+                aria-label={`${issue.key}, ${issue.title}`}
+                aria-current={index === active}
+                disabled={busy}
+                onFocus={() => setActive(index)}
+                onClick={() => onPickIssue(issue)}
+              >
+                <code>{issue.key}</code>
+                <strong>{issue.title}</strong>
+                {issue.status && (
+                  <Badge variant="light" color="gray" size="sm">
+                    {issue.status}
+                  </Badge>
+                )}
+                <small>
+                  {updated ? `Updated ${updated}` : "Never updated"}
+                </small>
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
 
 export default function App() {
   const [accessMode, setAccessMode] = useLocalStorage<"local" | null>({
@@ -246,9 +619,14 @@ export default function App() {
   const [selectedId, setSelectedId] = useState("");
   const [taskOpened, setTaskOpened] = useState(false);
   const [importOpened, setImportOpened] = useState(false);
-  const [importDraft, setImportDraft] = useState<ImportDraft>(emptyImportDraft);
-  const [importBusy, setImportBusy] = useState(false);
-  const [importError, setImportError] = useState<string | null>(null);
+  const [importProvider, setImportProvider] =
+    useState<ExternalProvider>("Linear");
+  // What a picked ticket left in the ticket agent's chat box. The id rises
+  // with every pick, so picking the same ticket twice writes it again.
+  const [ticketAgentPrefill, setTicketAgentPrefill] = useState<{
+    id: number;
+    text: string;
+  }>();
   const [organizationOpened, setOrganizationOpened] = useState(false);
   const [projectOpened, setProjectOpened] = useState(false);
   const [linkProjectId, setLinkProjectId] = useState<string | null>(null);
@@ -345,6 +723,11 @@ export default function App() {
     projectId && projectSources[projectId] !== undefined
       ? projectSources[projectId]
       : (organizationSources[organization?.id ?? ""] ?? []);
+  // What the picker may switch between: whatever this project turned on,
+  // and every provider when nobody has chosen yet.
+  const pickerProviders = enabledTicketSources.length
+    ? enabledTicketSources
+    : ticketProviders;
   const visibleSettingsSources = sourceSettingsProjectId
     ? (projectSources[sourceSettingsProjectId] ??
       organizationSources[organization?.id ?? ""] ??
@@ -390,6 +773,60 @@ export default function App() {
       if (sources === null) delete next[id];
       else next[id] = sources;
       return { ...current, ticketSources: { ...settings, [scope]: next } };
+    });
+  }
+  const integrationSettings =
+    agentPreferences.integrations ?? emptyAgentPreferences.integrations;
+  // Connections are edited at whichever scope the settings screen is showing.
+  const connectionScope: IntegrationScope = sourceSettingsProjectId
+    ? "projects"
+    : "organizations";
+  const connectionScopeId = sourceSettingsProjectId || (organization?.id ?? "");
+  function connectionAt(
+    scope: IntegrationScope,
+    scopeId: string,
+    provider: ExternalProvider,
+  ): IntegrationSettings | undefined {
+    return integrationSettings[scope][scopeId]?.[provider];
+  }
+  function setConnection(
+    provider: ExternalProvider,
+    patch: Partial<IntegrationSettings>,
+  ) {
+    if (!connectionScopeId) return;
+    setAgentPreferences((current) =>
+      patchIntegration(
+        current,
+        connectionScope,
+        connectionScopeId,
+        provider,
+        patch,
+      ),
+    );
+  }
+  // Drop a project's own connection so the organization's applies again. Its
+  // token goes with it, or the host would keep a secret nothing points at.
+  async function useOrganizationConnection(provider: ExternalProvider) {
+    const scopeId = sourceSettingsProjectId;
+    if (!scopeId) return;
+    if (connectionAt("projects", scopeId, provider)?.connected && isTauri())
+      await invoke("clear_integration_secret", {
+        scope: "projects",
+        scopeId,
+        provider,
+      });
+    setAgentPreferences((current) => {
+      const integrations =
+        current.integrations ?? emptyAgentPreferences.integrations;
+      const providers = { ...integrations.projects[scopeId] };
+      delete providers[provider];
+      return {
+        ...current,
+        integrations: {
+          ...integrations,
+          projects: { ...integrations.projects, [scopeId]: providers },
+        },
+      };
     });
   }
   const organizationProjectIds = new Set(
@@ -618,29 +1055,19 @@ export default function App() {
     setTaskOpened(false);
     setView("loops");
   }
-  async function importTask() {
-    if (!project || !isTauri()) return;
-    setImportBusy(true);
-    setImportError(null);
-    try {
-      const issue = await invoke<ExternalIssue>("fetch_external_issue", {
-        input: importDraft,
-      });
-      let importedId = "";
-      updateWorkspace((current) => {
-        const imported = importIssue(current, issue, project.id);
-        importedId = imported.task.id;
-        return imported.workspace;
-      });
-      setSelectedId(importedId);
-      setImportDraft(emptyImportDraft);
-      setImportOpened(false);
-      setView("loops");
-    } catch (cause) {
-      setImportError(String(cause));
-    } finally {
-      setImportBusy(false);
-    }
+  // What the picker hands back. Picking creates nothing: it writes an
+  // opening message into the ticket agent's chat box and takes the person
+  // there, and the agent fetches the real body and makes the ticket once
+  // they send it. The queue's ticket agent only shows while no ticket is
+  // selected, so the pick clears the selection to land them in front of it.
+  function pickIssue(picked: ExternalIssue) {
+    setTicketAgentPrefill((current) => ({
+      id: (current?.id ?? 0) + 1,
+      text: ticketAgentPrompt(picked),
+    }));
+    setImportOpened(false);
+    setSelectedId("");
+    setView("loops");
   }
   function requestCollaboration(target: CollaborationTarget) {
     setCollaborationTarget(target);
@@ -891,11 +1318,7 @@ export default function App() {
             update={updateWorkspace}
             onNewTicket={() => openTaskDraft()}
             onImportTicket={(provider) => {
-              setImportError(null);
-              setImportDraft({
-                ...emptyImportDraft,
-                provider: provider ?? "Linear",
-              });
+              setImportProvider(provider ?? "Linear");
               setImportOpened(true);
             }}
             onNewProject={() => setProjectOpened(true)}
@@ -906,6 +1329,7 @@ export default function App() {
               setView("tools");
             }}
             ready={tasksReady}
+            ticketAgentPrefill={ticketAgentPrefill}
             beta={betaEnabled(harnessSettings)}
           />
         )}
@@ -978,14 +1402,14 @@ export default function App() {
                   <div>
                     <label>Import buttons</label>
                     <p>
-                      Only selected sources appear above the ticket queue.
-                      Credentials are entered during import.
+                      Only selected sources appear above the ticket queue. Each
+                      source searches with the connection set below.
                     </p>
                   </div>
                   <MultiSelect
                     size="xs"
                     className="settings-row-control"
-                    data={["Linear", "Jira", "Asana"]}
+                    data={ticketProviders}
                     value={visibleSettingsSources}
                     onChange={(value) => {
                       if (sourceSettingsProjectId)
@@ -1025,6 +1449,56 @@ export default function App() {
                       </Button>
                     </div>
                   )}
+                {connectionScopeId && (
+                  <>
+                    <p className="settings-group-note">
+                      {sourceSettingsProjectId
+                        ? `Anything left blank falls back to ${organization?.name ?? "the organization"}.`
+                        : "Every project in this organization uses these unless it sets its own."}
+                    </p>
+                    <div className="provider-connections">
+                      {ticketProviders.map((provider) => (
+                        <ProviderConnection
+                          key={provider}
+                          provider={provider}
+                          scope={connectionScope}
+                          scopeId={connectionScopeId}
+                          settings={connectionAt(
+                            connectionScope,
+                            connectionScopeId,
+                            provider,
+                          )}
+                          inherited={
+                            sourceSettingsProjectId
+                              ? connectionAt(
+                                  "organizations",
+                                  organization?.id ?? "",
+                                  provider,
+                                )
+                              : undefined
+                          }
+                          inheritedFrom={
+                            organization?.name ?? "the organization"
+                          }
+                          onPatch={(patch) => setConnection(provider, patch)}
+                          onConnected={(connected) =>
+                            setConnection(provider, { connected })
+                          }
+                          onUseOrganization={
+                            sourceSettingsProjectId &&
+                            connectionAt(
+                              "projects",
+                              sourceSettingsProjectId,
+                              provider,
+                            )
+                              ? () => useOrganizationConnection(provider)
+                              : null
+                          }
+                        />
+                      ))}
+                    </div>
+                  </>
+                )}
               </section>
 
               <section className="settings-group">
@@ -1480,105 +1954,35 @@ export default function App() {
       </Modal>
       <Modal
         opened={importOpened}
-        onClose={() => {
-          if (!importBusy) {
-            setImportOpened(false);
-            setImportDraft(emptyImportDraft);
-          }
-        }}
+        onClose={() => setImportOpened(false)}
         title="Import a source ticket"
         centered
       >
-        <form
-          onSubmit={(event) => {
-            event.preventDefault();
-            void importTask();
+        {pickerProviders.length > 1 && (
+          <Select
+            label="Source"
+            data={pickerProviders}
+            value={importProvider}
+            allowDeselect={false}
+            onChange={(value) => {
+              if (!value) return;
+              setImportProvider(value as ExternalProvider);
+            }}
+          />
+        )}
+        <TicketPicker
+          key={importProvider}
+          provider={importProvider}
+          organizationId={project?.organizationId ?? ""}
+          projectId={project?.id ?? ""}
+          busy={!project}
+          onPickIssue={pickIssue}
+          onOpenSettings={() => {
+            setImportOpened(false);
+            setSourceSettingsProjectId(projectId);
+            setView("tools");
           }}
-        >
-          <p className="app-eyebrow">{importDraft.provider.toUpperCase()}</p>
-          {importDraft.provider === "Jira" && (
-            <>
-              <TextInput
-                required
-                mt="md"
-                label="Jira Cloud site"
-                placeholder="https://your-team.atlassian.net"
-                value={importDraft.jiraSite}
-                onChange={(event) =>
-                  setImportDraft({
-                    ...importDraft,
-                    jiraSite: event.currentTarget.value,
-                  })
-                }
-              />
-              <TextInput
-                required
-                mt="md"
-                label="Atlassian account email"
-                value={importDraft.jiraEmail}
-                onChange={(event) =>
-                  setImportDraft({
-                    ...importDraft,
-                    jiraEmail: event.currentTarget.value,
-                  })
-                }
-              />
-            </>
-          )}
-          <TextInput
-            required
-            mt="md"
-            label={
-              importDraft.provider === "Asana" ? "Task GID" : "Issue ID or key"
-            }
-            placeholder={
-              importDraft.provider === "Asana" ? "1200123456789" : "BRD-128"
-            }
-            value={importDraft.reference}
-            onChange={(event) =>
-              setImportDraft({
-                ...importDraft,
-                reference: event.currentTarget.value,
-              })
-            }
-          />
-          <TextInput
-            required
-            mt="md"
-            type="password"
-            label={
-              importDraft.provider === "Jira"
-                ? "Atlassian API token"
-                : "Personal access token"
-            }
-            description="Used for this import only. Berdloop does not save it."
-            value={importDraft.token}
-            onChange={(event) =>
-              setImportDraft({
-                ...importDraft,
-                token: event.currentTarget.value,
-              })
-            }
-          />
-          {importError && (
-            <p role="alert" className="task-error">
-              {importError}
-            </p>
-          )}
-          <Button
-            fullWidth
-            mt="xl"
-            type="submit"
-            loading={importBusy}
-            disabled={
-              !project ||
-              !importDraft.reference.trim() ||
-              !importDraft.token.trim()
-            }
-          >
-            Import into {project?.name ?? "project"}
-          </Button>
-        </form>
+        />
       </Modal>
       <Modal
         opened={taskOpened}
