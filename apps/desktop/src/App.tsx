@@ -62,16 +62,10 @@ interface Draft {
 interface ImportDraft {
   provider: ExternalProvider;
   reference: string;
-  token: string;
-  jiraSite: string;
-  jiraEmail: string;
 }
 const emptyImportDraft: ImportDraft = {
   provider: "Linear",
   reference: "",
-  token: "",
-  jiraSite: "",
-  jiraEmail: "",
 };
 interface ProjectInfo {
   path: string;
@@ -481,7 +475,10 @@ export default function App() {
     setImportError(null);
     try {
       const issue = await invoke<ExternalIssue>("fetch_external_issue", {
-        input: importDraft,
+        provider: importDraft.provider,
+        reference: importDraft.reference,
+        organizationId: project.organizationId,
+        projectId: project.id,
       });
       let importedId = "";
       updateWorkspace((current) => {
@@ -1062,35 +1059,6 @@ export default function App() {
           }}
         >
           <p className="app-eyebrow">{importDraft.provider.toUpperCase()}</p>
-          {importDraft.provider === "Jira" && (
-            <>
-              <TextInput
-                required
-                mt="md"
-                label="Jira Cloud site"
-                placeholder="https://your-team.atlassian.net"
-                value={importDraft.jiraSite}
-                onChange={(event) =>
-                  setImportDraft({
-                    ...importDraft,
-                    jiraSite: event.currentTarget.value,
-                  })
-                }
-              />
-              <TextInput
-                required
-                mt="md"
-                label="Atlassian account email"
-                value={importDraft.jiraEmail}
-                onChange={(event) =>
-                  setImportDraft({
-                    ...importDraft,
-                    jiraEmail: event.currentTarget.value,
-                  })
-                }
-              />
-            </>
-          )}
           <TextInput
             required
             mt="md"
@@ -1108,24 +1076,6 @@ export default function App() {
               })
             }
           />
-          <TextInput
-            required
-            mt="md"
-            type="password"
-            label={
-              importDraft.provider === "Jira"
-                ? "Atlassian API token"
-                : "Personal access token"
-            }
-            description="Used for this import only. Berdloop does not save it."
-            value={importDraft.token}
-            onChange={(event) =>
-              setImportDraft({
-                ...importDraft,
-                token: event.currentTarget.value,
-              })
-            }
-          />
           {importError && (
             <p role="alert" className="task-error">
               {importError}
@@ -1136,11 +1086,7 @@ export default function App() {
             mt="xl"
             type="submit"
             loading={importBusy}
-            disabled={
-              !project ||
-              !importDraft.reference.trim() ||
-              !importDraft.token.trim()
-            }
+            disabled={!project || !importDraft.reference.trim()}
           >
             Import into {project?.name ?? "project"}
           </Button>
