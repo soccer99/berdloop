@@ -8,8 +8,10 @@ button {
   font-family: inherit;
 }
 .desktop-shell {
+  /* The brand block and the sidebar share this, so they cannot drift apart. */
+  --sidebar-width: 248px;
   display: grid;
-  grid-template-columns: 248px minmax(0, 1fr);
+  grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
   grid-template-rows: 56px minmax(0, 1fr) 56px;
   height: 100vh;
   overflow: hidden;
@@ -233,6 +235,20 @@ button {
     10px ui-monospace,
     monospace;
 }
+/* Loop status sits at the far right, and truncates rather than pushing. */
+.system-footer-loop {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-left: auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.system-footer-workers {
+  color: #bcd3a8;
+}
 .connection-dot {
   display: inline-block;
   width: 5px;
@@ -315,31 +331,36 @@ button {
   grid-column: 1 / -1;
   grid-row: 1;
   border-bottom: 1px solid #2e3a2a;
-  display: grid;
-  grid-template-columns: subgrid;
+  display: flex;
+  align-items: stretch;
   background: #1b241c;
   font-size: 13px;
 }
 .header-brand {
+  width: var(--sidebar-width);
+  flex: none;
   display: flex;
   align-items: center;
   justify-content: space-between;
   padding: 0 20px;
   border-right: 1px solid #344331;
 }
-.header-breadcrumbs {
+/* Takes the leftover width and truncates, so nothing either side can move. */
+.header-path {
+  flex: 1;
+  min-width: 0;
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  min-width: 0;
   padding: 0 24px;
-}
-.header-path {
-  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.header-controls {
+  flex: none;
+  display: flex;
+  align-items: center;
+  padding: 0 16px 0 12px;
 }
 .mobile-menu-button {
   display: none;
@@ -970,7 +991,7 @@ main {
 }
 @media (max-width: 1150px) {
   .desktop-shell {
-    grid-template-columns: 206px minmax(0, 1fr);
+    --sidebar-width: 206px;
   }
   .app-sidebar {
     padding-left: 10px;
@@ -979,7 +1000,7 @@ main {
   main {
     padding: 28px 24px;
   }
-  .header-breadcrumbs,
+  .header-path,
   .preview-notice {
     padding-left: 20px;
     padding-right: 20px;
@@ -1022,13 +1043,16 @@ main {
     padding: 0 16px;
     border-right: 0;
   }
+  .header-controls {
+    margin-left: auto;
+    padding: 8px 16px;
+  }
   .mobile-menu-button {
     display: inline-flex;
   }
-  .header-breadcrumbs {
-    width: 100%;
+  .header-path {
+    flex: 1 0 auto;
     min-height: 48px;
-    flex-wrap: wrap;
     padding: 8px 16px;
     border-top: 1px solid #2e3a2a;
   }
@@ -1362,19 +1386,39 @@ main {
 }
 
 /* Optional worker controls below the ticket queue */
+/* One block: the worker count and the start button, joined and fixed width. */
 .loop-bar {
   display: flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-  flex-shrink: 0;
-}
-.loop-bar-note {
-  font-size: 12px;
-  max-width: 260px;
+  align-items: stretch;
+  flex: none;
+  height: 34px;
+  border: 1px solid #3d4d35;
+  border-radius: 8px;
+  background: #1d281c;
   overflow: hidden;
-  text-overflow: ellipsis;
+}
+.loop-bar-workers {
+  display: flex;
+  align-items: center;
+  padding-left: 8px;
+}
+.loop-bar-workers .mantine-NumberInput-input {
+  color: #d7e1cf;
+  font-size: 13px;
+  text-align: right;
+}
+.loop-bar-unit {
+  padding: 0 10px 0 4px;
+  color: #8aa17b;
+  font-size: 12px;
   white-space: nowrap;
+}
+.loop-bar .loop-bar-run {
+  height: auto;
+  width: 40px;
+  flex: none;
+  border-radius: 0;
+  border-left: 1px solid #3d4d35;
 }
 
 /* Settings page: one narrow reading column of named groups. Each setting is a

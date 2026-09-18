@@ -11,7 +11,11 @@ import {
   type HarnessId,
   type LaunchPlan,
 } from "@berdloop/agent";
-import type { WorkflowAction, WorkflowRuntime } from "./workflow-ui";
+import type {
+  MergeEntry,
+  WorkflowAction,
+  WorkflowRuntime,
+} from "./workflow-ui";
 import { detectStall } from "./jev";
 import {
   resolveRolePreference,
@@ -24,6 +28,20 @@ import {
   type AgentScope,
   type ConversationSnapshot,
 } from "./conversation-routing";
+
+/**
+ * What an agent is told when it is started again after the app stopped.
+ *
+ * Short on purpose: it is resumed on its own session, so its own transcript
+ * is the record of what it was doing. Only the interruption is news.
+ */
+function resumePrompt(role: AgentScope["role"]): string {
+  const carry =
+    "Berdloop restarted and cut your last run off. Read your own recent messages, work out where you had reached, and carry on.";
+  return role === "worker"
+    ? `${carry} Your worktree and your commits are exactly as you left them. Merge and report as usual.`
+    : carry;
+}
 
 export const ticketAgentKey = (projectId: string) =>
   `ticket-agent:${projectId}`;
@@ -80,7 +98,9 @@ export function useWorkflowRuntime(
   const [threads, setThreads] = useState<Record<string, ConversationSnapshot>>(
     {},
   );
-  const [mergeQueues, setMergeQueues] = useState<Record<string, string[]>>({});
+  const [mergeQueues, setMergeQueues] = useState<Record<string, MergeEntry[]>>(
+    {},
+  );
   const [requests, setRequests] = useState<Record<string, HumanRequest[]>>({});
   const [stalled, setStalled] = useState<Record<string, boolean>>({});
   const [beta, setBeta] = useState("");
@@ -152,19 +172,23 @@ export function useWorkflowRuntime(
           invoke<string>("harness_mcp_config"),
           invoke<AgentPreferences>("load_agent_preferences"),
         ]);
-      const preferredHarness =
-        resolveRolePreference(
-          preferences,
-          scope.organizationId,
-          scope.projectId,
-          scope.role,
-        ).harness ?? harness;
+      const preference = resolveRolePreference(
+        preferences,
+        scope.organizationId,
+        scope.projectId,
+        scope.role,
+      );
       const chosenHarness = current?.sessionId
         ? current.harness
-        : preferredHarness;
+        : (preference.harness ?? harness);
+      // A model belongs to the harness that names it. A thread resumed on an
+      // earlier harness keeps that harness, so the model must not follow.
+      const model =
+        chosenHarness === preference.harness ? preference.model : "";
       const sessionId = current?.sessionId ?? crypto.randomUUID();
       const plan = planConversation({
         harness: chosenHarness,
+        model,
         role: scope.role,
         cwd,
         prompt,
@@ -254,6 +278,39 @@ export function useWorkflowRuntime(
     [],
   );
 
+  // Agents the app was running when it stopped.
+  //
+  // A rebuild, a reload or a crash takes the processes with it, but not the
+  // work: the worktrees, the commits and each harness's own transcript are all
+  // still there. Each thread is started again on its own saved session, so the
+  // app coming back up looks like it never went away. A thread that had already
+  // reported an outcome is left alone; the native side does not mark it.
+  const resumed = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    if (!native) return;
+    for (const thread of Object.values(threads)) {
+      if (!thread.interrupted || thread.streaming) continue;
+      if (resumed.current.has(thread.agentId)) continue;
+      const project = projects.find(
+        (item) => item.id === thread.scope.projectId,
+      );
+      // A worker carries on in its own worktree; everyone else in the project.
+      const cwd = thread.worktree ?? project?.path;
+      // The projects may not have been read yet. Try again next render.
+      if (!cwd) continue;
+      // Once per window: a start that fails must not be retried on every
+      // render. Anything queued for this thread rides along with the restart,
+      // because a starting agent is handed whatever is still pending.
+      resumed.current.add(thread.agentId);
+      void start(
+        thread.agentId,
+        cwd,
+        resumePrompt(thread.scope.role),
+        thread.scope,
+      ).catch(() => undefined);
+    }
+  }, [native, threads, projects, start]);
+
   // An instruction queued for a coordinator that is not running, such as a
   // ticket agent's replan request to a stopped planner, would otherwise wait
   // until a person happened to open that chat. Wake it once per revision.
@@ -262,6 +319,9 @@ export function useWorkflowRuntime(
     if (!native) return;
     for (const thread of Object.values(threads)) {
       if (thread.streaming || thread.scope.role === "worker") continue;
+      // A thread being started again after a restart carries its own queued
+      // instructions with it. Waking it here as well would race that.
+      if (thread.interrupted) continue;
       const pending = thread.messages.find(
         (message) => message.role === "user" && message.delivery === "pending",
       );
@@ -321,13 +381,13 @@ export function useWorkflowRuntime(
           try {
             return [
               ticket.id,
-              await invoke<string[]>("merge_line", {
+              await invoke<MergeEntry[]>("merge_line", {
                 projectId: ticket.projectId,
                 ticket: ticket.ticket,
               }),
             ] as const;
           } catch {
-            return [ticket.id, [] as string[]] as const;
+            return [ticket.id, [] as MergeEntry[]] as const;
           }
         }),
       );

@@ -353,6 +353,16 @@ describe("planLaunch", () => {
     expect(planLaunch({ ...input, harness: "codex" }).cwd).toBe("/work/task-a");
   });
 
+  test("the model a role was set to reaches the command line", () => {
+    for (const harness of ["claude-code", "codex"] as const) {
+      const plan = planLaunch({ ...input, harness, model: "opus-4" });
+      const at = plan.args.indexOf("--model");
+      expect(plan.args[at + 1]).toBe("opus-4");
+      // No model set leaves the harness on its own default.
+      expect(planLaunch({ ...input, harness }).args).not.toContain("--model");
+    }
+  });
+
   test("both harnesses receive the same task", () => {
     for (const harness of ["claude-code", "codex"] as const) {
       const plan = planLaunch({ ...input, harness });

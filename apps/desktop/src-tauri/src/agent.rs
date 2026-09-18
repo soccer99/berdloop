@@ -9,6 +9,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use crate::agent_preferences;
 use crate::conversations::{Conversation, Conversations, Scope, UserMessage};
@@ -51,8 +52,121 @@ pub struct Running(Mutex<AgentState>);
 
 const CONVERSATION_EVENT: &str = "agent://conversation";
 
+/// Set whenever a thread changes, cleared by the writer below.
+///
+/// There is one conversation book in one process, so one flag is enough, and
+/// it keeps `publish` from needing a lock its callers already hold.
+static DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn publish(app: &AppHandle, thread: &Conversation) {
+    DIRTY.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = app.emit(CONVERSATION_EVENT, thread);
+}
+
+/// Where the threads are kept between runs of the app.
+fn conversations_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    let directory = app
+        .path()
+        .app_data_dir()
+        .map_err(|_| "Could not find the app data directory.".to_string())?;
+    std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+    Ok(directory.join("conversations.v1.json"))
+}
+
+/// Read back the threads the previous run of the app left, at startup.
+///
+/// A conversation belongs to the work, not to the window, so a rebuild, a
+/// reload or a crash must not lose one. Any thread still marked streaming
+/// belonged to a process this one did not start: nothing is reading its
+/// output any more, so it is stopped here and marked for a restart.
+pub fn recover(app: &AppHandle) {
+    let Ok(path) = conversations_path(app) else {
+        return;
+    };
+    let mut book = Conversations::read(&path);
+    for pgid in interrupt(&mut book) {
+        stop_stale(pgid);
+    }
+    // Write what was just decided back out. A second stop before any agent
+    // speaks would otherwise read the same threads as still running, and go
+    // looking for process groups that were already stopped.
+    DIRTY.store(true, std::sync::atomic::Ordering::Relaxed);
+    app.state::<Running>().0.lock().unwrap().conversations = book;
+}
+
+/// Mark every thread that was still running, and answer with the process
+/// groups left behind.
+///
+/// Kept apart from the app so the rule can be read and tested on its own.
+pub fn interrupt(book: &mut Conversations) -> Vec<u32> {
+    let mut stale = Vec::new();
+    for thread in book.0.values_mut() {
+        if !thread.streaming {
+            continue;
+        }
+        stale.extend(thread.pgid.take());
+        thread.streaming = false;
+        // Work that reported an outcome is finished. Everything else was cut
+        // off mid-sentence and is put back to work by the window.
+        thread.interrupted = !["done", "merged"].contains(&thread.activity.as_str());
+        if thread.interrupted {
+            thread.activity = "queued".into();
+        }
+        thread.revision += 1;
+    }
+    stale
+}
+
+/// Stop a process group left behind by an earlier run of the app.
+///
+/// An orphaned agent is not working: nobody is reading its output, so it is
+/// blocked on a full pipe as soon as it says anything. Its own transcript is
+/// on disk, which is what the restart resumes from.
+///
+/// A process ID is reused, so the command is checked before anything is
+/// signalled. A stale number must never reach somebody else's process.
+fn stop_stale(pgid: u32) {
+    let ours = Command::new("ps")
+        .args(["-o", "command=", "-p", &pgid.to_string()])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .is_some_and(|line| line.starts_with("claude") || line.starts_with("codex"));
+    if !ours {
+        return;
+    }
+    let _ = Command::new("kill")
+        .args(["-TERM", "--", &format!("-{pgid}")])
+        .status();
+}
+
+/// Keep the saved threads up to date while agents are talking.
+///
+/// Every appended line marks them dirty and this writes at most once a
+/// second, so a talkative agent costs one file write rather than hundreds.
+pub fn autosave(app: AppHandle) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        if !DIRTY.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            continue;
+        }
+        let Ok(path) = conversations_path(&app) else {
+            continue;
+        };
+        let snapshot = Conversations(
+            app.state::<Running>()
+                .0
+                .lock()
+                .unwrap()
+                .conversations
+                .0
+                .clone(),
+        );
+        if let Err(error) = snapshot.write(&path) {
+            eprintln!("could not save conversations: {error}");
+        }
+    });
 }
 
 #[tauri::command]
@@ -252,7 +366,68 @@ fn check_worker_binary(path: &Path) -> Result<(), String> {
             path.display()
         ));
     }
+    check_worker_age(path)
+}
+
+/// In development, refuse a worker helper built before the code it links.
+///
+/// `tauri dev` runs `cargo run --bin berdloop`, which builds the app alone. The
+/// helper is a second binary, left at whatever version was last built by hand,
+/// so a change to the worker rules is picked up by the window and ignored by
+/// every worker. It fails silently, which is the dangerous part: an old helper
+/// deleted its place in the merge queue instead of marking it merged, so the
+/// record of what had landed went missing for a whole day of work.
+///
+/// Compare against the crate's sources, not against the app binary. The app is
+/// always relinked after the helper, so an app comparison rejects a build that
+/// is in fact current, and it never catches a helper older than the source it
+/// was built from, which is the failure that actually happened: a worker was
+/// told `dev-start` did not exist when the source had carried it for hours.
+///
+/// A bundled app is left alone. There the packer writes the files in whatever
+/// order it likes, and their times say nothing.
+fn check_worker_age(path: &Path) -> Result<(), String> {
+    if !cfg!(debug_assertions) {
+        return Ok(());
+    }
+    let Ok(helper) = std::fs::metadata(path).and_then(|meta| meta.modified()) else {
+        return Ok(());
+    };
+    let Some(source) = newest_source(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src")) else {
+        return Ok(());
+    };
+    if helper < source {
+        return Err(format!(
+            "The worker helper at {} is older than the code it is built from, so agents would run old rules. Run `cargo build --bins --manifest-path apps/desktop/src-tauri/Cargo.toml`, then start the agent again.",
+            path.display()
+        ));
+    }
     Ok(())
+}
+
+/// When any Rust file under `dir` was last written. Unreadable entries are
+/// skipped: a missing source tree must not block a packaged app from starting.
+fn newest_source(dir: &Path) -> Option<SystemTime> {
+    let mut newest = None;
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(dir) = todo.pop() {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                todo.push(entry.path());
+            } else if entry.path().extension().is_some_and(|ext| ext == "rs") {
+                if let Ok(at) = entry.metadata().and_then(|meta| meta.modified()) {
+                    newest = newest.max(Some(at));
+                }
+            }
+        }
+    }
+    newest
 }
 
 #[tauri::command]
@@ -266,6 +441,21 @@ pub fn agent_start(
     opening: Option<UserMessage>,
 ) -> Result<AgentRun, String> {
     let key = scope.key()?;
+    // The app is attempting this thread now, so it is no longer waiting to be
+    // resumed. Cleared before anything that can fail: a start that dies on a
+    // missing worker binary used to leave the flag set forever, and the loop
+    // reads that flag as "somebody is already on it" and never puts the
+    // abandoned task back.
+    {
+        let mut state = running.0.lock().unwrap();
+        if let Ok(thread) = state.conversations.ensure(&scope) {
+            thread.interrupted = false;
+        }
+    }
+    // Every agent is given the worker helper's path in its orders, so no
+    // launch path may skip the checks on it. A worker that cannot reach the
+    // merge queue commits its work and then never merges it, quietly.
+    worker_command()?;
     check_scope(&app, &scope)?;
     let settings = agent_preferences::read(&app)?;
     if let Some(choice) = settings.resolve(&scope.organization_id, &scope.project_id, &scope.role) {
@@ -406,11 +596,16 @@ pub fn agent_start(
         }
     }
     thread.run_id = Some(run_id.clone());
+    // The agent leads its own group, so its process ID is the group's. Saved
+    // so a later run of the app can stop it if this one does not get to.
+    thread.pgid = Some(child.id());
     thread.session_id = session_id.clone();
     thread.harness = harness.clone();
     thread.worktree = Some(plan.cwd.clone());
     thread.streaming = true;
     thread.activity = "coding".into();
+    thread.edits = 0;
+    thread.started_at = Some(crate::human::now_ms());
     thread.revision += 1;
     for message in pending {
         thread.delivery(&message.id, "delivered");
@@ -472,6 +667,9 @@ pub fn agent_start(
                             ),
                             "tool" => {
                                 thread.activity = activity_of(text).into();
+                                if is_edit(text) {
+                                    thread.edits += 1;
+                                }
                                 thread.revision += 1;
                             }
                             _ => {}
@@ -509,8 +707,13 @@ pub fn agent_start(
             live.child.wait().ok()
         });
         let clean = status.is_some_and(|s| s.success()) && !failed;
+        // A worker that exits cleanly without a report has not finished: its work
+        // never left its worktree. Calling that "done" hides the one failure the
+        // report exists to catch, so the run is only done when it reported.
+        let mut reported = true;
         if let Some((staging, task, ticket)) = worker {
-            if !staging.has_report_for_run(&task, &stream_run_id) {
+            reported = staging.has_report_for_run(&task, &stream_run_id);
+            if !reported {
                 let _ = staging.append_report(
                     &ticket,
                     &task,
@@ -536,8 +739,9 @@ pub fn agent_start(
             let mut state = running.0.lock().unwrap();
             if let Some(thread) = state.conversations.for_run(&key, &stream_run_id) {
                 thread.streaming = false;
+                thread.pgid = None;
                 if thread.activity != "paused" {
-                    thread.activity = if clean { "done" } else { "blocked" }.into();
+                    thread.activity = if clean && reported { "done" } else { "blocked" }.into();
                 }
                 thread.revision += 1;
                 for message in thread.pending() {
@@ -560,6 +764,14 @@ pub fn agent_start(
         );
     });
     Ok(AgentRun { run_id, session_id })
+}
+
+/// Whether a tool call changed a file. Counted for the row badge, nothing else.
+fn is_edit(tool: &str) -> bool {
+    let tool = tool.to_lowercase();
+    ["edit", "write", "patch", "file_change"]
+        .iter()
+        .any(|name| tool.contains(name))
 }
 
 fn activity_of(tool: &str) -> &'static str {
@@ -589,23 +801,115 @@ pub async fn agent_send_message(
 
 fn send_message(app: &AppHandle, scope: Scope, message: UserMessage) -> Result<(), String> {
     let key = scope.key()?;
+    // Writing to a worker that has stopped is how a person changes work that is
+    // already done. There is nobody to interrupt, so the message becomes the
+    // instruction for its next run and the task goes back on the queue. The
+    // worktree is untouched: the next run continues where this one left off.
+    let reopening = match scope.task_id.as_deref() {
+        Some(task) if scope.role == "worker" => {
+            let running = app.state::<Running>();
+            let stopped = {
+                let mut state = running.0.lock().unwrap();
+                let thread = state.conversations.ensure(&scope)?;
+                thread.run_id.is_some() && !thread.streaming
+            };
+            // Refused before the message is kept, so a task that cannot be
+            // reopened does not silently swallow what was typed.
+            if stopped {
+                reopen_task(app, task)?;
+            }
+            stopped
+        }
+        _ => false,
+    };
     let run = {
         let running = app.state::<Running>();
         let mut state = running.0.lock().unwrap();
         let thread = state.conversations.ensure(&scope)?;
-        if thread.run_id.is_some() && !thread.streaming {
+        if !reopening && thread.run_id.is_some() && !thread.streaming {
             return Err(
                 "That agent has stopped. Start or resume the conversation before sending.".into(),
             );
         }
         thread.enqueue(message)?;
+        if reopening {
+            thread.activity = "queued".into();
+            thread.revision += 1;
+        }
         let run = thread.run_id.clone();
         publish(app, thread);
-        run
+        // A stopped run cannot be handed anything; the next one collects it.
+        if reopening {
+            None
+        } else {
+            run
+        }
     };
     if let Some(run) = run {
         deliver_pending(app, &key, &run)?;
     }
+    Ok(())
+}
+
+/// Put a finished worker's task back on the queue.
+///
+/// The worktree is left exactly as the worker left it, so the next run carries
+/// on from its own commits rather than starting the task again.
+fn reopen_task(app: &AppHandle, task_id: &str) -> Result<(), String> {
+    let store = crate::workspace::for_app(app)?;
+    store.change(|w| reopen(w, task_id))?;
+    Ok(())
+}
+
+/// Whether this task may go back on the queue, and the change if it may.
+///
+/// Kept apart from the app so the rules can be read and tested on their own.
+pub fn reopen(w: &mut serde_json::Value, task_id: &str) -> Result<(), String> {
+    let id = serde_json::json!(task_id);
+    let tasks = w["agentTasks"].as_array().ok_or("Invalid tasks")?;
+    let target = tasks
+        .iter()
+        .find(|t| t["id"] == id)
+        .ok_or("That task is no longer in the workspace")?;
+    // A shipped ticket has nothing left running to pick the work up, so queuing
+    // it would look like it worked and then do nothing.
+    let parent = target["parentTaskId"].clone();
+    if w["tasks"]
+        .as_array()
+        .and_then(|list| list.iter().find(|t| t["id"] == parent))
+        .is_some_and(|t| t["status"] == serde_json::json!("complete"))
+    {
+        return Err("This ticket is finished. Open a new ticket for further changes.".into());
+    }
+    // Work built on top of this would be standing on something being changed
+    // underneath it.
+    if target["status"] == serde_json::json!("complete") {
+        let dependents: Vec<&str> = tasks
+            .iter()
+            .filter(|t| {
+                t["dependencyIds"]
+                    .as_array()
+                    .is_some_and(|d| d.contains(&id))
+                    && ["running", "review", "complete"]
+                        .contains(&t["status"].as_str().unwrap_or(""))
+            })
+            .filter_map(|t| t["title"].as_str())
+            .collect();
+        if !dependents.is_empty() {
+            return Err(format!(
+                "Reopen the work that depends on this first: {}",
+                dependents.join(", ")
+            ));
+        }
+    }
+    let item = w["agentTasks"]
+        .as_array_mut()
+        .ok_or("Invalid tasks")?
+        .iter_mut()
+        .find(|t| t["id"] == id)
+        .ok_or("That task is no longer in the workspace")?;
+    item["status"] = serde_json::json!("queued");
+    item["updatedAt"] = serde_json::json!(crate::workspace::now());
     Ok(())
 }
 
@@ -905,6 +1209,46 @@ fn write_user_message(handle: &mut ChildStdin, text: &str) -> std::io::Result<()
 mod tests {
     use super::*;
 
+    /// Writing in a finished worker's conversation is how work gets changed, so
+    /// what may and may not be reopened is the rule worth pinning down.
+    #[test]
+    fn reopening_a_task_is_allowed_unless_something_already_stands_on_it() {
+        let workspace = |ticket: &str, first: &str, second: &str| {
+            serde_json::json!({
+                "tasks": [{"id": "t1", "projectId": "p", "status": ticket}],
+                "agentTasks": [
+                    {"id": "a", "parentTaskId": "t1", "title": "first",
+                     "status": first, "dependencyIds": []},
+                    {"id": "b", "parentTaskId": "t1", "title": "second",
+                     "status": second, "dependencyIds": ["a"]},
+                ],
+            })
+        };
+
+        // The ordinary case: a finished worker's task goes back on the queue.
+        let mut w = workspace("running", "complete", "queued");
+        reopen(&mut w, "a").unwrap();
+        assert_eq!(w["agentTasks"][0]["status"], "queued");
+
+        // A blocked task is reopened the same way, with nothing in its path.
+        let mut w = workspace("running", "blocked", "queued");
+        reopen(&mut w, "a").unwrap();
+        assert_eq!(w["agentTasks"][0]["status"], "queued");
+
+        // Work built on top of it has to be reopened first, and is named.
+        let mut w = workspace("running", "complete", "complete");
+        let refused = reopen(&mut w, "a").unwrap_err();
+        assert!(refused.contains("second"), "{refused}");
+        assert_eq!(w["agentTasks"][0]["status"], "complete", "left untouched");
+
+        // A shipped ticket has nobody left to pick the work up.
+        let mut w = workspace("complete", "complete", "complete");
+        assert!(reopen(&mut w, "a").unwrap_err().contains("new ticket"));
+
+        let mut w = workspace("running", "complete", "queued");
+        assert!(reopen(&mut w, "gone").is_err());
+    }
+
     #[test]
     fn worker_launch_receives_model_and_system_prompt() {
         let mut plan = LaunchPlan {
@@ -982,6 +1326,18 @@ mod tests {
         let mut out = Vec::new();
         let session = parse_line(harness, &value, &mut out);
         (out, session)
+    }
+
+    #[test]
+    fn only_file_changing_tools_count_as_edits() {
+        assert!(is_edit("Edit"));
+        assert!(is_edit("MultiEdit"));
+        assert!(is_edit("Write"));
+        assert!(is_edit("apply_patch"));
+        assert!(is_edit("file_change"));
+        assert!(!is_edit("Bash"));
+        assert!(!is_edit("Read"));
+        assert!(!is_edit("merge-wait"));
     }
 
     #[test]
@@ -1186,6 +1542,86 @@ mod tests {
         );
         finish_fixture(state.live.remove("run-a").unwrap());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `tauri dev` builds the app alone, so the helper beside it goes stale and
+    /// every worker then runs rules the window has already replaced.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn a_worker_helper_older_than_its_source_is_refused() {
+        let dir = std::env::temp_dir().join(format!("berdloop-helper-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let helper = dir.join("berdloop-worker");
+        std::fs::write(&helper, b"\x7fELF fake binary").unwrap();
+
+        // Set both times from the source tree, never from the clock: another
+        // session editing this repo while the test runs must not fail it.
+        let source = newest_source(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src")).unwrap();
+        let touch = |at: std::time::SystemTime| {
+            std::fs::File::options()
+                .write(true)
+                .open(&helper)
+                .unwrap()
+                .set_modified(at)
+                .unwrap();
+        };
+
+        // Newer than every source file: nothing to complain about. This is the
+        // ordinary case the old check got wrong, because `tauri dev` relinks the
+        // app after the helper and the helper then looked stale on every build.
+        touch(source + std::time::Duration::from_secs(60));
+        assert!(check_worker_binary(&helper).is_ok());
+
+        // Older than the source it was built from: refused, with the fix.
+        touch(source - std::time::Duration::from_secs(60));
+        let refused = check_worker_binary(&helper).unwrap_err();
+        assert!(refused.contains("older than the code"), "{refused}");
+        assert!(refused.contains("cargo build --bins"), "{refused}");
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_restart_puts_running_threads_back_to_work_and_leaves_finished_ones() {
+        let mut book = Conversations::default();
+        let mut make = |task: &str, activity: &str, streaming: bool, pgid: Option<u32>| {
+            let thread = book
+                .ensure(&Scope {
+                    organization_id: "org".into(),
+                    project_id: "p".into(),
+                    role: "worker".into(),
+                    ticket_id: Some("t".into()),
+                    task_id: Some(task.into()),
+                })
+                .unwrap();
+            thread.activity = activity.into();
+            thread.streaming = streaming;
+            thread.pgid = pgid;
+            thread.session_id = Some(format!("session-{task}"));
+        };
+        make("cut-off", "coding", true, Some(4242));
+        make("finished", "done", true, Some(4343));
+        make("stopped", "paused", false, Some(4444));
+
+        let mut stale = interrupt(&mut book);
+        stale.sort();
+
+        // Both processes the app left running are stopped, whatever they were
+        // doing: nothing is reading their output any more.
+        assert_eq!(stale, vec![4242, 4343]);
+        // Work that was cut off is put back to work, on its own session.
+        assert!(book.0["cut-off"].interrupted);
+        assert!(!book.0["cut-off"].streaming);
+        assert_eq!(
+            book.0["cut-off"].session_id.as_deref(),
+            Some("session-cut-off")
+        );
+        // Work that had already reported is left alone.
+        assert!(!book.0["finished"].interrupted);
+        assert_eq!(book.0["finished"].activity, "done");
+        // A thread that was not running is not touched at all.
+        assert!(!book.0["stopped"].interrupted);
+        assert_eq!(book.0["stopped"].pgid, Some(4444));
     }
 
     #[test]

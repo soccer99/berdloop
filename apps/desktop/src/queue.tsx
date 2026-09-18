@@ -11,14 +11,16 @@ import {
 } from "@mantine/core";
 import { useLocalStorage } from "@mantine/hooks";
 import {
-  IconArrowDown,
   IconArrowLeft,
   IconArrowUp,
   IconChevronDown,
   IconChevronRight,
+  IconChevronUp,
+  IconClock,
   IconGitBranch,
   IconGripVertical,
   IconMessage,
+  IconPencil,
   IconPlayerPlay,
   IconPlayerStop,
   IconPlus,
@@ -41,15 +43,20 @@ import {
   ticketState,
   threadMessages,
   type AgentActivity,
+  type MergeEntry,
+  mergeIsLive,
+  mergeActivity,
   type ThreadMessage,
   type WorkflowAction,
   type WorkflowRuntime,
 } from "./workflow-ui";
 import "./workflow.css";
 import type { Runtime } from "./workflow-runtime";
+import type { ConversationSnapshot } from "./conversation-routing";
 import { HumanRequestCard } from "./agent-chat";
 import { orderAgentTasks, orderTickets, routeSteering } from "./jev";
 import { ChangesPanel } from "./changes-panel";
+import { openExternally } from "./external-link";
 
 interface QueueProps {
   workspace: TaskWorkspace;
@@ -93,6 +100,72 @@ function Status({
     <span className={`wf-status wf-status-${activity ?? "queued"}`}>
       <i />
       {label ?? (activity ? activityLabels[activity] : "Queued")}
+    </span>
+  );
+}
+/** How long a run has been going, in the shortest form that stays honest. */
+function elapsed(since: number, now: number): string {
+  const minutes = Math.floor(Math.max(0, now - since) / 60000);
+  if (minutes < 1) return "<1m";
+  if (minutes < 60) return `${minutes}m`;
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+}
+/**
+ * When a merge attempt joined the line.
+ *
+ * A merge queue is read back long after the ticket closed, so anything that
+ * did not happen today carries its date. A bare time would be unreadable.
+ */
+function mergeWhen(at: number): string {
+  const when = new Date(at);
+  const now = new Date();
+  if (when.toDateString() === now.toDateString())
+    return when.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return when.toLocaleString([], {
+    year: when.getFullYear() === now.getFullYear() ? undefined : "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+/**
+ * What a worker has done so far: edits, messages, and how long it has run.
+ *
+ * The clock only shows while the process is alive, because a finished run has
+ * no end stamp and a number that keeps climbing would be a lie.
+ */
+function RowStats({
+  thread,
+  now,
+}: {
+  thread?: ConversationSnapshot;
+  now: number;
+}) {
+  const edits = thread?.edits ?? 0;
+  const messages = thread?.messages.length ?? 0;
+  const running = thread?.streaming ? thread.startedAt : undefined;
+  if (!edits && !messages && !running) return null;
+  return (
+    <span className="wf-row-stats">
+      {edits > 0 && (
+        <span title={`${edits} file ${edits === 1 ? "edit" : "edits"}`}>
+          <IconPencil size={12} />
+          {edits}
+        </span>
+      )}
+      {messages > 0 && (
+        <span title={`${messages} ${messages === 1 ? "message" : "messages"}`}>
+          <IconMessage size={12} />
+          {messages}
+        </span>
+      )}
+      {running && (
+        <span className="wf-row-clock" title="Time running">
+          <IconClock size={12} />
+          {elapsed(running, now)}
+        </span>
+      )}
     </span>
   );
 }
@@ -541,16 +614,27 @@ export function QueueView({
   );
   const selected = tasks.find((item) => item.id === selectedTaskId);
   const thread = selected ? runtime?.threads[selected.id] : undefined;
-  const mergeQueue = ticket
+  const mergeQueue: MergeEntry[] = ticket
     ? (runtime?.mergeQueues?.[ticket.id] ??
       tasks
-        .filter(
-          (item) =>
-            taskActivity(item, runtime?.threads[item.id]) ===
-            "waiting-to-merge",
-        )
-        .map((item) => item.id))
+        .filter((item) => activityOf(item) === "waiting-to-merge")
+        .map((item) => ({
+          taskId: item.id,
+          status: "waiting" as const,
+          at: 0,
+        })))
     : [];
+  // Only attempts still in the line hold a queue position. The rest are the
+  // ticket's merge history, which is kept and never trimmed.
+  const stillWaiting = mergeQueue.filter(mergeIsLive);
+  const landed = new Set(
+    mergeQueue.filter((item) => item.status === "merged").map((i) => i.taskId),
+  );
+  const mergeHistory = mergeQueue.filter((item) => !mergeIsLive(item));
+  const activityOf = (item: AgentTask) =>
+    taskActivity(item, runtime?.threads[item.id], landed.has(item.id));
+  const mergePosition = (taskId: string) =>
+    stillWaiting.findIndex((item) => item.taskId === taskId);
   const connected = !!runtime?.connected;
   const ticketAgentKey = `ticket-agent:${projectId || `organization:${organizationId}`}`;
   const plannerKey = `planner:${ticket?.id ?? ""}`;
@@ -562,16 +646,13 @@ export function QueueView({
     (item) => item.status === "queued",
   );
   const activeTasks = tasks.filter(
-    (item) =>
-      !["queued", "done"].includes(
-        taskActivity(item, runtime?.threads[item.id]),
-      ),
+    (item) => !["queued", "done", "merged"].includes(activityOf(item)),
   );
-  const queuedTasks = tasks.filter(
-    (item) => taskActivity(item, runtime?.threads[item.id]) === "queued",
-  );
-  const doneTasks = tasks.filter(
-    (item) => taskActivity(item, runtime?.threads[item.id]) === "done",
+  const queuedTasks = tasks.filter((item) => activityOf(item) === "queued");
+  // Finished work that never landed stays visible beside what did, so a task
+  // that stopped short of the merge queue cannot be mistaken for shipped.
+  const doneTasks = tasks.filter((item) =>
+    ["done", "merged"].includes(activityOf(item)),
   );
 
   useEffect(() => {
@@ -690,6 +771,13 @@ export function QueueView({
     }
   }
   const [ordering, setOrdering] = useState(false);
+  // A slow clock, only so the running times keep counting while a worker is
+  // quiet. Streamed output already redraws the rows when there is any.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 30_000);
+    return () => clearInterval(timer);
+  }, []);
 
   /**
    * Beta: let a decision model put a queue in build order.
@@ -816,10 +904,21 @@ export function QueueView({
     index: number,
     length: number,
   ) {
+    // One control: drag the grip in the middle, or tap the arrow above or
+    // below it to bump the row one place.
     return (
-      <div className="wf-order">
+      <div className="wf-move">
+        <button
+          className="wf-move-step"
+          aria-label="Move up in queue"
+          title="Move up in queue"
+          disabled={index === 0 || !ready}
+          onClick={() => move(kind, id, -1)}
+        >
+          <IconChevronUp size={13} />
+        </button>
         <span
-          className="wf-drag-handle"
+          className="wf-move-grip"
           draggable={ready}
           aria-label="Drag to reorder"
           title="Drag to reorder"
@@ -832,23 +931,16 @@ export function QueueView({
             dragging.current = null;
           }}
         >
-          <IconGripVertical size={15} />
+          <IconGripVertical size={14} />
         </span>
         <button
-          aria-label="Move up in queue"
-          title="Move up in queue"
-          disabled={index === 0 || !ready}
-          onClick={() => move(kind, id, -1)}
-        >
-          <IconArrowUp size={14} />
-        </button>
-        <button
+          className="wf-move-step"
           aria-label="Move down in queue"
           title="Move down in queue"
           disabled={index === length - 1 || !ready}
           onClick={() => move(kind, id, 1)}
         >
-          <IconArrowDown size={14} />
+          <IconChevronDown size={13} />
         </button>
       </div>
     );
@@ -856,7 +948,7 @@ export function QueueView({
   function taskRows(items: AgentTask[], queued = false) {
     return items.map((item, index) => {
       const currentThread = runtime?.threads[item.id];
-      const activity = taskActivity(item, currentThread);
+      const activity = taskActivity(item, currentThread, landed.has(item.id));
       return (
         <div
           key={item.id}
@@ -876,13 +968,14 @@ export function QueueView({
             onClick={() => setSelectedTaskId(item.id)}
           >
             <div className="wf-row-top">
-              <span>
+              <span className="wf-row-mark">
                 {queued ? (
                   String(index + 1).padStart(2, "0")
                 ) : (
-                  <IconTerminal2 size={15} />
+                  <IconTerminal2 size={14} />
                 )}
               </span>
+              <strong>{item.title}</strong>
               <Status activity={activity} />
               {runtime?.stalled?.[item.id] && (
                 <Badge size="xs" color="yellow" variant="light">
@@ -890,12 +983,12 @@ export function QueueView({
                 </Badge>
               )}
             </div>
-            <strong>{item.title}</strong>
             <small>
               {currentThread?.agentId ?? item.assigneeId ?? "Unassigned"}
-              {mergeQueue.includes(item.id)
-                ? ` · Merge queue #${mergeQueue.indexOf(item.id) + 1}`
+              {mergePosition(item.id) >= 0
+                ? ` · Merge queue #${mergePosition(item.id) + 1}`
                 : ""}
+              <RowStats thread={currentThread} now={now} />
             </small>
             <p>
               {currentThread?.messages.at(-1)?.text ??
@@ -1207,7 +1300,7 @@ export function QueueView({
                 <span>{number}</span>
                 {title}
                 {id === "work" && <small>{tasks.length}</small>}
-                {id === "merge" && <small>{mergeQueue.length}</small>}
+                {id === "merge" && <small>{stillWaiting.length}</small>}
               </button>
             ))}
           </nav>
@@ -1234,7 +1327,12 @@ export function QueueView({
               <div className="wf-section-heading">
                 <div>
                   {ticket.sourceUrl && (
-                    <a href={ticket.sourceUrl} target="_blank" rel="noreferrer">
+                    <a
+                      href={ticket.sourceUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      onClick={openExternally}
+                    >
                       Open source ticket ↗
                     </a>
                   )}
@@ -1349,7 +1447,13 @@ export function QueueView({
                       </button>
                       <div className="wf-thread-heading">
                         <div>
-                          <Status activity={taskActivity(selected, thread)} />
+                          <Status
+                            activity={taskActivity(
+                              selected,
+                              thread,
+                              landed.has(selected.id),
+                            )}
+                          />
                           <h2>{selected.title}</h2>
                           <small>
                             {thread?.agentId ??
@@ -1380,7 +1484,11 @@ export function QueueView({
                       <div className="wf-prompt">
                         <div className="wf-section-heading">
                           <h3>
-                            {taskActivity(selected, thread) === "queued"
+                            {taskActivity(
+                              selected,
+                              thread,
+                              landed.has(selected.id),
+                            ) === "queued"
                               ? "Queued prompt"
                               : "Task prompt"}
                           </h3>
@@ -1390,7 +1498,11 @@ export function QueueView({
                             disabled={
                               !ready ||
                               !["queued", "paused", "blocked"].includes(
-                                taskActivity(selected, thread),
+                                taskActivity(
+                                  selected,
+                                  thread,
+                                  landed.has(selected.id),
+                                ),
                               )
                             }
                             onClick={() => setTaskEditor(selected)}
@@ -1461,7 +1573,11 @@ export function QueueView({
                         streaming={thread?.streaming}
                         label="Message task agent"
                         placeholder={
-                          taskActivity(selected, thread) === "queued"
+                          taskActivity(
+                            selected,
+                            thread,
+                            landed.has(selected.id),
+                          ) === "queued"
                             ? "Add context for the agent that picks up this task…"
                             : "Give this agent new context or direction…"
                         }
@@ -1474,7 +1590,11 @@ export function QueueView({
                       <div className="wf-thread-footer">
                         <small>
                           {thread?.worktree ??
-                            (taskActivity(selected, thread) === "queued"
+                            (taskActivity(
+                              selected,
+                              thread,
+                              landed.has(selected.id),
+                            ) === "queued"
                               ? "Worktree assigned when work begins."
                               : "No worktree reported.")}
                         </small>
@@ -1485,7 +1605,11 @@ export function QueueView({
                           disabled={
                             !ready ||
                             !["queued", "paused", "blocked", "done"].includes(
-                              taskActivity(selected, thread),
+                              taskActivity(
+                                selected,
+                                thread,
+                                landed.has(selected.id),
+                              ),
                             )
                           }
                           onClick={() =>
@@ -1515,30 +1639,48 @@ export function QueueView({
               <div className="wf-section-heading">
                 <h2>Merge queue</h2>
                 <Badge variant="light" color="gray">
-                  {mergeQueue.length} waiting
+                  {stillWaiting.length} waiting · {mergeHistory.length} finished
                 </Badge>
               </div>
               <p className="muted">
-                Workers merge into the ticket branch one at a time. Conflict
-                fixes and checks appear in each agent thread.
+                Workers merge into the ticket branch one at a time. Every
+                attempt stays on this list, in the order it ran, whether it
+                landed, gave up or died. Conflict fixes and checks appear in
+                each agent thread.
               </p>
               {mergeQueue.length ? (
-                mergeQueue.map((id, index) => {
-                  const item = tasks.find((item) => item.id === id);
+                mergeQueue.map(({ taskId, status, at }, index) => {
+                  const item = tasks.find((item) => item.id === taskId);
+                  const place = mergePosition(taskId);
                   return (
                     <button
                       className="wf-merge-row"
-                      key={id}
+                      // One task can merge more than once, so the task id alone
+                      // is not unique on this list.
+                      key={`${taskId}-${at}-${index}`}
                       onClick={() => {
-                        setSelectedTaskId(id);
+                        setSelectedTaskId(taskId);
                         setStep("work");
                       }}
                     >
-                      <span>{String(index + 1).padStart(2, "0")}</span>
-                      <strong>{item?.title ?? id}</strong>
+                      <span>
+                        {place >= 0 ? String(place + 1).padStart(2, "0") : "—"}
+                      </span>
+                      <strong>{item?.title ?? taskId}</strong>
+                      {at > 0 && (
+                        <time
+                          className="wf-merge-when"
+                          dateTime={new Date(at).toISOString()}
+                        >
+                          {mergeWhen(at)}
+                        </time>
+                      )}
                       <Status
                         activity={
-                          runtime?.threads[id]?.activity ?? "waiting-to-merge"
+                          status === "merging" || status === "conflict"
+                            ? (runtime?.threads[taskId]?.activity ??
+                              mergeActivity[status])
+                            : mergeActivity[status]
                         }
                       />
                       <IconChevronRight size={15} />
@@ -1546,9 +1688,9 @@ export function QueueView({
                   );
                 })
               ) : (
-                <Empty title="No workers waiting to merge">
+                <Empty title="Nothing has merged on this ticket yet">
                   A worker joins after implementing, testing, and confirming its
-                  task.
+                  task. Once it does, it stays on this list for good.
                 </Empty>
               )}
             </section>
@@ -1570,6 +1712,7 @@ export function QueueView({
                   href={runtime.pullRequests[ticket.id]!.url}
                   target="_blank"
                   rel="noreferrer"
+                  onClick={openExternally}
                 >
                   Open pull request · {runtime.pullRequests[ticket.id]!.status}{" "}
                   ↗

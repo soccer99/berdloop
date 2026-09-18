@@ -322,6 +322,14 @@ export const berdloopTools: ToolSpec[] = [
     use: "The first thing you do on your turn. It answers with the list of conflicted files, which will be empty when the merge was clean.",
   },
   {
+    name: "merge_conflicts",
+    roles: ["worker"],
+    summary:
+      "Show both sides of every conflicted file, and when each was written.",
+    args: [TASK_ARG],
+    use: "Call this the moment merge_sync reports a conflict, before you open a file. It names each side's last commit and its date, which is what tells you whether the other change already knew about yours.",
+  },
+  {
     name: "merge_land",
     roles: ["worker"],
     summary: "Move the ticket branch onto your finished work.",
@@ -403,7 +411,7 @@ export const berdloopTools: ToolSpec[] = [
           "What you did, and the check you ran that proves the criteria are met. If blocked, what stopped you.",
       },
     ],
-    use: "The last thing you do, whatever the outcome.",
+    use: "The last thing you do, whatever the outcome. `complete` is refused unless your work has landed on the ticket branch, so merge before you report. Reporting is not optional: a task nobody reports is recorded as blocked when you exit.",
   },
 
   // ---- task agent: steers the workers on its ticket ----

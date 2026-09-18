@@ -15,8 +15,6 @@ interface WorkspaceHeaderProps {
   loop: LoopStatus;
   loopTicketId: string;
   loopProject?: Project;
-  /** Worker processes alive right now. */
-  busyWorkers: number;
   onWorkersChange: (workers: number) => void;
 }
 
@@ -30,7 +28,6 @@ export function WorkspaceHeader({
   loop,
   loopTicketId,
   loopProject,
-  busyWorkers,
   onWorkersChange,
 }: WorkspaceHeaderProps) {
   const isQueue = view === "loops" || view === "queue";
@@ -58,22 +55,21 @@ export function WorkspaceHeader({
           {navigationOpen ? "Close menu" : "Workspace menu"}
         </Button>
       </div>
-      <div className="header-breadcrumbs">
-        <nav className="header-path" aria-label="Breadcrumbs">
-          <span className="breadcrumb">
-            {organizationName}
-            {(isQueue || view === "tools") && projectName
-              ? ` / ${projectName}`
-              : ""}{" "}
-            /
-          </span>{" "}
-          {currentPage}
-        </nav>
+      <nav className="header-path" aria-label="Breadcrumbs">
+        <span className="breadcrumb">
+          {organizationName}
+          {(isQueue || view === "tools") && projectName
+            ? ` / ${projectName}`
+            : ""}{" "}
+          /
+        </span>{" "}
+        {currentPage}
+      </nav>
+      <div className="header-controls">
         <LoopBar
           loop={loop}
           ticketId={loopTicketId}
           project={loopProject}
-          busy={busyWorkers}
           onWorkersChange={onWorkersChange}
         />
       </div>

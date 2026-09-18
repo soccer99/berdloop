@@ -129,6 +129,16 @@ pub struct ChangedFile {
     pub diff: String,
 }
 
+/// One conflicted file, and the last commit that touched it on either side.
+#[derive(Debug, Clone)]
+pub struct ConflictSide {
+    pub file: String,
+    /// The worker's own branch.
+    pub mine: String,
+    /// The ticket branch, which is another worker's landed work.
+    pub theirs: String,
+}
+
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MergeOutcome {
@@ -172,6 +182,38 @@ fn git_try(dir: &Path, args: &[&str]) -> (bool, String) {
             (out.status.success(), text)
         }
         Err(e) => (false, format!("git could not run: {e}")),
+    }
+}
+
+/// How long a scratch index may lie around before it is treated as litter.
+///
+/// Long enough that a slow `git add -A` on a large worktree is never swept
+/// while it is still running.
+const SCRATCH_LIFE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Clear scratch indexes left by a run of the app that was stopped.
+///
+/// Killing git part way through leaves its `.lock` behind. The file is ours
+/// alone and is rebuilt on every call, so an old one is always litter. The
+/// `.tree` files beside them are the record of each turn and are never touched.
+fn sweep_scratch(scratch: &Path) {
+    let Ok(entries) = std::fs::read_dir(scratch) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.ends_with(".index") && !name.ends_with(".index.lock") {
+            continue;
+        }
+        let old = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .is_ok_and(|at| at.elapsed().is_ok_and(|age| age > SCRATCH_LIFE));
+        if old {
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }
 
@@ -569,18 +611,22 @@ impl Staging {
         }
         let _ = std::fs::remove_file(notes.join(format!("{}.landed", safe_ref(task_id))));
         std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
+        // A directory can go missing while the branch survives: the task was
+        // reopened after its worktree was cleaned up. Reattaching to the branch
+        // brings the worker's own commits back, which is what it is being asked
+        // to carry on from. Only a task with no branch starts from the ticket.
+        let existing = git(&bare, &["rev-parse", "--verify", "--quiet", &branch]).is_ok();
+        // Git still holds a registration for a directory deleted behind its back.
+        let _ = git(&bare, &["worktree", "prune"]);
         let from = ticket_branch(ticket);
+        let target = path.to_string_lossy().into_owned();
         git(
             &bare,
-            &[
-                "worktree",
-                "add",
-                "--quiet",
-                "-b",
-                &branch,
-                &path.to_string_lossy(),
-                &from,
-            ],
+            &if existing {
+                vec!["worktree", "add", "--quiet", &target, &branch]
+            } else {
+                vec!["worktree", "add", "--quiet", "-b", &branch, &target, &from]
+            },
         )?;
         // Only a brand new directory needs this, and only once: it costs an
         // install, and a worker that is already running would lose its work if
@@ -614,11 +660,21 @@ impl Staging {
         let index = path.join(git(&path, &["rev-parse", "--git-path", "index"])?);
         let scratch = self.turns_dir();
         std::fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
-        let copy = scratch.join(format!("{}.index", safe_ref(task_id)));
+        sweep_scratch(&scratch);
+        // A name of its own for every call. The window asks what changed on
+        // every streamed message, so several of these run at once on the same
+        // task; sharing one scratch index made them fight for its git lock,
+        // and the loser answered "Another git process seems to be running".
+        let copy = scratch.join(format!(
+            "{}.{}.index",
+            safe_ref(task_id),
+            uuid::Uuid::new_v4()
+        ));
         std::fs::copy(&index, &copy).map_err(|e| e.to_string())?;
         let tree = git_with_index(&path, &copy, &["add", "-A"])
             .and_then(|_| git_with_index(&path, &copy, &["write-tree"]));
         let _ = std::fs::remove_file(&copy);
+        let _ = std::fs::remove_file(copy.with_extension("index.lock"));
         tree
     }
 
@@ -787,7 +843,55 @@ impl Staging {
         })
     }
 
-    /// Move the ticket branch forward onto the worker's finished branch.
+    /// What each side of a conflict is, and when it was written.
+    ///
+    /// A worker resolving a conflict is deciding between two changes it did not
+    /// both make. Which came first, and from whose task, is the context that
+    /// decides which intention is the current one, so it is gathered here
+    /// rather than left to the worker to work out from raw git.
+    pub fn conflict_sides(&self, task_id: &str) -> Result<Vec<ConflictSide>, String> {
+        let path = self.work(task_id);
+        if !path.exists() {
+            return Err("That task has no worktree.".to_string());
+        }
+        if git(&path, &["rev-parse", "--verify", "--quiet", "MERGE_HEAD"]).is_err() {
+            return Ok(Vec::new());
+        }
+        let files: Vec<String> = git(&path, &["diff", "--name-only", "--diff-filter=U"])
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        // "%an wrote it, %ar" reads as prose in the tool's reply on purpose: the
+        // worker is being told a story about the file, not handed a log.
+        let describe = |revision: &str, file: &str| {
+            git(
+                &path,
+                &[
+                    "log",
+                    "-1",
+                    "--date=iso",
+                    "--format=%s — %an, %ad",
+                    revision,
+                    "--",
+                    file,
+                ],
+            )
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+        };
+        Ok(files
+            .into_iter()
+            .map(|file| ConflictSide {
+                mine: describe("HEAD", &file),
+                theirs: describe("MERGE_HEAD", &file),
+                file,
+            })
+            .collect())
+    }
+
+    /// Move the ticket branch forward onto the worker's finished work.
     ///
     /// This is the second half of a merge queue turn. Because the worker has
     /// already merged the ticket into itself, this can only ever be a fast
@@ -920,7 +1024,15 @@ pub fn staging_for(app: &tauri::AppHandle, project_id: &str) -> Result<Staging, 
 }
 
 #[tauri::command]
-pub fn git_prepare(
+pub async fn git_prepare(
+    app: tauri::AppHandle,
+    project_id: String,
+    source: String,
+) -> Result<Prepared, String> {
+    crate::offload(move || git_prepare_blocking(app, project_id, source)).await
+}
+
+fn git_prepare_blocking(
     app: tauri::AppHandle,
     project_id: String,
     source: String,
@@ -929,7 +1041,16 @@ pub fn git_prepare(
 }
 
 #[tauri::command]
-pub fn git_start_ticket(
+pub async fn git_start_ticket(
+    app: tauri::AppHandle,
+    project_id: String,
+    ticket: String,
+    base_branch: String,
+) -> Result<Worktree, String> {
+    crate::offload(move || git_start_ticket_blocking(app, project_id, ticket, base_branch)).await
+}
+
+fn git_start_ticket_blocking(
     app: tauri::AppHandle,
     project_id: String,
     ticket: String,
@@ -944,7 +1065,16 @@ pub fn git_start_ticket(
 /// the admin credentials, and those live in the app, deliberately out of reach
 /// of anything a worker can read. A project with no `.berd/` skips all of it.
 #[tauri::command]
-pub fn git_open_task(
+pub async fn git_open_task(
+    app: tauri::AppHandle,
+    project_id: String,
+    ticket: String,
+    task_id: String,
+) -> Result<Worktree, String> {
+    crate::offload(move || git_open_task_blocking(app, project_id, ticket, task_id)).await
+}
+
+fn git_open_task_blocking(
     app: tauri::AppHandle,
     project_id: String,
     ticket: String,
@@ -973,7 +1103,17 @@ pub fn git_open_task(
 /// What one worker has changed, against the ticket, its last commit, or the
 /// point where it was last given an instruction.
 #[tauri::command]
-pub fn git_task_changes(
+pub async fn git_task_changes(
+    app: tauri::AppHandle,
+    project_id: String,
+    ticket: String,
+    task_id: String,
+    base: String,
+) -> Result<Changes, String> {
+    crate::offload(move || git_task_changes_blocking(app, project_id, ticket, task_id, base)).await
+}
+
+fn git_task_changes_blocking(
     app: tauri::AppHandle,
     project_id: String,
     ticket: String,
@@ -984,7 +1124,18 @@ pub fn git_task_changes(
 }
 
 #[tauri::command]
-pub fn git_sync_from_ticket(
+pub async fn git_sync_from_ticket(
+    app: tauri::AppHandle,
+    project_id: String,
+    ticket: String,
+    task_id: String,
+    message: String,
+) -> Result<MergeOutcome, String> {
+    crate::offload(move || git_sync_from_ticket_blocking(app, project_id, ticket, task_id, message))
+        .await
+}
+
+fn git_sync_from_ticket_blocking(
     app: tauri::AppHandle,
     project_id: String,
     ticket: String,
@@ -997,7 +1148,17 @@ pub fn git_sync_from_ticket(
 }
 
 #[tauri::command]
-pub fn git_land(
+pub async fn git_land(
+    app: tauri::AppHandle,
+    project_id: String,
+    ticket: String,
+    task_id: String,
+    message: String,
+) -> Result<MergeOutcome, String> {
+    crate::offload(move || git_land_blocking(app, project_id, ticket, task_id, message)).await
+}
+
+fn git_land_blocking(
     app: tauri::AppHandle,
     project_id: String,
     ticket: String,
@@ -1015,7 +1176,16 @@ pub fn git_land(
 /// before the worktree goes, so nothing is left running against a directory
 /// that no longer exists.
 #[tauri::command]
-pub fn git_close_task(
+pub async fn git_close_task(
+    app: tauri::AppHandle,
+    project_id: String,
+    ticket: String,
+    task_id: String,
+) -> Result<(), String> {
+    crate::offload(move || git_close_task_blocking(app, project_id, ticket, task_id)).await
+}
+
+fn git_close_task_blocking(
     app: tauri::AppHandle,
     project_id: String,
     ticket: String,
@@ -1033,7 +1203,16 @@ pub fn git_close_task(
 }
 
 #[tauri::command]
-pub fn git_ticket_status(
+pub async fn git_ticket_status(
+    app: tauri::AppHandle,
+    project_id: String,
+    ticket: String,
+    base_branch: String,
+) -> Result<TicketStatus, String> {
+    crate::offload(move || git_ticket_status_blocking(app, project_id, ticket, base_branch)).await
+}
+
+fn git_ticket_status_blocking(
     app: tauri::AppHandle,
     project_id: String,
     ticket: String,
@@ -1048,7 +1227,14 @@ pub fn git_ticket_status(
 /// this is how the loop learns an outcome even if the window was closed while
 /// the work ran.
 #[tauri::command]
-pub fn git_task_reports(
+pub async fn git_task_reports(
+    app: tauri::AppHandle,
+    project_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    crate::offload(move || git_task_reports_blocking(app, project_id)).await
+}
+
+fn git_task_reports_blocking(
     app: tauri::AppHandle,
     project_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
@@ -1063,7 +1249,18 @@ pub fn git_task_reports(
 }
 
 #[tauri::command]
-pub fn git_publish(
+pub async fn git_publish(
+    app: tauri::AppHandle,
+    project_id: String,
+    ticket: String,
+    remote_branch: String,
+    protected: String,
+) -> Result<String, String> {
+    crate::offload(move || git_publish_blocking(app, project_id, ticket, remote_branch, protected))
+        .await
+}
+
+fn git_publish_blocking(
     app: tauri::AppHandle,
     project_id: String,
     ticket: String,
@@ -1327,6 +1524,77 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_snapshots_of_one_task_do_not_fight_for_a_git_lock() {
+        let (_source, staging, _base) = ready("PROJ-24");
+        let tree = staging.open_task("PROJ-24", "busy").unwrap();
+        for index in 0..40 {
+            write(
+                &tree.path,
+                &format!("file{index}.txt"),
+                "content
+",
+            );
+        }
+        // The window asks what changed on every streamed message, so these run
+        // together on one task. Sharing a scratch index made one of them fail
+        // with "Another git process seems to be running in this repository".
+        let staging = std::sync::Arc::new(staging);
+        // Released together, so the calls really do overlap rather than queue.
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let staging = std::sync::Arc::clone(&staging);
+                let gate = std::sync::Arc::clone(&gate);
+                std::thread::spawn(move || {
+                    gate.wait();
+                    (0..10)
+                        .map(|_| staging.snapshot_tree("busy"))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        for worker in workers {
+            for result in worker.join().unwrap() {
+                result.expect("a snapshot was refused");
+            }
+        }
+        // Every scratch index is cleared up behind itself; the turn record stays.
+        let litter: Vec<_> = std::fs::read_dir(staging.root.join("turns"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".index"))
+            .collect();
+        assert!(litter.is_empty(), "left behind: {litter:?}");
+    }
+
+    #[test]
+    fn a_stale_scratch_index_lock_is_swept_instead_of_wedging_the_task() {
+        let (_source, staging, _base) = ready("PROJ-25");
+        let tree = staging.open_task("PROJ-25", "wedged").unwrap();
+        write(
+            &tree.path, "work.txt", "content
+",
+        );
+        // What a git process killed part way through leaves behind.
+        let stale = staging.root.join("turns").join("wedged.old.index.lock");
+        std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        std::fs::write(&stale, "").unwrap();
+        let old = chrono::Local::now()
+            - chrono::Duration::from_std(SCRATCH_LIFE).unwrap()
+            - chrono::Duration::minutes(1);
+        assert!(Command::new("touch")
+            .args(["-t", &old.format("%Y%m%d%H%M").to_string()])
+            .arg(&stale)
+            .status()
+            .unwrap()
+            .success());
+
+        assert!(staging.changes("PROJ-25", "wedged", "commit").is_ok());
+        assert!(!stale.exists(), "a stale lock was left to wedge the task");
+    }
+
+    #[test]
     fn preparing_never_writes_to_the_source() {
         let source = source_repo();
         let before = git(&source, &["rev-parse", "HEAD"]).unwrap();
@@ -1428,6 +1696,41 @@ mod tests {
         assert_eq!(status.files_changed, 1);
     }
 
+    /// Reopening a task must continue the worker's own work, not start over on
+    /// a fresh copy of the ticket branch.
+    #[test]
+    fn a_reopened_task_gets_its_own_commits_back() {
+        let source = source_repo();
+        let staging = staging();
+        let ready = staging.prepare(&source).unwrap();
+        staging.start_ticket("PROJ-11", &ready.base_branch).unwrap();
+
+        let tree = staging.open_task("PROJ-11", "redo").unwrap();
+        write(&tree.path, "half-done.txt", "the worker got this far\n");
+        staging.commit_task("redo", "partial work").unwrap();
+
+        // The directory is cleaned up, but the branch holds the work.
+        git(
+            &staging.bare(),
+            &["worktree", "remove", "--force", &tree.path],
+        )
+        .unwrap();
+        assert!(!Path::new(&tree.path).exists());
+
+        let again = staging.open_task("PROJ-11", "redo").unwrap();
+        assert_eq!(again.path, tree.path, "the same directory is reused");
+        assert_eq!(
+            std::fs::read_to_string(Path::new(&again.path).join("half-done.txt")).unwrap(),
+            "the worker got this far\n",
+            "the worker's commit came back"
+        );
+
+        // A task closed properly has no branch left, so it starts from the ticket.
+        staging.close_task("PROJ-11", "redo").unwrap();
+        let fresh = staging.open_task("PROJ-11", "redo").unwrap();
+        assert!(!Path::new(&fresh.path).join("half-done.txt").exists());
+    }
+
     #[test]
     fn closing_twice_is_harmless() {
         let source = source_repo();
@@ -1455,6 +1758,49 @@ mod tests {
 
         let status = staging.ticket_status("PROJ-1", &ready.base_branch).unwrap();
         assert_eq!(status.files_changed, 2);
+    }
+
+    /// The worker is told which side is whose and when each was written, because
+    /// that is what it resolves the conflict with.
+    #[test]
+    fn a_conflict_names_both_sides_and_when_each_was_written() {
+        let source = source_repo();
+        let staging = staging();
+        let ready = staging.prepare(&source).unwrap();
+        staging.start_ticket("PROJ-9", &ready.base_branch).unwrap();
+
+        for (task, body, message) in [
+            ("task-a", "A wins\ntwo\nthree\n", "rename the greeting"),
+            ("task-b", "B wins\ntwo\nthree\n", "translate the greeting"),
+        ] {
+            let tree = staging.open_task("PROJ-9", task).unwrap();
+            write(&tree.path, "app.txt", body);
+            staging.commit_task(task, message).unwrap();
+        }
+        staging.sync_from_ticket("PROJ-9", "task-a").unwrap();
+        staging.land("PROJ-9", "task-a").unwrap();
+
+        // Nothing is conflicted until a sync actually clashes.
+        assert!(staging.conflict_sides("task-b").unwrap().is_empty());
+        assert!(!staging.sync_from_ticket("PROJ-9", "task-b").unwrap().merged);
+
+        let sides = staging.conflict_sides("task-b").unwrap();
+        assert_eq!(sides.len(), 1);
+        assert_eq!(sides[0].file, "app.txt");
+        assert!(
+            sides[0].mine.contains("translate the greeting"),
+            "own side: {}",
+            sides[0].mine
+        );
+        assert!(
+            sides[0].theirs.contains("rename the greeting"),
+            "other side: {}",
+            sides[0].theirs
+        );
+        // A date on each side is the whole point; without it there is no "when".
+        for side in [&sides[0].mine, &sides[0].theirs] {
+            assert!(side.contains(" — "), "no author and date in {side}");
+        }
     }
 
     #[test]

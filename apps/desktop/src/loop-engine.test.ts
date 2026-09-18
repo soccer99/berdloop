@@ -20,6 +20,12 @@ class Bench {
   holdPrepare?: () => void;
   startFails?: string;
   runIds = 0;
+  /** Agent ids the Rust side would report as streaming right now. */
+  streamingAgents: string[] = [];
+  /** Agent ids the app is starting again after it was stopped mid-run. */
+  interruptedAgents: string[] = [];
+  /** Set to make the host refuse, as a missing sign-in would. */
+  forgeError?: string;
   engine: LoopEngine;
 
   constructor(
@@ -33,7 +39,9 @@ class Bench {
       projectId,
       slots: 2,
       harness: "claude-code",
+      model: "",
       reviewHarness: "claude-code",
+      reviewModel: "",
     };
     this.engine = new LoopEngine({
       invoke: <T>(command: string, args?: Record<string, unknown>) =>
@@ -67,6 +75,9 @@ class Bench {
         return this.reports[args!.projectId as string] ?? [];
       case "devenv_serve":
         return [];
+      case "forge_check":
+        if (this.forgeError) throw new Error(this.forgeError);
+        return "GitHub team/repo, signed in as tester";
       case "git_prepare":
         if (this.holdPrepare === undefined) return { baseBranch: "main" };
         await new Promise<void>((resolve) => {
@@ -81,7 +92,17 @@ class Bench {
         });
         return { path: `/work/${args!.taskId}` };
       case "agent_conversations":
-        return [];
+        return [
+          ...this.streamingAgents.map((agentId) => ({
+            agentId,
+            streaming: true,
+          })),
+          ...this.interruptedAgents.map((agentId) => ({
+            agentId,
+            streaming: false,
+            interrupted: true,
+          })),
+        ];
       case "publish_ticket_pr": {
         const id = args!.ticketId as string;
         this.world = {
@@ -195,6 +216,64 @@ async function settle() {
 }
 
 describe("LoopEngine", () => {
+  /**
+   * The deadlock this guards against: a worker dies, its task keeps saying
+   * "running", nothing hands it out again, and everything waiting behind it
+   * waits forever while the workers sit idle.
+   */
+  test("requeues work whose worker is gone, so a dead agent cannot wedge the loop", async () => {
+    const chain = [
+      task("a", "t1", "running"),
+      { ...task("b", "t1", "queued"), dependencyIds: ["a"] },
+    ];
+    const bench = new Bench(
+      [project("p1")],
+      workspace([ticket("t1", "p1", "running")], chain),
+      "p1",
+    );
+    bench.engine.start();
+    // prepare, open the ticket branch, then hand the recovered task out.
+    for (let i = 0; i < 4; i++) {
+      await bench.engine.tick();
+      await settle();
+    }
+
+    // Handed out again, which is the whole point. It reads as running once
+    // more, but this time there is a worker behind it.
+    expect(bench.started.map((item) => item.key)).toEqual(["a"]);
+
+    // A task whose worker is genuinely alive is left where it is.
+    const live = new Bench(
+      [project("p1")],
+      workspace([ticket("t2", "p1", "running")], [task("c", "t2", "running")]),
+      "p1",
+    );
+    live.streamingAgents = ["c"];
+    live.engine.start();
+    for (let i = 0; i < 4; i++) {
+      await live.engine.tick();
+      await settle();
+    }
+    expect(live.task("c").status).toBe("running");
+    expect(live.started).toHaveLength(0);
+
+    // A worker the app is putting back to work after a restart is not gone.
+    // Handing its task out as well would put two workers in one worktree.
+    const resuming = new Bench(
+      [project("p1")],
+      workspace([ticket("t3", "p1", "running")], [task("d", "t3", "running")]),
+      "p1",
+    );
+    resuming.interruptedAgents = ["d"];
+    resuming.engine.start();
+    for (let i = 0; i < 4; i++) {
+      await resuming.engine.tick();
+      await settle();
+    }
+    expect(resuming.task("d").status).toBe("running");
+    expect(resuming.started).toHaveLength(0);
+  });
+
   test("opens each ticket on its own branch, and prepares a project once", async () => {
     const bench = new Bench(
       [project("p1")],
@@ -474,6 +553,26 @@ describe("LoopEngine", () => {
     });
   });
 
+  test("a project with no sign-in for its host starts no worker at all", async () => {
+    const bench = new Bench(
+      [project("p1")],
+      workspace([ticket("a", "p1", "queued")], [task("a1", "a")]),
+      "p1",
+    );
+    bench.forgeError = "No saved sign-in for github.com.";
+    bench.engine.start();
+    for (let i = 0; i < 3; i++) await bench.engine.tick();
+    // The whole point: nothing is spent on work that could not be published.
+    expect(bench.started).toEqual([]);
+    expect(bench.named("git_open_task")).toHaveLength(0);
+    expect(bench.engine.snapshot().note).toContain("No saved sign-in");
+
+    // Signing in is all it takes. Nothing has to be restarted.
+    bench.forgeError = undefined;
+    for (let i = 0; i < 4; i++) await bench.engine.tick();
+    expect(bench.started.map((s) => s.ticket)).toEqual(["a"]);
+  });
+
   test("an empty ticket gets its planner started exactly once", async () => {
     const bench = new Bench(
       [project("p1")],
@@ -486,7 +585,7 @@ describe("LoopEngine", () => {
     expect(bench.engine.snapshot().note).toBe(NO_TASKS);
   });
 
-  test("an approved pull request is checked, merged and completed, then the next ticket starts", async () => {
+  test("an approved pull request is left to the watcher while the next ticket starts", async () => {
     const bench = new Bench(
       [project("p1")],
       workspace(
@@ -508,12 +607,11 @@ describe("LoopEngine", () => {
       "p1",
     );
     bench.engine.start();
-    await bench.engine.tick();
-    expect(bench.named("ticket_pr_sync")).toHaveLength(1);
-    expect(bench.ticket("a").status).toBe("complete");
-    for (let i = 0; i < 3; i++) await bench.engine.tick();
-    // The forge is polled, not hammered.
-    expect(bench.named("ticket_pr_sync")).toHaveLength(1);
+    for (let i = 0; i < 4; i++) await bench.engine.tick();
+    // Following the pull request belongs to the backend watcher, which does it
+    // for every project and whether or not this loop is running. The loop only
+    // has to stop waiting on it.
+    expect(bench.named("ticket_pr_sync")).toHaveLength(0);
     expect(bench.started.map((s) => s.ticket)).toEqual(["b"]);
   });
 
