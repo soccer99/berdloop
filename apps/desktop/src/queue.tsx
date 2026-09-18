@@ -48,6 +48,7 @@ import {
 import "./workflow.css";
 import type { Runtime } from "./workflow-runtime";
 import { HumanRequestCard } from "./agent-chat";
+import { useDraft } from "./drafts";
 import { orderAgentTasks, orderTickets, routeSteering } from "./jev";
 import { ChangesPanel } from "./changes-panel";
 
@@ -184,6 +185,7 @@ function Log({
 }
 
 function Composer({
+  draftKey,
   label,
   placeholder,
   connected,
@@ -192,6 +194,12 @@ function Composer({
   inlineSend = false,
   quote,
 }: {
+  /**
+   * The subject being written about, named by the mount site: the ticket
+   * agent, the planner or one worker. The unsent text is kept under this key,
+   * so it comes back after the body unmounts or the whole composer remounts.
+   */
+  draftKey: string;
   label: string;
   placeholder: string;
   connected: boolean;
@@ -200,7 +208,7 @@ function Composer({
   inlineSend?: boolean;
   quote?: { id: number; text: string };
 }) {
-  const [text, setText] = useState("");
+  const [text, setText, clearDraft] = useDraft(draftKey);
   const [target, setTarget] = useState(targets?.[0]?.value ?? "worker");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -210,7 +218,10 @@ function Composer({
   useEffect(() => {
     if (!quote || applied.current === quote.id) return;
     applied.current = quote.id;
-    // Replace the quote still at the top of the draft, else add to it.
+    // A prefill never costs the person what they typed: the quote replaces
+    // only the previous quote, when that is still sitting at the top of the
+    // draft, and otherwise goes in front of the draft. Either way the typed
+    // text stays below it, and the result is stored like any other draft.
     setText((current) =>
       quoted.current && current.startsWith(quoted.current)
         ? quote.text + current.slice(quoted.current.length)
@@ -240,7 +251,9 @@ function Composer({
         setError("");
         try {
           await onSend(text.trim(), target as WorkflowAction["target"]);
-          setText("");
+          // Only here. The catch below leaves the draft alone, because a send
+          // that failed leaves the typed text as the only copy.
+          clearDraft();
         } catch (cause) {
           setError(String(cause));
         } finally {
@@ -303,6 +316,7 @@ function Composer({
 }
 
 function AgentConversation({
+  draftKey,
   messages,
   streaming,
   label,
@@ -313,6 +327,8 @@ function AgentConversation({
   inlineSend,
   quote,
 }: {
+  /** Subject of the unsent text, passed straight to the composer. */
+  draftKey: string;
   messages: ThreadMessage[];
   streaming?: boolean;
   label: string;
@@ -328,6 +344,7 @@ function AgentConversation({
     <>
       <Log messages={messages} streaming={streaming} />
       <Composer
+        draftKey={draftKey}
         label={label}
         placeholder={placeholder}
         connected={connected}
@@ -434,6 +451,7 @@ function Coordinator({
           style={{ height }}
         >
           <AgentConversation
+            draftKey={threadKey}
             messages={threadMessages(thread?.messages, messages)}
             streaming={thread?.streaming}
             label={`Message ${title}`}
@@ -1437,6 +1455,7 @@ export function QueueView({
                         />
                       ))}
                       <AgentConversation
+                        draftKey={selected.id}
                         messages={threadMessages(
                           thread?.messages,
                           savedMessages[selected.id],
