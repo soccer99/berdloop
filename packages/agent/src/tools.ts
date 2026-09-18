@@ -476,6 +476,26 @@ export const berdloopTools: ToolSpec[] = [
     use: "The queue picks up where it stopped.",
   },
   {
+    name: "ticket_import",
+    roles: ["ticket-agent"],
+    summary:
+      "Read a ticket from Linear, Jira or Asana and put it on the queue.",
+    args: [
+      {
+        name: "provider",
+        required: true,
+        description: "One of: Linear, Jira, Asana.",
+      },
+      {
+        name: "reference",
+        required: true,
+        description:
+          "The issue as the provider names it, for example ENG-42 or an Asana task GID.",
+      },
+    ],
+    use: "Berdloop holds the connection a person set in settings, so you never need a token. Importing the same issue again updates the ticket it already made rather than queueing the work twice.",
+  },
+  {
     name: "ticket_replan",
     roles: ["ticket-agent"],
     summary: "Ask a ticket's task agent to rework its task list.",

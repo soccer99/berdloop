@@ -75,7 +75,7 @@ describe("standingOrders", () => {
         .sort();
     const six = ["add", "edit", "merge", "remove", "reorder", "split"];
     expect(operations("ticket-agent", "ticket")).toEqual(
-      [...six, "pause", "replan", "resume"].sort(),
+      [...six, "import", "pause", "replan", "resume"].sort(),
     );
     expect(operations("task-agent", "task")).toEqual(
       [...six, "steer", "stop"].sort(),

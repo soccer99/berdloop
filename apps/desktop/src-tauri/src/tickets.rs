@@ -172,6 +172,19 @@ pub async fn fetch_external_issue(
     organization_id: String,
     project_id: String,
 ) -> Result<ExternalIssue, String> {
+    fetch(&app, provider, reference, &organization_id, &project_id).await
+}
+
+/// Read one issue. The window comes here through `fetch_external_issue`; the
+/// ticket agent comes here through the control channel, so both go to the
+/// provider the same way and with the same resolved connection.
+pub async fn fetch(
+    app: &tauri::AppHandle,
+    provider: String,
+    reference: String,
+    organization_id: &str,
+    project_id: &str,
+) -> Result<ExternalIssue, String> {
     let reference = reference.trim().to_string();
     if reference.is_empty()
         || reference.len() > 128
@@ -182,7 +195,7 @@ pub async fn fetch_external_issue(
         return Err("Enter a valid ticket ID.".to_string());
     }
     supported(&provider)?;
-    let connection = connection(&app, &organization_id, &project_id, &provider)?;
+    let connection = connection(app, organization_id, project_id, &provider)?;
     let token = connection.token.as_str();
     let client = client()?;
     let mut jira_site_host = String::new();
