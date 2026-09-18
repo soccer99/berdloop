@@ -27,6 +27,8 @@ pub struct AgentPreferences {
     pub projects: HashMap<String, HashMap<String, RolePreference>>,
     #[serde(default)]
     pub ticket_sources: TicketSources,
+    #[serde(default)]
+    pub integrations: Integrations,
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -35,6 +37,30 @@ pub struct TicketSources {
     pub organizations: HashMap<String, Vec<String>>,
     #[serde(default)]
     pub projects: HashMap<String, Vec<String>>,
+}
+
+/// What a person told Berdloop about one ticket provider. The access token is
+/// not here: it lives in `integration_secrets`, in a file only its owner can
+/// read. `connected` is the status the host writes once a token was saved.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Integration {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jira_site: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jira_email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asana_workspace: Option<String>,
+    #[serde(default)]
+    pub connected: bool,
+}
+
+#[derive(Clone, Default, Deserialize, Serialize)]
+pub struct Integrations {
+    #[serde(default)]
+    pub organizations: HashMap<String, HashMap<String, Integration>>,
+    #[serde(default)]
+    pub projects: HashMap<String, HashMap<String, Integration>>,
 }
 
 impl AgentPreferences {
@@ -52,6 +78,27 @@ impl AgentPreferences {
                     .get(organization_id)
                     .and_then(|roles| roles.get(role))
             })
+    }
+
+    /// The project's connection when the project has one for this provider,
+    /// and the organization's otherwise. The same rule `resolve` follows.
+    pub fn resolve_integration(
+        &self,
+        organization_id: &str,
+        project_id: &str,
+        provider: &str,
+    ) -> Option<Integration> {
+        self.integrations
+            .projects
+            .get(project_id)
+            .and_then(|providers| providers.get(provider))
+            .or_else(|| {
+                self.integrations
+                    .organizations
+                    .get(organization_id)
+                    .and_then(|providers| providers.get(provider))
+            })
+            .cloned()
     }
 }
 
@@ -169,6 +216,95 @@ mod tests {
         assert_eq!(
             settings.resolve("org", "other", "worker").unwrap().model,
             "org-model"
+        );
+    }
+
+    fn connection(site: &str) -> Integration {
+        Integration {
+            jira_site: Some(site.into()),
+            jira_email: Some("person@example.com".into()),
+            asana_workspace: None,
+            connected: true,
+        }
+    }
+
+    #[test]
+    fn a_project_integration_overrides_the_organization_one() {
+        let mut settings = AgentPreferences::default();
+        settings
+            .integrations
+            .organizations
+            .entry("org".into())
+            .or_default()
+            .insert("Jira".into(), connection("https://org.atlassian.net"));
+        settings
+            .integrations
+            .projects
+            .entry("project".into())
+            .or_default()
+            .insert("Jira".into(), connection("https://project.atlassian.net"));
+        assert_eq!(
+            settings
+                .resolve_integration("org", "project", "Jira")
+                .unwrap()
+                .jira_site
+                .unwrap(),
+            "https://project.atlassian.net"
+        );
+        assert_eq!(
+            settings
+                .resolve_integration("org", "other", "Jira")
+                .unwrap()
+                .jira_site
+                .unwrap(),
+            "https://org.atlassian.net"
+        );
+        assert!(settings
+            .resolve_integration("org", "project", "Linear")
+            .is_none());
+    }
+
+    #[test]
+    fn preferences_written_before_integrations_existed_still_load() {
+        let json = r#"{
+            "organizations": {},
+            "projects": {},
+            "ticketSources": { "organizations": {}, "projects": {} }
+        }"#;
+        let restored: AgentPreferences = serde_json::from_str(json).unwrap();
+        assert!(restored.integrations.organizations.is_empty());
+        assert!(restored
+            .resolve_integration("org", "project", "Jira")
+            .is_none());
+    }
+
+    #[test]
+    fn an_integration_round_trips_without_carrying_a_token() {
+        let mut settings = AgentPreferences::default();
+        settings
+            .integrations
+            .organizations
+            .entry("org".into())
+            .or_default()
+            .insert(
+                "Asana".into(),
+                Integration {
+                    asana_workspace: Some("1234".into()),
+                    connected: true,
+                    ..Integration::default()
+                },
+            );
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains("\"asanaWorkspace\":\"1234\""));
+        assert!(!json.contains("token"));
+        let restored: AgentPreferences = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            restored.resolve_integration("org", "", "Asana").unwrap(),
+            Integration {
+                asana_workspace: Some("1234".into()),
+                connected: true,
+                ..Integration::default()
+            }
         );
     }
 }

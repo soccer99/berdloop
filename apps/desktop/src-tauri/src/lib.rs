@@ -4,6 +4,7 @@ mod extensions;
 pub mod git;
 mod harness_settings;
 pub mod human;
+pub mod integration_secrets;
 pub mod mcp;
 pub mod merge_queue;
 mod projects;
@@ -302,6 +303,8 @@ pub fn run() {
             save_task_workspace,
             agent_preferences::load_agent_preferences,
             agent_preferences::save_agent_preferences,
+            integration_secrets::save_integration_secret,
+            integration_secrets::clear_integration_secret,
             fetch_external_issue,
             sessions::sessions_list,
             agent::agent_start,
