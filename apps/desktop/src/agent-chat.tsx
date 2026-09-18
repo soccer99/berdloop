@@ -19,6 +19,7 @@ import {
   type AgentThreadView,
   type ThreadMessage,
 } from "./workflow-ui";
+import { shouldSendOnKey } from "./send-shortcut";
 
 /**
  * One agent conversation.
@@ -64,6 +65,12 @@ export interface AgentChatProps {
   onStop?: () => void;
   placeholder?: string;
 }
+
+/** Said next to every send control, so the keystroke is discoverable. */
+const SEND_HINT = "Send · Enter, or Cmd+Enter / Ctrl+Enter";
+
+/** The question variant answers on the modifier alone: Enter is a newline. */
+const ANSWER_HINT = "Send · Cmd+Enter / Ctrl+Enter";
 
 const DELIVERY_NOTE: Record<NonNullable<ThreadMessage["delivery"]>, string> = {
   saved: "Saved",
@@ -205,21 +212,44 @@ export function AgentChat({
           }
           onChange={(event) => setDraft(event.currentTarget.value)}
           onKeyDown={(event) => {
-            // Enter sends. A newline still needs a modifier, as everywhere else.
+            // A half-typed CJK word is not an instruction: leave the IME alone.
+            if (event.nativeEvent.isComposing) return;
+            // Cmd+Enter and Ctrl+Enter send, the same keystroke as every other
+            // composer here, judged by the one shared predicate.
+            if (
+              shouldSendOnKey(
+                {
+                  key: event.key,
+                  metaKey: event.metaKey,
+                  ctrlKey: event.ctrlKey,
+                  shiftKey: event.shiftKey,
+                  isComposing: event.nativeEvent.isComposing,
+                },
+                { text: draft, busy },
+              )
+            ) {
+              event.preventDefault();
+              void send();
+              return;
+            }
+            // Bare Enter sends too, as it always has here. A newline still
+            // needs a modifier, as everywhere else.
             if (event.key === "Enter" && !event.shiftKey) {
               event.preventDefault();
               void send();
             }
           }}
         />
-        <ActionIcon
-          size="lg"
-          disabled={!draft.trim() || busy}
-          onClick={() => void send()}
-          aria-label="Send"
-        >
-          <IconArrowUp size={17} />
-        </ActionIcon>
+        <Tooltip label={SEND_HINT}>
+          <ActionIcon
+            size="lg"
+            disabled={!draft.trim() || busy}
+            onClick={() => void send()}
+            aria-label="Send"
+          >
+            <IconArrowUp size={17} />
+          </ActionIcon>
+        </Tooltip>
       </div>
     </section>
   );
@@ -240,6 +270,13 @@ export function HumanRequestCard({
 }) {
   const [note, setNote] = useState("");
   const approval = request.kind === "approval";
+
+  /** The question variant's one way to answer, for the button and the key. */
+  function submitAnswer() {
+    const answer = note.trim();
+    if (!answer) return;
+    void onAnswer?.(request.id, true, answer);
+  }
 
   return (
     <div className="agent-ask">
@@ -282,14 +319,31 @@ export function HumanRequestCard({
             placeholder="Your answer"
             value={note}
             onChange={(event) => setNote(event.currentTarget.value)}
+            onKeyDown={(event) => {
+              // Only the question variant takes a keystroke. An approval has
+              // Allow and Refuse, and Enter cannot say which one you meant.
+              if (
+                shouldSendOnKey(
+                  {
+                    key: event.key,
+                    metaKey: event.metaKey,
+                    ctrlKey: event.ctrlKey,
+                    shiftKey: event.shiftKey,
+                    isComposing: event.nativeEvent.isComposing,
+                  },
+                  { text: note },
+                )
+              ) {
+                event.preventDefault();
+                submitAnswer();
+              }
+            }}
           />
-          <Button
-            size="xs"
-            disabled={!note.trim()}
-            onClick={() => void onAnswer?.(request.id, true, note.trim())}
-          >
-            Send
-          </Button>
+          <Tooltip label={ANSWER_HINT}>
+            <Button size="xs" disabled={!note.trim()} onClick={submitAnswer}>
+              Send
+            </Button>
+          </Tooltip>
         </div>
       )}
     </div>
