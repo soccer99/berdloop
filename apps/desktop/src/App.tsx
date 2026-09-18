@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Button,
   Modal,
@@ -130,6 +130,8 @@ export default function App() {
   // The agent system, and the loop that keeps handing it work.
   const loopTicketId = useBerdloop((state) => state.ticketId);
   const setLoopTicketId = useBerdloop((state) => state.setTicketId);
+  // Read once, at mount: whether the previous window was handing out work.
+  const [loopWasRunning] = useState(() => useBerdloop.getState().loopRunning);
   const [sourceSettingsProjectId, setSourceSettingsProjectId] = useState("");
   const [agentPreferences, setAgentPreferences] =
     useLocalStorage<AgentPreferences>({
@@ -185,6 +187,20 @@ export default function App() {
     projectTickets.find(
       (item) => item.id === loopTicketId && item.status !== "complete",
     ) ?? topTicket(projectTickets);
+  // Harness and model are one choice, so they are resolved together and the
+  // model travels with the harness that names it.
+  const workerPreference = resolveRolePreference(
+    agentPreferences,
+    organizationId,
+    projectId,
+    "worker",
+  );
+  const reviewPreference = resolveRolePreference(
+    agentPreferences,
+    organizationId,
+    projectId,
+    "pr-code-review",
+  );
   const loop = useRalphLoop({
     workspace,
     update: updateWorkspace,
@@ -192,19 +208,10 @@ export default function App() {
     projectId,
     preferredTicketId: loopTicketId,
     slots: loopProject?.workers ?? defaultWorkers,
-    harness:
-      resolveRolePreference(
-        agentPreferences,
-        organizationId,
-        projectId,
-        "worker",
-      ).harness ?? "claude-code",
-    reviewHarness: resolveRolePreference(
-      agentPreferences,
-      organizationId,
-      projectId,
-      "pr-code-review",
-    ).harness,
+    harness: workerPreference.harness ?? "claude-code",
+    model: workerPreference.model,
+    reviewHarness: reviewPreference.harness,
+    reviewModel: reviewPreference.model,
     startAgent: async ({ key, plan, role, ticket }) => {
       if (isTauri())
         await invoke("save_agent_preferences", {
@@ -234,6 +241,29 @@ export default function App() {
       });
     },
   });
+  // The loop lives in this window, so a hot reload, a rebuild or a crash stops
+  // it handing out work. None of that was a decision to stop, so it is started
+  // again once the records and the project folder are back. Its own recovery
+  // pass then reconciles whatever finished while the window was gone.
+  const loopRestarted = useRef(false);
+  useEffect(() => {
+    if (loopRestarted.current || !tasksReady || !loopWasRunning) return;
+    if (!projects.find((item) => item.id === projectId)?.path) return;
+    loopRestarted.current = true;
+    loop.start();
+  }, [tasksReady, loopWasRunning, projects, projectId, loop]);
+
+  // Projects live in this window, so the backend cannot watch a pull request
+  // until it has been told where the project is.
+  useEffect(() => {
+    if (!isTauri()) return;
+    void invoke("watch_projects", {
+      projects: projects
+        .filter((item) => item.path)
+        .map((item) => ({ id: item.id, path: item.path })),
+    }).catch(() => undefined);
+  }, [projects]);
+
   // Workers alive right now. The processes are the truth, so this counts the
   // live conversations rather than the loop's own bookkeeping, which frees a
   // slot as soon as a worker reports and so reads low while it exits.
@@ -673,7 +703,6 @@ export default function App() {
               ""
             }
             loopProject={loopProject}
-            busyWorkers={busyWorkers}
             onWorkersChange={(workers) =>
               loopProject && saveProjectRecord({ ...loopProject, workers })
             }
@@ -715,7 +744,13 @@ export default function App() {
             onOpenAccount={() => setCollaborationTarget("welcome")}
           />
         }
-        systemStatus={<SystemStatus runtime={runtime} />}
+        systemStatus={
+          <SystemStatus
+            runtime={runtime}
+            loopNote={loop.note}
+            busyWorkers={busyWorkers}
+          />
+        }
       >
         {taskStoreError && (
           <p className="task-error" role="alert">
@@ -887,7 +922,12 @@ export default function App() {
               )?.id ??
               ""
             }
-            onLoopTicket={setLoopTicketId}
+            onLoopTicket={(id) => {
+              // Pointing the loop at a ticket is a request to work on it. If
+              // the loop is not running, nothing would come of it otherwise.
+              setLoopTicketId(id);
+              if (!loop.running) loop.start();
+            }}
             update={updateWorkspace}
             onNewTicket={() => openTaskDraft()}
             onImportTicket={(provider) => {

@@ -8,6 +8,7 @@ import {
   type HarnessSettings,
 } from "@berdloop/agent";
 import type { Project, Task, TaskWorkspace } from "@berdloop/core";
+import { useBerdloop } from "@berdloop/state";
 import {
   LoopEngine,
   type ActiveRun,
@@ -21,8 +22,9 @@ import {
  *
  * ponytail: the loop lives in the window, so closing the app stops handing out
  * new work. Work already running keeps going, because each worker is its own
- * process and reports to disk. Move this to the Tauri backend if runs need to
- * survive the window.
+ * process and reports to disk, and whether the loop was running is recorded so
+ * the next window starts it again. Move this to the Tauri backend if the gap
+ * between a reload and the window mounting ever matters.
  */
 
 const TICK_MS = 3000;
@@ -39,7 +41,9 @@ export interface LoopOptions {
   /** A ticket a person pointed the loop at. */
   preferredTicketId?: string;
   harness?: HarnessId;
+  model?: string;
   reviewHarness?: HarnessId;
+  reviewModel?: string;
   slots?: number;
   startAgent: LoopDeps["startAgent"];
   startPlanner: LoopDeps["startPlanner"];
@@ -90,7 +94,9 @@ export function useRalphLoop(options: LoopOptions): LoopStatus {
         preferredTicketId: latest.current.preferredTicketId,
         slots: latest.current.slots ?? defaultWorkers,
         harness: latest.current.harness ?? "claude-code",
+        model: latest.current.model ?? "",
         reviewHarness: latest.current.reviewHarness ?? "claude-code",
+        reviewModel: latest.current.reviewModel ?? "",
       }),
       update: (change) => latest.current.update(change),
       launch: () => ({
@@ -156,8 +162,14 @@ export function useRalphLoop(options: LoopOptions): LoopStatus {
         }));
         return;
       }
+      // Recorded before the engine runs, so a reload a moment later still
+      // knows the loop was meant to be handing out work.
+      useBerdloop.getState().setLoopRunning(true);
       engine.current!.start();
     },
-    pause: () => engine.current!.pause(),
+    pause: () => {
+      useBerdloop.getState().setLoopRunning(false);
+      engine.current!.pause();
+    },
   };
 }

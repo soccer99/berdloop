@@ -5,6 +5,7 @@ pub mod control;
 mod conversations;
 pub mod devenv;
 mod extensions;
+pub mod forge;
 pub mod git;
 mod harness_models;
 mod harness_settings;
@@ -22,6 +23,22 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{fs, sync::Mutex, time::Duration};
 use tauri::Manager;
+
+/// Run blocking work off the main thread, and answer when it is done.
+///
+/// Tauri runs a command that is not `async` on the main thread, so git, the
+/// network and the file system each freeze the window until they return. Any
+/// command that touches one hands the work to a pool and awaits the result, so
+/// the caller still just gets a promise and the app keeps drawing.
+pub async fn offload<T, F>(work: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .map_err(|error| format!("Background work did not finish: {error}"))?
+}
 
 #[derive(Serialize)]
 struct RuntimeInfo {
@@ -279,8 +296,21 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_opener::init())
         .manage(WorkspaceLock(Mutex::new(())))
         .manage(agent::Running::default())
+        .manage(pr_review::Watched::default())
+        // Conversations outlive the process that ran them: a rebuild, a
+        // reload or a crash leaves the work where it was, and the app picks
+        // it back up rather than starting from an empty window.
+        .setup(|app| {
+            agent::recover(app.handle());
+            agent::autosave(app.handle().clone());
+            // A build finishes whether or not a person has the loop running,
+            // so following pull requests cannot depend on the window.
+            pr_review::watch(app.handle().clone());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             runtime_info,
             projects::project_inspect,
@@ -325,6 +355,8 @@ pub fn run() {
             pr_review::publish_ticket_pr,
             pr_review::pr_review_context,
             pr_review::ticket_pr_sync,
+            pr_review::watch_projects,
+            forge::forge_check,
             git::git_task_reports,
             merge_queue::merge_line
         ])
