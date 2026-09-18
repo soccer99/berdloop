@@ -97,8 +97,12 @@ export function patchRolePreference(
   };
 }
 
-// The project's connection when the project has one for this provider, and
-// the organization's otherwise. The same rule the ticket sources follow.
+// One field at a time: the project's value where it filled one in, and the
+// organization's everywhere else. The same merge resolveRolePreference does
+// for a prompt, and the one the settings window promises when it tells a
+// person a blank field falls back to the organization. Saving a project token
+// writes a project entry holding nothing but `connected`, so taking that entry
+// whole would drop a Jira site or an Asana workspace typed once at org scope.
 export function resolveIntegration(
   preferences: AgentPreferences,
   organizationId: string,
@@ -107,10 +111,21 @@ export function resolveIntegration(
 ): IntegrationSettings | undefined {
   const integrations =
     preferences.integrations ?? emptyAgentPreferences.integrations;
-  return (
-    integrations.projects[projectId]?.[provider] ??
-    integrations.organizations[organizationId]?.[provider]
-  );
+  const organization = integrations.organizations[organizationId]?.[provider];
+  const project = integrations.projects[projectId]?.[provider];
+  if (!organization && !project) return undefined;
+  const field = (read: (of?: IntegrationSettings) => string | undefined) => {
+    const own = read(project);
+    return own?.trim() ? own : read(organization);
+  };
+  return {
+    jiraSite: field((of) => of?.jiraSite),
+    jiraEmail: field((of) => of?.jiraEmail),
+    asanaWorkspace: field((of) => of?.asanaWorkspace),
+    // Whether a token was saved is not a field a person leaves blank: the
+    // scope that owns the token owns the answer.
+    connected: (project ?? organization)?.connected ?? false,
+  };
 }
 
 // Change one provider's connection at one scope, leaving every other scope,

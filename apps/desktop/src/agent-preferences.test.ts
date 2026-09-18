@@ -144,7 +144,7 @@ describe("integration settings", () => {
     ).toBeUndefined();
   });
 
-  test("the project's connection wins over the organization's", () => {
+  test("the project's fields win one by one, and blank ones fall back", () => {
     let settings = patchIntegration(
       preferences(),
       "organizations",
@@ -158,12 +158,44 @@ describe("integration settings", () => {
     );
     settings = patchIntegration(settings, "projects", "project", "Jira", {
       jiraSite: "https://project.atlassian.net",
-      jiraEmail: "project@example.com",
+      jiraEmail: "  ",
       connected: true,
     });
+    const jira = resolveIntegration(settings, "org", "project", "Jira");
+    expect(jira?.jiraSite).toBe("https://project.atlassian.net");
+    expect(jira?.jiraEmail).toBe("org@example.com");
+  });
+
+  // Saving a token at project scope writes `{connected: true}` and nothing
+  // else, so a whole-entry fallback hid the site and workspace held by the
+  // organization and the picker refused a project settings called connected.
+  test("a project entry holding only a token keeps the organization's fields", () => {
+    let settings = patchIntegration(
+      preferences(),
+      "organizations",
+      "org",
+      "Jira",
+      {
+        jiraSite: "https://org.atlassian.net",
+        jiraEmail: "org@example.com",
+        connected: true,
+      },
+    );
+    settings = patchIntegration(settings, "organizations", "org", "Asana", {
+      asanaWorkspace: "1234",
+      connected: true,
+    });
+    for (const provider of ["Jira", "Asana"] as const)
+      settings = patchIntegration(settings, "projects", "project", provider, {
+        connected: true,
+      });
+    const jira = resolveIntegration(settings, "org", "project", "Jira");
+    expect(jira?.jiraSite).toBe("https://org.atlassian.net");
+    expect(jira?.jiraEmail).toBe("org@example.com");
+    expect(jira?.connected).toBe(true);
     expect(
-      resolveIntegration(settings, "org", "project", "Jira")?.jiraSite,
-    ).toBe("https://project.atlassian.net");
+      resolveIntegration(settings, "org", "project", "Asana")?.asanaWorkspace,
+    ).toBe("1234");
   });
 
   test("a project without its own connection falls back to the organization", () => {
