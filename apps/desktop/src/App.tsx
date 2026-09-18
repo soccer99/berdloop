@@ -60,7 +60,7 @@ import {
 
 import { HarnessModelSelects } from "./harness-model-selects";
 import { useHarnessCatalog } from "./harness-catalog";
-import { useDraft } from "./drafts";
+import { pruneDraftsForOwners, useDraft } from "./drafts";
 
 // The WorkOS adapter will provide this after account auth is connected.
 const workosSession: AccountSession | null = null;
@@ -368,6 +368,23 @@ export default function App() {
       }));
     }
   }, [projects, tasks, tasksReady, updateWorkspace]);
+
+  // Drafts outlive the editor they were typed in, so a deleted ticket or task
+  // would otherwise leave its unsent text behind for good. This is the one
+  // place that knows every ticket and task across every project: the queue
+  // view only ever sees one project's worth, and pruning from there would read
+  // the other projects' work as deleted. Gated on `tasksReady`, because an
+  // empty workspace before the store answers is not an empty workspace.
+  // Joined so the effect depends on the ids themselves, not on an array that
+  // is rebuilt every render: pruning runs when something is deleted, not always.
+  const liveSubjectKey = [
+    ...workspace.tasks.map((item) => item.id),
+    ...workspace.agentTasks.map((item) => item.id),
+  ].join("\n");
+  useEffect(() => {
+    if (!tasksReady) return;
+    pruneDraftsForOwners(liveSubjectKey ? liveSubjectKey.split("\n") : []);
+  }, [tasksReady, liveSubjectKey]);
 
   const organization =
     organizations.find((item) => item.id === organizationId) ??

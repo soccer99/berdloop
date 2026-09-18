@@ -1457,7 +1457,7 @@ export function QueueView({
                         />
                       ))}
                       <AgentConversation
-                        draftKey={selected.id}
+                        draftKey={`worker:${selected.id}`}
                         messages={threadMessages(
                           thread?.messages,
                           savedMessages[selected.id],

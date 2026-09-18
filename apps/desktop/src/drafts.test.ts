@@ -1,10 +1,12 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import {
+  draftOwner,
   draftStorageKey,
   draftStoragePrefix,
   nextDraftRecord,
   parseDraftRecord,
   pruneDrafts,
+  pruneDraftsForOwners,
   readDraft,
   readDraftRecord,
   removeDraft,
@@ -234,6 +236,60 @@ describe("pruneDrafts", () => {
     pruneDrafts([], { storage });
 
     expect(storage.keys).toEqual(["berdloop.preview.access-mode.v1"]);
+  });
+});
+
+describe("pruning drafts whose ticket or task is gone", () => {
+  test("a deleted subject's draft is dropped and a live one is kept", () => {
+    mount("worker:task-live").type("Still being written");
+    mount("worker:task-gone").type("For a task that has since been deleted");
+    mount("task-editor:task-gone:title").type("Half a title");
+    mount("planner:ticket-gone").type("For a deleted ticket");
+    mount("ticket-editor:ticket-live:criteria").type("Sharper wording");
+
+    const dropped = pruneDraftsForOwners(["task-live", "ticket-live"], {
+      storage,
+    });
+
+    expect(dropped.sort()).toEqual([
+      "planner:ticket-gone",
+      "task-editor:task-gone:title",
+      "worker:task-gone",
+    ]);
+    expect(storedDraftKeys({ storage }).sort()).toEqual([
+      "ticket-editor:ticket-live:criteria",
+      "worker:task-live",
+    ]);
+  });
+
+  test("subjects no ticket or task owns are never pruned", () => {
+    // Nothing can delete a search box, a session field or a create form, so
+    // pruning must not read them as gone the way a deleted task is.
+    mount("ticket-search:project-1").type("auth");
+    mount("agent-session:prompt").type("Half a prompt");
+    mount("new-ticket:project-1:title").type("A ticket not yet made");
+    mount("task-editor:new:title").type("A task not yet made");
+    mount("ticket-agent:project-1").type("Live project");
+    mount("worker:task-gone").type("For a deleted task");
+
+    expect(pruneDraftsForOwners([], { storage })).toEqual(["worker:task-gone"]);
+    expect(storedDraftKeys({ storage }).sort()).toEqual([
+      "agent-session:prompt",
+      "new-ticket:project-1:title",
+      "task-editor:new:title",
+      "ticket-agent:project-1",
+      "ticket-search:project-1",
+    ]);
+  });
+
+  test("draftOwner names who a subject dies with", () => {
+    expect(draftOwner("worker:task-1")).toBe("task-1");
+    expect(draftOwner("human-request:task-1:request-9")).toBe("task-1");
+    expect(draftOwner("ticket-editor:ticket-1:title")).toBe("ticket-1");
+    expect(draftOwner("planner:ticket-1")).toBe("ticket-1");
+    expect(draftOwner("task-editor:new:title")).toBeNull();
+    expect(draftOwner("ticket-search:project-1")).toBeNull();
+    expect(draftOwner("agent-session:prompt")).toBeNull();
   });
 });
 

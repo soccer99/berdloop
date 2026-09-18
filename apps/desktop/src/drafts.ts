@@ -38,7 +38,9 @@
  * Whitespace-only text is never written, and setting a value back to empty
  * removes the stored entry.
  *
- * `pruneDrafts(liveKeys)` removes stored drafts whose subject is gone.
+ * `pruneDrafts(liveKeys)` removes stored drafts whose subject is gone, and
+ * `pruneDraftsForOwners(liveIds)` is how the app calls it: it keeps every
+ * subject that no ticket or task owns, so only deleted work is forgotten.
  */
 import { useCallback, useEffect, useState } from "react";
 import { useLocalStorage } from "@mantine/hooks";
@@ -230,6 +232,54 @@ export function pruneDrafts(
     removeDraft(key, options);
   }
   return dropped;
+}
+
+/**
+ * Subject families that name one ticket or task, as `family:<id>` followed by
+ * anything else the subject needs. These are the only drafts pruning can
+ * remove, because they are the only ones whose subject can stop existing. A
+ * search box, a session field or the new-ticket form names something that is
+ * never deleted, so it is always kept.
+ */
+const ownedDraftFamilies = new Set([
+  "planner",
+  "ticket-editor",
+  "task-editor",
+  "worker",
+  "human-request",
+]);
+
+/**
+ * The ticket or task whose deletion should take this draft with it, or null
+ * when nothing can delete it. `task-editor:new` is the create form, which
+ * outlives every task, so it has no owner either.
+ */
+export function draftOwner(subject: string) {
+  const [family, id] = subject.split(":");
+  if (!ownedDraftFamilies.has(family) || !id || id === "new") {
+    return null;
+  }
+  return id;
+}
+
+/**
+ * Removes drafts whose ticket or task is gone, and keeps every other draft.
+ * Pass the ids of every ticket and task that still exists.
+ *
+ * Call this only once those lists have actually loaded: an empty list means
+ * "every ticket and task was deleted", which is indistinguishable from "the
+ * store has not answered yet" and would throw away live typing.
+ */
+export function pruneDraftsForOwners(
+  liveOwners: Iterable<string>,
+  options: DraftOptions = {},
+) {
+  const live = new Set(liveOwners);
+  const keep = storedDraftKeys(options).filter((subject) => {
+    const owner = draftOwner(subject);
+    return owner === null || live.has(owner);
+  });
+  return pruneDrafts(keep, options);
 }
 
 interface DraftState {
