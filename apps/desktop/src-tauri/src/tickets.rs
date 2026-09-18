@@ -394,9 +394,13 @@ fn looks_like_issue_key(query: &str) -> bool {
     }
 }
 
+/// `/rest/api/3/search/jql` refuses a query with no restriction in it
+/// ("Unbounded JQL queries are not allowed here"), so the recent list, which
+/// has no term to search for, is bounded by a clause every issue satisfies
+/// rather than by a date or a project, which would hide issues.
 fn jira_jql(query: &str) -> String {
     if query.is_empty() {
-        return "order by created DESC".to_string();
+        return "project is not EMPTY order by created DESC".to_string();
     }
     let term = jira_escape(query);
     if looks_like_issue_key(query) {
@@ -448,7 +452,7 @@ async fn search_jira(
     let host = jira_host(&connection.jira_site, &connection.jira_email)?;
     let max_results = first.to_string();
     let response = client()?
-        .get(format!("https://{host}/rest/api/3/search"))
+        .get(format!("https://{host}/rest/api/3/search/jql"))
         .header(
             "Authorization",
             jira_auth(&connection.jira_email, &connection.token),
@@ -779,7 +783,9 @@ mod tests {
 
     #[test]
     fn a_search_term_cannot_break_out_of_the_jql_string() {
-        assert_eq!(jira_jql(""), "order by created DESC");
+        // The recent list still has to be a bounded query, which Jira
+        // enhanced search insists on.
+        assert_eq!(jira_jql(""), "project is not EMPTY order by created DESC");
         assert_eq!(
             jira_jql("import"),
             "text ~ \"import\" order by created DESC"
