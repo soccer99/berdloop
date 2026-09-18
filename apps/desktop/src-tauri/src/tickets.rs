@@ -24,6 +24,12 @@ const RECENT_LIMIT: u32 = 10;
 const JIRA_SITE: &str = "Enter a Jira Cloud site URL and account email.";
 const ASANA_WORKSPACE: &str = "Add your Asana workspace GID in settings.";
 const ASANA_FIELDS: &str = "gid,name,notes,permalink_url,completed,modified_at";
+/// Asana's task list takes no ordering parameter: it answers in an order of
+/// its own and truncates to the limit asked for, so asking it for twenty
+/// would hand back an arbitrary twenty of a person's assigned tasks. A whole
+/// page is read instead and ordered here before anything is dropped. 100 is
+/// the most Asana returns in one page, and is above MAX_LIMIT.
+const ASANA_PAGE: u32 = 100;
 
 /// One issue as Berdloop shows it, whether it came from a search or from
 /// reading a single reference.
@@ -508,8 +514,10 @@ fn parse_asana_search(body: &Value) -> Result<Vec<ExternalIssue>, String> {
 }
 
 /// Searching Asana needs a paid plan. Rather than show a person a failure
-/// they cannot act on, the recent list they can already see is filtered here,
-/// on the two things they would type: the task name and its GID.
+/// they cannot act on, the page of assigned tasks is filtered here, on the
+/// two things they would type: the task name and its GID. It filters the
+/// whole page rather than the newest few, so the fallback can still find an
+/// older task by name.
 fn asana_filter(tasks: Vec<ExternalIssue>, query: &str, first: u32) -> Vec<ExternalIssue> {
     let needle = query.to_lowercase();
     tasks
@@ -536,13 +544,14 @@ async fn asana_json(request: reqwest::RequestBuilder) -> Result<Value, String> {
 }
 
 /// Asana only lists tasks for a workspace together with an assignee, so the
-/// recent list is the signed-in person's own tasks in that workspace.
-async fn asana_recent(
+/// recent list is the signed-in person's own tasks in that workspace. A full
+/// page comes back, newest first; how much of it to show is the caller's
+/// choice, and the search fallback wants all of it to filter over.
+async fn asana_assigned(
     connection: &Connection,
     workspace: &str,
-    first: u32,
 ) -> Result<Vec<ExternalIssue>, String> {
-    let limit = first.to_string();
+    let limit = ASANA_PAGE.to_string();
     let body = asana_json(
         client()?
             .get(format!("{ASANA_API}/tasks"))
@@ -558,6 +567,13 @@ async fn asana_recent(
     parse_asana_search(&body)
 }
 
+/// The newest `first` of an already-ordered list. Truncating is the last
+/// thing done, never the first, so the list is the newest tasks and not
+/// whichever ones Asana happened to send.
+fn asana_newest(tasks: Vec<ExternalIssue>, first: u32) -> Vec<ExternalIssue> {
+    tasks.into_iter().take(first as usize).collect()
+}
+
 async fn search_asana(
     connection: &Connection,
     query: &str,
@@ -568,7 +584,10 @@ async fn search_asana(
         return Err(ASANA_WORKSPACE.to_string());
     }
     if query.is_empty() {
-        return asana_recent(connection, workspace, first).await;
+        return Ok(asana_newest(
+            asana_assigned(connection, workspace).await?,
+            first,
+        ));
     }
     let limit = first.to_string();
     let searched = asana_json(
@@ -590,7 +609,7 @@ async fn search_asana(
         // is a limit of the plan, not a failure of the search, so the recent
         // list is filtered here instead and nothing is reported.
         Err(_) => Ok(asana_filter(
-            asana_recent(connection, workspace, first).await?,
+            asana_assigned(connection, workspace).await?,
             query,
             first,
         )),
@@ -863,6 +882,47 @@ mod tests {
         assert!(asana_filter(recent.clone(), "nothing here", 20).is_empty());
         // The limit the window asked for still holds.
         assert_eq!(asana_filter(recent, "task", 1).len(), 1);
+    }
+
+    /// Asana returns assigned tasks oldest first, which is what makes
+    /// truncating before sorting wrong.
+    fn asana_page(count: u32) -> Value {
+        let data: Vec<Value> = (0..count)
+            .map(|index| {
+                json!({
+                    "gid": format!("{}", 1000 + index),
+                    "name": format!("Task {index}"),
+                    "notes": "",
+                    "permalink_url": format!("https://app.asana.com/0/1/{}", 1000 + index),
+                    "completed": false,
+                    "modified_at": format!("2026-09-{:02}T10:04:00.000Z", index + 1)
+                })
+            })
+            .collect();
+        json!({ "data": data })
+    }
+
+    #[test]
+    fn a_page_longer_than_the_limit_answers_with_the_newest_tasks() {
+        // A whole page is read, so a person with more assigned tasks than the
+        // picker shows still opens on their newest ones, not their oldest.
+        const { assert!(MAX_LIMIT < ASANA_PAGE) };
+        let page = parse_asana_search(&asana_page(25)).unwrap();
+        assert_eq!(page.len(), 25);
+        let newest = asana_newest(page.clone(), 20);
+        assert_eq!(newest.len(), 20);
+        assert_eq!(newest[0].key, "1024");
+        assert_eq!(newest[19].key, "1005");
+        for pair in newest.windows(2) {
+            assert!(pair[0].updated_at > pair[1].updated_at);
+        }
+        // The five oldest are the ones dropped, which is the bug reversed.
+        assert!(!newest.iter().any(|task| task.key == "1004"));
+        // The fallback searches the whole page, so an older task is still
+        // findable by name once the newest ones are not what was asked for.
+        let matched = asana_filter(page, "Task 3", 20);
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].key, "1003");
     }
 
     #[test]
