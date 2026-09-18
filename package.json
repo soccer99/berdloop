@@ -19,7 +19,7 @@
     "build": "bun run --filter \"./apps/*\" build",
     "build:desktop": "bun run --filter @berdloop/desktop desktop:build",
     "typecheck": "bun run --filter \"*\" typecheck",
-    "test": "bun test packages/core packages/agent packages/state",
+    "test": "bun test packages/core packages/agent packages/state apps/desktop/src/ticket-picker.test.ts",
     "check": "bun run typecheck && bun run test && bun run build",
     "format": "prettier --write apps packages package.json tsconfig.json README.md .github",
     "format:check": "prettier --check apps packages package.json tsconfig.json README.md .github"

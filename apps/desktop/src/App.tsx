@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import {
   Badge,
   Button,
+  Loader,
   Modal,
   MultiSelect,
   Select,
@@ -52,6 +53,13 @@ import {
   type IntegrationSettings,
   type RolePreference,
 } from "./agent-preferences";
+import {
+  needsConnection,
+  recentFirst,
+  searchDebounceMs,
+  searchSequence,
+  updatedLabel,
+} from "./ticket-picker";
 
 // The WorkOS adapter will provide this after account auth is connected.
 const workosSession: AccountSession | null = null;
@@ -63,14 +71,6 @@ interface Draft {
   ticket: string;
   criteria: string;
 }
-interface ImportDraft {
-  provider: ExternalProvider;
-  reference: string;
-}
-const emptyImportDraft: ImportDraft = {
-  provider: "Linear",
-  reference: "",
-};
 interface ProjectInfo {
   path: string;
   name: string;
@@ -306,6 +306,162 @@ function ProviderConnection({
   );
 }
 
+// Choosing a ticket to import. The host holds the connection, so the picker
+// only ever names a provider and a scope: it asks for the provider's own
+// recent list the moment it opens, so there is something to choose from
+// before anybody types, and a search replaces that list only while it is
+// still the newest one asked for.
+function TicketPicker({
+  provider,
+  organizationId,
+  projectId,
+  busy,
+  onPickIssue,
+  onOpenSettings,
+}: {
+  provider: ExternalProvider;
+  organizationId: string;
+  projectId: string;
+  busy: boolean;
+  onPickIssue: (issue: ExternalIssue) => void;
+  onOpenSettings: () => void;
+}) {
+  const [query, setQuery] = useState("");
+  const [issues, setIssues] = useState<ExternalIssue[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [active, setActive] = useState(0);
+  const sequence = useRef(searchSequence());
+  const rows = useRef<(HTMLButtonElement | null)[]>([]);
+  const search = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    const term = query.trim();
+    const ticket = sequence.current.start();
+    setLoading(true);
+    // Opening the picker asks at once; waiting would only show an empty
+    // panel. Typing rests first, so a typed word is one search and not one
+    // per letter. Either way the answer is shown only if its ticket is still
+    // the newest, so a slow earlier search cannot overwrite a newer one.
+    const timer = setTimeout(
+      () => {
+        void invoke<ExternalIssue[]>("search_external_issues", {
+          provider,
+          organizationId,
+          projectId,
+          query: term,
+        })
+          .then((found) => {
+            if (!sequence.current.accept(ticket)) return;
+            setIssues(recentFirst(found));
+            setError("");
+            setActive(0);
+            setLoading(false);
+          })
+          .catch((cause) => {
+            if (!sequence.current.accept(ticket)) return;
+            setIssues([]);
+            setError(String(cause));
+            setLoading(false);
+          });
+      },
+      term ? searchDebounceMs : 0,
+    );
+    return () => clearTimeout(timer);
+  }, [provider, organizationId, projectId, query]);
+
+  function move(step: number) {
+    if (issues.length === 0) return;
+    const next = Math.min(Math.max(active + step, 0), issues.length - 1);
+    setActive(next);
+    rows.current[next]?.focus();
+  }
+
+  function onKeyDown(event: KeyboardEvent<HTMLDivElement>) {
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      move(event.key === "ArrowDown" ? 1 : -1);
+      return;
+    }
+    // A row is a real button and answers Enter by itself; this is Enter from
+    // the search field, which takes whichever row the arrows landed on.
+    if (event.key === "Enter" && event.target === search.current) {
+      event.preventDefault();
+      const picked = issues[active];
+      if (picked) onPickIssue(picked);
+    }
+  }
+
+  const connect = needsConnection(error, provider);
+  return (
+    <div className="ticket-picker" onKeyDown={onKeyDown}>
+      <TextInput
+        ref={search}
+        data-autofocus
+        mt="md"
+        label={`Search ${provider}`}
+        placeholder="A key, a title, or a word from the ticket"
+        value={query}
+        onChange={(event) => setQuery(event.currentTarget.value)}
+      />
+      {loading ? (
+        <p className="ticket-picker-note">
+          <Loader size="xs" /> Asking {provider}…
+        </p>
+      ) : connect ? (
+        <div className="ticket-picker-note">
+          <p>{error}</p>
+          <Button size="xs" variant="subtle" onClick={onOpenSettings}>
+            Open settings
+          </Button>
+        </div>
+      ) : error ? (
+        <p role="alert" className="task-error">
+          {error}
+        </p>
+      ) : issues.length === 0 ? (
+        <p className="ticket-picker-note">No tickets matched</p>
+      ) : (
+        <div
+          className="ticket-picker-list"
+          role="group"
+          aria-label={`${provider} tickets`}
+        >
+          {issues.map((issue, index) => {
+            const updated = updatedLabel(issue);
+            return (
+              <button
+                key={issue.id}
+                type="button"
+                ref={(element) => {
+                  rows.current[index] = element;
+                }}
+                className={`ticket-pick${index === active ? " active" : ""}`}
+                aria-label={`${issue.key}, ${issue.title}`}
+                aria-current={index === active}
+                disabled={busy}
+                onFocus={() => setActive(index)}
+                onClick={() => onPickIssue(issue)}
+              >
+                <code>{issue.key}</code>
+                <strong>{issue.title}</strong>
+                {issue.status && (
+                  <Badge variant="light" color="gray" size="sm">
+                    {issue.status}
+                  </Badge>
+                )}
+                <small>
+                  {updated ? `Updated ${updated}` : "Never updated"}
+                </small>
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function App() {
   const [accessMode, setAccessMode] = useLocalStorage<"local" | null>({
     key: "berdloop.preview.access-mode.v1",
@@ -379,7 +535,8 @@ export default function App() {
   const [selectedId, setSelectedId] = useState("");
   const [taskOpened, setTaskOpened] = useState(false);
   const [importOpened, setImportOpened] = useState(false);
-  const [importDraft, setImportDraft] = useState<ImportDraft>(emptyImportDraft);
+  const [importProvider, setImportProvider] =
+    useState<ExternalProvider>("Linear");
   const [importBusy, setImportBusy] = useState(false);
   const [importError, setImportError] = useState<string | null>(null);
   const [organizationOpened, setOrganizationOpened] = useState(false);
@@ -461,6 +618,11 @@ export default function App() {
     projectId && projectSources[projectId] !== undefined
       ? projectSources[projectId]
       : (organizationSources[organization?.id ?? ""] ?? []);
+  // What the picker may switch between: whatever this project turned on,
+  // and every provider when nobody has chosen yet.
+  const pickerProviders = enabledTicketSources.length
+    ? enabledTicketSources
+    : ticketProviders;
   const visibleSettingsSources = sourceSettingsProjectId
     ? (projectSources[sourceSettingsProjectId] ??
       organizationSources[organization?.id ?? ""] ??
@@ -746,14 +908,16 @@ export default function App() {
     setTaskOpened(false);
     setView("loops");
   }
-  async function importTask() {
+  // What the picker hands back. The next task sends the pick to the ticket
+  // agent instead; until then it takes the same route an import always did.
+  async function pickIssue(picked: ExternalIssue) {
     if (!project || !isTauri()) return;
     setImportBusy(true);
     setImportError(null);
     try {
       const issue = await invoke<ExternalIssue>("fetch_external_issue", {
-        provider: importDraft.provider,
-        reference: importDraft.reference,
+        provider: picked.provider,
+        reference: picked.key,
         organizationId: project.organizationId,
         projectId: project.id,
       });
@@ -764,7 +928,6 @@ export default function App() {
         return imported.workspace;
       });
       setSelectedId(importedId);
-      setImportDraft(emptyImportDraft);
       setImportOpened(false);
       setView("loops");
     } catch (cause) {
@@ -985,10 +1148,7 @@ export default function App() {
             onNewTicket={() => openTaskDraft()}
             onImportTicket={(provider) => {
               setImportError(null);
-              setImportDraft({
-                ...emptyImportDraft,
-                provider: provider ?? "Linear",
-              });
+              setImportProvider(provider ?? "Linear");
               setImportOpened(true);
             }}
             onNewProject={() => setProjectOpened(true)}
@@ -1370,53 +1530,47 @@ export default function App() {
       <Modal
         opened={importOpened}
         onClose={() => {
-          if (!importBusy) {
-            setImportOpened(false);
-            setImportDraft(emptyImportDraft);
-          }
+          if (!importBusy) setImportOpened(false);
         }}
         title="Import a source ticket"
         centered
       >
-        <form
-          onSubmit={(event) => {
-            event.preventDefault();
-            void importTask();
-          }}
-        >
-          <p className="app-eyebrow">{importDraft.provider.toUpperCase()}</p>
-          <TextInput
-            required
-            mt="md"
-            label={
-              importDraft.provider === "Asana" ? "Task GID" : "Issue ID or key"
-            }
-            placeholder={
-              importDraft.provider === "Asana" ? "1200123456789" : "BRD-128"
-            }
-            value={importDraft.reference}
-            onChange={(event) =>
-              setImportDraft({
-                ...importDraft,
-                reference: event.currentTarget.value,
-              })
-            }
+        {pickerProviders.length > 1 && (
+          <Select
+            label="Source"
+            data={pickerProviders}
+            value={importProvider}
+            allowDeselect={false}
+            onChange={(value) => {
+              if (!value) return;
+              setImportError(null);
+              setImportProvider(value as ExternalProvider);
+            }}
           />
-          {importError && (
-            <p role="alert" className="task-error">
-              {importError}
-            </p>
-          )}
-          <Button
-            fullWidth
-            mt="xl"
-            type="submit"
-            loading={importBusy}
-            disabled={!project || !importDraft.reference.trim()}
-          >
-            Import into {project?.name ?? "project"}
-          </Button>
-        </form>
+        )}
+        <TicketPicker
+          key={importProvider}
+          provider={importProvider}
+          organizationId={project?.organizationId ?? ""}
+          projectId={project?.id ?? ""}
+          busy={importBusy || !project}
+          onPickIssue={(issue) => void pickIssue(issue)}
+          onOpenSettings={() => {
+            setImportOpened(false);
+            setSourceSettingsProjectId(projectId);
+            setView("tools");
+          }}
+        />
+        {importBusy && (
+          <p className="ticket-picker-note">
+            <Loader size="xs" /> Importing into {project?.name ?? "project"}…
+          </p>
+        )}
+        {importError && (
+          <p role="alert" className="task-error">
+            {importError}
+          </p>
+        )}
       </Modal>
       <Modal
         opened={taskOpened}
