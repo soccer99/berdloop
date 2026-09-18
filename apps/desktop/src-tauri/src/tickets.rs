@@ -8,6 +8,7 @@
 use base64::Engine;
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::agent_preferences;
@@ -589,8 +590,159 @@ fn asana_newest(tasks: Vec<ExternalIssue>, first: u32) -> Vec<ExternalIssue> {
     tasks.into_iter().take(first as usize).collect()
 }
 
+/// What one picker session has already learned about one Asana workspace.
+///
+/// A free plan refuses `/workspaces/{gid}/tasks/search`, so every term a
+/// person typed used to cost two requests: the refusal, and then the same
+/// unchanged page of a hundred assigned tasks read again. Asana allows a free
+/// workspace 150 requests a minute, so a few searches in a row started
+/// failing for a reason the picker could only report as a plain HTTP error.
+/// The page is read once here and every later term is filtered over it, and
+/// the refusal is learned once rather than per keystroke.
+struct AsanaSession {
+    /// The scope and workspace the page belongs to. Anything learned under
+    /// another key belongs to another session, so changing project or
+    /// workspace never answers out of the page before it.
+    key: String,
+    /// The assigned tasks this session read. `None` until it has read them:
+    /// an empty page is an answer, not a miss.
+    page: Option<Vec<ExternalIssue>>,
+    /// Asana has already refused the premium search under this key.
+    search_refused: bool,
+}
+
+impl AsanaSession {
+    const fn new() -> Self {
+        Self {
+            key: String::new(),
+            page: None,
+            search_refused: false,
+        }
+    }
+
+    /// The session as it stands for `key`, forgetting whatever another key
+    /// taught it.
+    fn at(&mut self, key: &str) -> &mut Self {
+        if self.key != key {
+            self.key = key.to_string();
+            self.page = None;
+            self.search_refused = false;
+        }
+        self
+    }
+}
+
+/// One session, because one picker is open at a time.
+static ASANA_SESSION: Mutex<AsanaSession> = Mutex::new(AsanaSession::new());
+
+/// What tells one session's page from another's. The scope is in it because
+/// a project and its organization can be connected to different workspaces,
+/// and the provider because only this provider keeps a page at all.
+fn asana_key(organization_id: &str, project_id: &str, workspace: &str) -> String {
+    format!("Asana\u{1f}{organization_id}\u{1f}{project_id}\u{1f}{workspace}")
+}
+
+/// The page of assigned tasks for `key`, read through `read` only when this
+/// session has not read it yet. Every term after the first is answered from
+/// that one page, so typing costs no requests at all.
+async fn asana_page_once<Fut>(
+    session: &Mutex<AsanaSession>,
+    key: &str,
+    read: impl FnOnce() -> Fut,
+) -> Result<Vec<ExternalIssue>, String>
+where
+    Fut: std::future::Future<Output = Result<Vec<ExternalIssue>, String>>,
+{
+    // The lock is taken and let go on either side of the read, never held
+    // across it.
+    let known = session.lock().unwrap().at(key).page.clone();
+    if let Some(page) = known {
+        return Ok(page);
+    }
+    let page = read().await?;
+    session.lock().unwrap().at(key).page = Some(page.clone());
+    Ok(page)
+}
+
+/// An empty search is the picker opening, which is where one session ends
+/// and the next begins: the page just read replaces whatever the last one
+/// held, and a refusal it learned is forgotten in case the plan has changed.
+fn asana_session_opens(session: &Mutex<AsanaSession>, key: &str, page: &[ExternalIssue]) {
+    let mut session = session.lock().unwrap();
+    session.key = key.to_string();
+    session.page = Some(page.to_vec());
+    session.search_refused = false;
+}
+
+fn asana_search_refused(session: &Mutex<AsanaSession>, key: &str) -> bool {
+    session.lock().unwrap().at(key).search_refused
+}
+
+fn asana_remember_refusal(session: &Mutex<AsanaSession>, key: &str) {
+    session.lock().unwrap().at(key).search_refused = true;
+}
+
+/// How Asana answered its own search. Only the plan refusing it is worth
+/// remembering: any other failure says nothing about the plan and could well
+/// work on the next term.
+enum PremiumSearch {
+    Found(Vec<ExternalIssue>),
+    Refused,
+    Failed,
+}
+
+/// 402 and 403 are how a plan without premium search answers it.
+fn plan_refused(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::PAYMENT_REQUIRED || status == reqwest::StatusCode::FORBIDDEN
+}
+
+/// Asana's own search, which reads the request's status rather than a
+/// message, so the refusal is told apart from a provider that was merely
+/// unreachable this once.
+async fn asana_premium_search(
+    connection: &Connection,
+    workspace: &str,
+    query: &str,
+    first: u32,
+) -> PremiumSearch {
+    let limit = first.to_string();
+    let Ok(client) = client() else {
+        return PremiumSearch::Failed;
+    };
+    let sent = client
+        .get(format!("{ASANA_API}/workspaces/{workspace}/tasks/search"))
+        .bearer_auth(&connection.token)
+        .query(&[
+            ("text", query),
+            ("opt_fields", ASANA_FIELDS),
+            ("sort_by", "modified_at"),
+            ("limit", limit.as_str()),
+        ])
+        .send()
+        .await;
+    let Ok(response) = sent else {
+        return PremiumSearch::Failed;
+    };
+    if !response.status().is_success() {
+        return if plan_refused(response.status()) {
+            PremiumSearch::Refused
+        } else {
+            PremiumSearch::Failed
+        };
+    }
+    match response.json::<Value>().await {
+        Ok(body) => match parse_asana_search(&body) {
+            Ok(tasks) => PremiumSearch::Found(tasks),
+            Err(_) => PremiumSearch::Failed,
+        },
+        Err(_) => PremiumSearch::Failed,
+    }
+}
+
 async fn search_asana(
     connection: &Connection,
+    organization_id: &str,
+    project_id: &str,
     query: &str,
     first: u32,
 ) -> Result<Vec<ExternalIssue>, String> {
@@ -598,37 +750,27 @@ async fn search_asana(
     if workspace.is_empty() || !workspace.chars().all(|c| c.is_ascii_digit()) {
         return Err(settings_fix(ASANA_WORKSPACE));
     }
+    let key = asana_key(organization_id, project_id, workspace);
     if query.is_empty() {
-        return Ok(asana_newest(
-            asana_assigned(connection, workspace).await?,
-            first,
-        ));
+        let page = asana_assigned(connection, workspace).await?;
+        asana_session_opens(&ASANA_SESSION, &key, &page);
+        return Ok(asana_newest(page, first));
     }
-    let limit = first.to_string();
-    let searched = asana_json(
-        client()?
-            .get(format!("{ASANA_API}/workspaces/{workspace}/tasks/search"))
-            .bearer_auth(&connection.token)
-            .query(&[
-                ("text", query),
-                ("opt_fields", ASANA_FIELDS),
-                ("sort_by", "modified_at"),
-                ("limit", limit.as_str()),
-            ]),
-    )
-    .await
-    .and_then(|body| parse_asana_search(&body));
-    match searched {
-        Ok(tasks) => Ok(tasks),
-        // The search endpoint answers 402 or 403 on a plan without it. That
-        // is a limit of the plan, not a failure of the search, so the recent
-        // list is filtered here instead and nothing is reported.
-        Err(_) => Ok(asana_filter(
-            asana_assigned(connection, workspace).await?,
-            query,
-            first,
-        )),
+    if !asana_search_refused(&ASANA_SESSION, &key) {
+        match asana_premium_search(connection, workspace, query, first).await {
+            PremiumSearch::Found(tasks) => return Ok(tasks),
+            // The plan does not include search. That is not something a
+            // person can act on and it will not change while they type, so
+            // it is remembered and the assigned page answers from here on.
+            PremiumSearch::Refused => asana_remember_refusal(&ASANA_SESSION, &key),
+            PremiumSearch::Failed => {}
+        }
     }
+    let page = asana_page_once(&ASANA_SESSION, &key, || {
+        asana_assigned(connection, workspace)
+    })
+    .await?;
+    Ok(asana_filter(page, query, first))
 }
 
 #[tauri::command]
@@ -655,7 +797,7 @@ pub async fn search_external_issues(
     match provider.as_str() {
         "Linear" => search_linear(&connection.token, &query, first).await,
         "Jira" => search_jira(&connection, &query, first).await,
-        "Asana" => search_asana(&connection, &query, first).await,
+        "Asana" => search_asana(&connection, &organization_id, &project_id, &query, first).await,
         _ => unreachable!(),
     }
 }
@@ -663,6 +805,7 @@ pub async fn search_external_issues(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     #[test]
     fn jira_description_becomes_plain_text() {
@@ -940,6 +1083,92 @@ mod tests {
         let matched = asana_filter(page, "Task 3", 20);
         assert_eq!(matched.len(), 1);
         assert_eq!(matched[0].key, "1003");
+    }
+
+    /// A person on a free plan used to pay a request and a hundred-task
+    /// download for every letter they typed. One read now answers every
+    /// later term of the same session.
+    #[test]
+    fn a_second_search_of_one_workspace_reads_no_new_page() {
+        let session = Mutex::new(AsanaSession::new());
+        let key = asana_key("org-1", "project-1", "42");
+        let reads = Cell::new(0);
+        let read = || {
+            reads.set(reads.get() + 1);
+            async { parse_asana_search(&asana_page(25)) }
+        };
+
+        let first = tauri::async_runtime::block_on(asana_page_once(&session, &key, read)).unwrap();
+        assert_eq!(reads.get(), 1);
+        assert_eq!(asana_filter(first, "Task 3", 20)[0].key, "1003");
+
+        // The next term asks Asana for nothing, and still filters the whole
+        // page it read the first time.
+        let again = tauri::async_runtime::block_on(asana_page_once(&session, &key, read)).unwrap();
+        assert_eq!(reads.get(), 1);
+        assert_eq!(again.len(), 25);
+        let matched = asana_filter(again.clone(), "TASK 7", 20);
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].key, "1007");
+        assert!(asana_filter(again, "nothing here", 20).is_empty());
+
+        // Another workspace, or another scope, is another page: it is read
+        // rather than answered out of the one before it.
+        for changed in [
+            asana_key("org-1", "project-1", "99"),
+            asana_key("org-1", "project-2", "42"),
+        ] {
+            tauri::async_runtime::block_on(asana_page_once(&session, &changed, read)).unwrap();
+        }
+        assert_eq!(reads.get(), 3);
+    }
+
+    /// The picker opening reads the page anyway, so the first term typed is
+    /// filtered over that read rather than paying for a second one.
+    #[test]
+    fn the_page_the_picker_opened_on_answers_the_first_term() {
+        let session = Mutex::new(AsanaSession::new());
+        let key = asana_key("org-1", "project-1", "42");
+        asana_session_opens(
+            &session,
+            &key,
+            &parse_asana_search(&asana_page(25)).unwrap(),
+        );
+        let reads = Cell::new(0);
+        let page = tauri::async_runtime::block_on(asana_page_once(&session, &key, || {
+            reads.set(reads.get() + 1);
+            async { parse_asana_search(&asana_page(25)) }
+        }))
+        .unwrap();
+        assert_eq!(reads.get(), 0);
+        assert_eq!(asana_filter(page, "Task 12", 20)[0].key, "1012");
+    }
+
+    /// A refused premium search is a fact about the plan, not about the
+    /// term, so it is learned once instead of once per keystroke.
+    #[test]
+    fn a_refused_premium_search_is_learned_once_a_session() {
+        // 402 and 403 are the plan refusing; anything else could work on the
+        // next term and is not remembered.
+        assert!(plan_refused(reqwest::StatusCode::PAYMENT_REQUIRED));
+        assert!(plan_refused(reqwest::StatusCode::FORBIDDEN));
+        assert!(!plan_refused(reqwest::StatusCode::TOO_MANY_REQUESTS));
+        assert!(!plan_refused(reqwest::StatusCode::INTERNAL_SERVER_ERROR));
+
+        let session = Mutex::new(AsanaSession::new());
+        let key = asana_key("org-1", "project-1", "42");
+        assert!(!asana_search_refused(&session, &key));
+        asana_remember_refusal(&session, &key);
+        assert!(asana_search_refused(&session, &key));
+        // Another workspace may be on another plan, so it is asked itself.
+        assert!(!asana_search_refused(
+            &session,
+            &asana_key("org-1", "project-1", "99")
+        ));
+        // Opening the picker again asks once more, in case the plan changed.
+        asana_remember_refusal(&session, &key);
+        asana_session_opens(&session, &key, &[]);
+        assert!(!asana_search_refused(&session, &key));
     }
 
     #[test]
