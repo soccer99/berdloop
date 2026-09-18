@@ -257,6 +257,9 @@ describe("the one-message-one-ticket rule", () => {
     expect(orders).toContain(
       "A shared file is a sequencing problem, not a reason to merge two tickets.",
     );
+    // Without this the rule reads as a hard one-ticket-per-message cap, so the
+    // clause that permits splitting is asserted too.
+    expect(orders).toContain("a floor on granularity, not a ceiling");
   });
 
   test("reaches nobody else", () => {
