@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "ports": {
+    "base": 41000,
+    "stride": 20
+  },
+  "services": [
+    {
+      "name": "web",
+      "var": "PORT",
+      "default": 3000,
+      "offset": 0
+    }
+  ],
+  "dev": {
+    "command": "bun run dev"
+  },
+  "resources": [],
+  "compose": null,
+  "env": {
+    "files": [
+      ".env"
+    ],
+    "values": {}
+  },
+  "limits": {
+    "servers": 2,
+    "idleMinutes": 10
+  }
+}

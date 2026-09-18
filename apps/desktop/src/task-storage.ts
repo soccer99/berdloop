@@ -30,7 +30,18 @@ function validWorkspace(value: unknown): value is TaskWorkspace {
         typeof task.ticket === "string" &&
         ["Local", "Jira", "Linear", "Asana"].includes(task.source) &&
         ["Branch", "Engineer", "Review", "Deploy"].includes(task.stage) &&
-        ["queued", "running", "paused", "complete"].includes(task.status),
+        ["queued", "running", "paused", "review", "complete"].includes(
+          task.status,
+        ) &&
+        (task.mergePolicy === undefined ||
+          ["manual", "automatic"].includes(task.mergePolicy)) &&
+        (task.pullRequest === undefined ||
+          (typeof task.pullRequest === "object" &&
+            typeof task.pullRequest.url === "string" &&
+            typeof task.pullRequest.head === "string" &&
+            ["pending", "changes-requested", "approved"].includes(
+              task.pullRequest.review,
+            ))),
     ) &&
     Array.isArray(workspace.agentTasks) &&
     workspace.agentTasks.every(
@@ -40,6 +51,7 @@ function validWorkspace(value: unknown): value is TaskWorkspace {
         typeof task.parentTaskId === "string" &&
         typeof task.title === "string" &&
         typeof task.criteria === "string" &&
+        (task.prompt === undefined || typeof task.prompt === "string") &&
         Array.isArray(task.dependencyIds) &&
         task.dependencyIds.every((id: unknown) => typeof id === "string") &&
         [
@@ -54,6 +66,24 @@ function validWorkspace(value: unknown): value is TaskWorkspace {
         typeof task.updatedAt === "string",
     )
   );
+}
+
+/** Prompts an older build kept in the browser. Malformed storage is ignored. */
+export function legacyPrompts(
+  raw: string | null = localStorage.getItem("berdloop.ui.task-prompts.v1"),
+): Record<string, string> {
+  try {
+    const parsed: unknown = JSON.parse(raw ?? "{}");
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+      return {};
+    return Object.fromEntries(
+      Object.entries(parsed).filter(
+        (entry): entry is [string, string] => typeof entry[1] === "string",
+      ),
+    );
+  } catch {
+    return {};
+  }
 }
 
 export const localTaskStore: WorkspaceStore = {
@@ -83,7 +113,24 @@ export const localTaskStore: WorkspaceStore = {
     }
     if (!validWorkspace(value))
       throw new Error("Local tasks use an unsupported format.");
-    return value;
+    const prompts = legacyPrompts();
+    const migrated = {
+      ...value,
+      agentTasks: value.agentTasks.map((task) =>
+        task.prompt === undefined && typeof prompts[task.id] === "string"
+          ? { ...task, prompt: prompts[task.id] }
+          : task,
+      ),
+    };
+    if (JSON.stringify(migrated) !== JSON.stringify(value)) {
+      if (isTauri())
+        return invoke<TaskWorkspace>("patch_task_workspace", {
+          base: value,
+          workspace: migrated,
+        });
+      localStorage.setItem(browserKey, JSON.stringify(migrated));
+    }
+    return migrated;
   },
   async save(workspace) {
     if (!validWorkspace(workspace)) throw new Error("Invalid task workspace.");
@@ -145,6 +192,8 @@ export function useTaskWorkspace(session: AccountSession | null = null) {
   const [error, setError] = useState<string | null>(null);
   const current = useRef(workspace);
   const writes = useRef<Promise<void>>(Promise.resolve());
+  const pendingWrites = useRef(0);
+  const generation = useRef(0);
   const repository = useRef(
     new TaskRepository(
       localTaskStore,
@@ -179,18 +228,83 @@ export function useTaskWorkspace(session: AccountSession | null = null) {
   const update = useCallback(
     (change: (previous: TaskWorkspace) => TaskWorkspace) => {
       if (!ready) return;
-      const next = change(current.current);
+      const base = current.current;
+      const next = change(base);
+      const version = ++generation.current;
+      pendingWrites.current += 1;
       current.current = next;
       setWorkspace(next);
       publish(next);
       writes.current = writes.current
         .catch(() => {})
-        .then(() => repository.current.save(next, session))
-        .then(() => setError(null))
-        .catch((cause: unknown) => setError(String(cause)));
+        .then(async () => {
+          if (isTauri()) {
+            const saved = await invoke<TaskWorkspace>("patch_task_workspace", {
+              base,
+              workspace: next,
+            });
+            if (version === generation.current) {
+              current.current = saved;
+              setWorkspace(saved);
+              publish(saved);
+            }
+          } else await repository.current.save(next, session);
+          setError(null);
+        })
+        .catch(async (cause: unknown) => {
+          setError(String(cause));
+          // A rejected patch leaves the screen showing an edit that was never
+          // saved. Read the records back so the next edit starts from truth.
+          if (!isTauri() || version !== generation.current) return;
+          const loaded = await localTaskStore.load().catch(() => null);
+          if (loaded && version === generation.current) {
+            current.current = loaded;
+            setWorkspace(loaded);
+            publish(loaded);
+          }
+        })
+        .finally(() => {
+          pendingWrites.current -= 1;
+        });
     },
     [ready, session],
   );
+
+  // Rust owns native records. Polling is deliberately small and direct; no
+  // second queue store or synchronization protocol is needed in the UI.
+  useEffect(() => {
+    if (!isTauri() || !ready) return;
+    let active = true;
+    let reading = false;
+    const refresh = async () => {
+      if (reading || pendingWrites.current) return;
+      reading = true;
+      const version = generation.current;
+      try {
+        const loaded = await localTaskStore.load();
+        if (
+          active &&
+          loaded &&
+          !pendingWrites.current &&
+          version === generation.current &&
+          JSON.stringify(loaded) !== JSON.stringify(current.current)
+        ) {
+          current.current = loaded;
+          setWorkspace(loaded);
+          publish(loaded);
+        }
+      } catch (cause) {
+        if (active) setError(String(cause));
+      } finally {
+        reading = false;
+      }
+    };
+    const timer = setInterval(() => void refresh(), 750);
+    return () => {
+      active = false;
+      clearInterval(timer);
+    };
+  }, [ready]);
 
   return { workspace, update, ready, error };
 }

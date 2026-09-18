@@ -18,6 +18,7 @@ test: ## Run type checks, tests, builds, formatting checks, and Rust checks
 	bun run format:check
 	cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml --check
 	cargo check --locked --manifest-path apps/desktop/src-tauri/Cargo.toml
+	cargo test --locked --manifest-path apps/desktop/src-tauri/Cargo.toml
 
 logs: ## Follow development logs (Ctrl+C stops following, not the apps)
 	@python3 scripts/dev.py logs

@@ -19,6 +19,8 @@ export interface Project {
   provider?: string | null;
   /** How many workers the loop may run at once for this project. */
   workers?: number;
+  /** Kept, but hidden from the project lists. Its tickets stay attached. */
+  archived?: boolean;
 }
 export interface Task {
   id: string;
@@ -27,7 +29,20 @@ export interface Task {
   source: TicketProvider;
   ticket: string;
   stage: Stage;
-  status: "running" | "paused" | "queued" | "complete";
+  status: "running" | "paused" | "queued" | "review" | "complete";
+  pullRequest?: {
+    url: string;
+    /** The exact published commit. Review and merge evidence apply to it only. */
+    head: string;
+    baseBranch: string;
+    review: "pending" | "changes-requested" | "approved";
+    summary?: string;
+    /** The commit the recorded review looked at. Stale when it differs from head. */
+    reviewedHead?: string;
+    merged?: boolean;
+  };
+  /** Who merges the final pull request. Kept with the ticket, not in the browser. */
+  mergePolicy?: "manual" | "automatic";
   criteria: string;
   /** Stable ID returned by a provider. Absent for manually entered references. */
   sourceId?: string;

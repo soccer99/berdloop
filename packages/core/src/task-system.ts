@@ -23,9 +23,13 @@ export interface AgentTask {
   parentTaskId: string;
   title: string;
   criteria: string;
+  /** The complete instructions shown in the task editor and sent to its worker. */
+  prompt?: string;
   status: AgentTaskStatus;
   dependencyIds: string[];
   assigneeId?: string;
+  /** A fix requested by the independent PR reviewer; scheduled ahead of new work. */
+  reviewFix?: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -103,13 +107,25 @@ export function importIssue(
   };
 }
 
+/**
+ * The ticket the loop works on when nobody has picked one: the top of the
+ * queue as the ticket list shows it, working and paused tickets before queued
+ * ones. Complete tickets are never handed out.
+ */
+export function topTicket(tickets: Task[]): Task | undefined {
+  return (
+    tickets.find((item) => ["running", "paused"].includes(item.status)) ??
+    tickets.find((item) => item.status === "queued")
+  );
+}
+
 export function addAgentTask(
   workspace: TaskWorkspace,
   input: Pick<
     AgentTask,
     "parentTaskId" | "title" | "criteria" | "dependencyIds"
   > &
-    Partial<Pick<AgentTask, "assigneeId">>,
+    Partial<Pick<AgentTask, "assigneeId" | "prompt">>,
   now = new Date().toISOString(),
   makeId: () => string = () => crypto.randomUUID(),
 ): TaskWorkspace {

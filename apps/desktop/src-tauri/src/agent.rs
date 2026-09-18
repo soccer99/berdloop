@@ -11,6 +11,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use crate::agent_preferences;
+use crate::conversations::{Conversation, Conversations, Scope, UserMessage};
 use crate::git::Staging;
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -28,11 +29,44 @@ const STDERR_TAIL: usize = 4096;
 /// command instead, so its handle is simply never used.
 pub struct Live {
     child: Child,
-    stdin: Option<ChildStdin>,
+    outbound: Outbound,
+    _control: Option<crate::control::Channel>,
+}
+
+#[derive(Clone)]
+struct Outbound {
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
+    plan: LaunchPlan,
+    delivery: Arc<Mutex<()>>,
 }
 
 #[derive(Default)]
-pub struct Running(Mutex<HashMap<String, Live>>);
+struct AgentState {
+    live: HashMap<String, Live>,
+    conversations: Conversations,
+}
+
+#[derive(Default)]
+pub struct Running(Mutex<AgentState>);
+
+const CONVERSATION_EVENT: &str = "agent://conversation";
+
+fn publish(app: &AppHandle, thread: &Conversation) {
+    let _ = app.emit(CONVERSATION_EVENT, thread);
+}
+
+#[tauri::command]
+pub fn agent_conversations(running: tauri::State<'_, Running>) -> Vec<Conversation> {
+    running
+        .0
+        .lock()
+        .unwrap()
+        .conversations
+        .0
+        .values()
+        .cloned()
+        .collect()
+}
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -144,7 +178,7 @@ fn parse_codex(line: &serde_json::Value, out: &mut Vec<(&'static str, String)>) 
 ///
 /// The harness flags live in TypeScript beside the rules and tools they go
 /// with, so this side only starts a process and carries its output back.
-#[derive(serde::Deserialize)]
+#[derive(Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LaunchPlan {
     pub program: String,
@@ -159,6 +193,25 @@ pub struct LaunchPlan {
     pub env: std::collections::HashMap<String, String>,
 }
 
+/// The decision gateway a worker should use, as environment.
+///
+/// The approval gate runs inside the worker, which is its own process, so the
+/// gateway has to travel with it. Empty when the beta is off, and the gate
+/// then behaves exactly as it did before.
+fn decisions_env(app: &AppHandle) -> HashMap<String, String> {
+    let settings = crate::harness_settings::read(app);
+    match crate::jev::Jev::available(&settings) {
+        Some(jev) => HashMap::from([
+            (
+                crate::jev::PROVIDER_VAR.to_string(),
+                jev.provider().id().to_string(),
+            ),
+            (crate::jev::KEY_VAR.to_string(), jev.key().to_string()),
+        ]),
+        None => HashMap::new(),
+    }
+}
+
 /// Absolute path to the `berdloop-worker` command that ships beside the app.
 ///
 /// Agents are told this path rather than a bare name, because a harness runs
@@ -171,8 +224,35 @@ pub fn worker_command() -> Result<String, String> {
         .map_err(|e| e.to_string())?
         .parent()
         .ok_or("the app has no directory")?
-        .join("berdloop-worker");
+        .join(if cfg!(windows) {
+            "berdloop-worker.exe"
+        } else {
+            "berdloop-worker"
+        });
+    check_worker_binary(&here)?;
     Ok(here.to_string_lossy().into_owned())
+}
+
+/// Refuse to start an agent whose helper is missing, before it can commit work
+/// it will never be able to merge. The build writes a shell-script placeholder
+/// when the real helper has not been built yet; that is caught here too.
+fn check_worker_binary(path: &Path) -> Result<(), String> {
+    let mut head = [0u8; 2];
+    let read = std::fs::File::open(path)
+        .and_then(|mut file| file.read(&mut head))
+        .map_err(|_| {
+            format!(
+                "The worker helper is missing at {}. Rebuild the app with `bun run build:desktop`, or run `cargo build --bins` for development.",
+                path.display()
+            )
+        })?;
+    if read == 2 && &head == b"#!" {
+        return Err(format!(
+            "The worker helper at {} is a build placeholder, not the real command. Run `bun run sidecar` and rebuild the app.",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -182,18 +262,80 @@ pub fn agent_start(
     mut plan: LaunchPlan,
     harness: String,
     session_id: Option<String>,
-    organization_id: Option<String>,
-    project_id: Option<String>,
-    role: Option<String>,
+    scope: Scope,
+    opening: Option<UserMessage>,
 ) -> Result<AgentRun, String> {
-    if let Some(role) = role.as_deref() {
-        let settings = agent_preferences::read(&app)?;
-        if let Some(choice) = settings.resolve(
-            organization_id.as_deref().unwrap_or(""),
-            project_id.as_deref().unwrap_or(""),
-            role,
-        ) {
-            apply_preference(&mut plan, choice);
+    let key = scope.key()?;
+    check_scope(&app, &scope)?;
+    let settings = agent_preferences::read(&app)?;
+    if let Some(choice) = settings.resolve(&scope.organization_id, &scope.project_id, &scope.role) {
+        apply_preference(&mut plan, &choice);
+    }
+    let control = if scope.role != "worker" {
+        let (channel, path) = crate::control::open(&app, scope.clone())?;
+        plan.env
+            .insert("BERDLOOP_CONTROL".into(), path.to_string_lossy().into());
+        let workspace = crate::workspace::for_app(&app)?.load()?;
+        let tickets: Vec<_> = workspace["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| {
+                t["projectId"] == scope.project_id
+                    && scope.ticket_id.as_ref().is_none_or(|id| t["id"] == *id)
+            })
+            .collect();
+        let tasks: Vec<_> = workspace["agentTasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| {
+                tickets
+                    .iter()
+                    .any(|parent| parent["id"] == t["parentTaskId"])
+            })
+            .collect();
+        let context = format!("\n\n## Current workspace\nProject ID: {}\nTickets: {}\nTasks: {}\nUse queue-show to refresh this state before changes.",
+            scope.project_id, serde_json::to_string(&tickets).unwrap(), serde_json::to_string(&tasks).unwrap());
+        plan.prompt.push_str(&context);
+        if plan.delivery == "argv" {
+            plan.args
+                .last_mut()
+                .ok_or("Missing prompt")?
+                .push_str(&context);
+        }
+        Some(channel)
+    } else {
+        None
+    };
+    // Hold the routing lock until both the process and its conversation exist.
+    // Concurrent starts/sends cannot create two agents or miss the first output.
+    let mut state = running.0.lock().unwrap();
+    let thread = state.conversations.ensure(&scope)?;
+    if thread.streaming {
+        return Err("This conversation already has a running agent.".into());
+    }
+    if let Some(message) = opening.as_ref() {
+        thread.enqueue(message.clone())?;
+    }
+    let pending = thread.pending();
+    let extra: Vec<_> = pending
+        .iter()
+        .filter(|m| opening.as_ref().is_none_or(|first| first.id != m.id))
+        .map(|m| m.text.as_str())
+        .collect();
+    if !extra.is_empty() {
+        let suffix = format!(
+            "\n\n## Instructions received while queued\n{}",
+            extra.join("\n\n")
+        );
+        plan.prompt.push_str(&suffix);
+        if plan.delivery == "argv" {
+            let prompt = plan
+                .args
+                .last_mut()
+                .ok_or("The launch plan has no prompt.")?;
+            prompt.push_str(&suffix);
         }
     }
     let run_id = uuid::Uuid::new_v4().to_string();
@@ -204,48 +346,97 @@ pub fn agent_start(
             .ok()
             .map(|ticket| (staging, task, ticket))
     });
-
-    let mut child = Command::new(&plan.program)
+    // Remember the directory as it stands, so the window can show what this
+    // run changes. A missed snapshot only costs a diff view, never a launch.
+    if let Some((staging, task, _)) = worker.as_ref() {
+        if let Err(error) = staging.mark_turn(task) {
+            eprintln!("could not mark the turn for {task}: {error}");
+        }
+    }
+    let mut command = Command::new(&plan.program);
+    command
         .args(&plan.args)
         .current_dir(&plan.cwd)
-        // Belt and braces: the standing orders carry the absolute path, and
-        // the command is on PATH as well for anything that looks there.
         .env("PATH", worker_path())
         .envs(&plan.env)
         .env("BERDLOOP_RUN_ID", &run_id)
-        // Kept open, not closed: this is the channel a steering message uses.
+        // The approval gate runs inside the worker, which is its own process,
+        // so the gateway has to travel with it. Empty when the beta is off,
+        // and the gate then behaves exactly as it did before.
+        .envs(decisions_env(&app))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("could not start {}: {e}", plan.program))?;
-
+        .stderr(Stdio::piped());
+    // Its own process group, so stopping the agent also stops whatever it was
+    // running: a test suite left behind would otherwise keep writing into a
+    // worktree the next attempt is about to use.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    let spawned = command.spawn();
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(error) => {
+            if let Some(message) = opening.as_ref() {
+                thread.delivery(&message.id, "failed");
+            }
+            thread.append(
+                "system",
+                format!("Could not start {}: {error}", plan.program),
+            );
+            publish(&app, thread);
+            return Err(format!("could not start {}: {error}", plan.program));
+        }
+    };
     let stdout = child.stdout.take().ok_or("no stdout")?;
     let stderr = child.stderr.take().ok_or("no stderr")?;
     let mut stdin = child.stdin.take();
-
-    // Claude Code reads its prompt from the same stream that later steering
-    // messages use, so the first message is sent the same way as the rest.
     if stream_prompt {
-        let handle = stdin.as_mut().ok_or("no stdin")?;
-        write_user_message(handle, &plan.prompt).map_err(|e| e.to_string())?;
+        let result = stdin
+            .as_mut()
+            .ok_or("no stdin".to_string())
+            .and_then(|handle| write_user_message(handle, &plan.prompt).map_err(|e| e.to_string()));
+        if let Err(error) = result {
+            let _ = child.kill();
+            let _ = child.wait();
+            if let Some(message) = opening.as_ref() {
+                thread.delivery(&message.id, "failed");
+            }
+            publish(&app, thread);
+            return Err(error);
+        }
     }
-
-    running
-        .0
-        .lock()
-        .unwrap()
-        .insert(run_id.clone(), Live { child, stdin });
+    thread.run_id = Some(run_id.clone());
+    thread.session_id = session_id.clone();
+    thread.harness = harness.clone();
+    thread.worktree = Some(plan.cwd.clone());
+    thread.streaming = true;
+    thread.activity = "coding".into();
+    thread.revision += 1;
+    for message in pending {
+        thread.delivery(&message.id, "delivered");
+    }
+    publish(&app, thread);
+    state.live.insert(
+        run_id.clone(),
+        Live {
+            child,
+            _control: control,
+            outbound: Outbound {
+                stdin: Arc::new(Mutex::new(stdin)),
+                plan,
+                delivery: Arc::new(Mutex::new(())),
+            },
+        },
+    );
+    drop(state);
 
     let errors = Arc::new(Mutex::new(String::new()));
     let sink = Arc::clone(&errors);
-    std::thread::spawn(move || {
+    let stderr_reader = std::thread::spawn(move || {
         let mut buffer = String::new();
-        let mut reader = stderr;
-        let _ = reader.read_to_string(&mut buffer);
+        let _ = BufReader::new(stderr).read_to_string(&mut buffer);
         *sink.lock().unwrap() = buffer;
     });
-
     let app_handle = app.clone();
     let stream_run_id = run_id.clone();
     let mut stream_session = session_id.clone();
@@ -256,8 +447,42 @@ pub fn agent_start(
                 continue;
             };
             let mut chunks = Vec::new();
-            if let Some(found) = parse_line(&harness, &value, &mut chunks) {
-                stream_session = Some(found);
+            let found = parse_line(&harness, &value, &mut chunks);
+            if let Some(session) = &found {
+                stream_session = Some(session.clone());
+            }
+            {
+                let running = app_handle.state::<Running>();
+                let mut state = running.0.lock().unwrap();
+                if let Some(thread) = state.conversations.for_run(&key, &stream_run_id) {
+                    if let Some(session) = found.as_ref() {
+                        thread.session_id = Some(session.clone());
+                        thread.revision += 1;
+                    }
+                    for (kind, text) in &chunks {
+                        match *kind {
+                            "text" if !text.is_empty() => thread.append("agent", text.clone()),
+                            "error" => thread.append(
+                                "system",
+                                if text.is_empty() {
+                                    "The agent reported an error.".into()
+                                } else {
+                                    text.clone()
+                                },
+                            ),
+                            "tool" => {
+                                thread.activity = activity_of(text).into();
+                                thread.revision += 1;
+                            }
+                            _ => {}
+                        }
+                    }
+                    publish(&app_handle, thread);
+                }
+            }
+            // Session announcements need no text to flush a message queued during startup.
+            if found.is_some() {
+                let _ = deliver_pending(&app_handle, &key, &stream_run_id);
             }
             for (kind, text) in chunks {
                 failed |= kind == "error";
@@ -272,24 +497,18 @@ pub fn agent_start(
                 );
             }
         }
-
-        // Reap the child so a finished run leaves no zombie behind.
-        let status = app_handle
+        let live = app_handle
             .state::<Running>()
             .0
             .lock()
             .unwrap()
-            .remove(&stream_run_id)
-            .and_then(|mut live| {
-                // Closing standard input is what lets a streaming harness
-                // finish. Nothing more will be sent to it.
-                live.stdin.take();
-                live.child.wait().ok()
-            });
+            .live
+            .remove(&stream_run_id);
+        let status = live.and_then(|mut live| {
+            live.outbound.stdin.lock().unwrap().take();
+            live.child.wait().ok()
+        });
         let clean = status.is_some_and(|s| s.success()) && !failed;
-
-        // An agent can crash, be stopped, or forget its final report. Record a
-        // blocked outcome on disk so the loop can release its worker slot.
         if let Some((staging, task, ticket)) = worker {
             if !staging.has_report_for_run(&task, &stream_run_id) {
                 let _ = staging.append_report(
@@ -301,10 +520,34 @@ pub fn agent_start(
                 );
             }
         }
-
-        let mut detail = errors.lock().unwrap().clone();
-        if detail.len() > STDERR_TAIL {
-            detail = detail.split_off(detail.len() - STDERR_TAIL);
+        let _ = stderr_reader.join();
+        let detail: String = errors
+            .lock()
+            .unwrap()
+            .chars()
+            .rev()
+            .take(STDERR_TAIL)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        {
+            let running = app_handle.state::<Running>();
+            let mut state = running.0.lock().unwrap();
+            if let Some(thread) = state.conversations.for_run(&key, &stream_run_id) {
+                thread.streaming = false;
+                if thread.activity != "paused" {
+                    thread.activity = if clean { "done" } else { "blocked" }.into();
+                }
+                thread.revision += 1;
+                for message in thread.pending() {
+                    thread.delivery(&message.id, "failed");
+                }
+                if !clean && !detail.is_empty() {
+                    thread.append("system", detail.clone());
+                }
+                publish(&app_handle, thread);
+            }
         }
         let _ = app_handle.emit(
             END_EVENT,
@@ -316,13 +559,214 @@ pub fn agent_start(
             },
         );
     });
-
     Ok(AgentRun { run_id, session_id })
 }
 
+fn activity_of(tool: &str) -> &'static str {
+    let tool = tool.to_lowercase();
+    if tool.contains("merge-wait") || tool.contains("merge-request") {
+        "waiting-to-merge"
+    } else if tool.contains("merge-sync") || tool.contains("merge-land") {
+        "merging"
+    } else if tool.contains("test") || tool.contains("check") {
+        "testing"
+    } else {
+        "coding"
+    }
+}
+
+/// Route by conversation scope. The browser never chooses a process or session ID.
+#[tauri::command]
+pub async fn agent_send_message(
+    app: AppHandle,
+    scope: Scope,
+    message: UserMessage,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || send_message(&app, scope, message))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn send_message(app: &AppHandle, scope: Scope, message: UserMessage) -> Result<(), String> {
+    let key = scope.key()?;
+    let run = {
+        let running = app.state::<Running>();
+        let mut state = running.0.lock().unwrap();
+        let thread = state.conversations.ensure(&scope)?;
+        if thread.run_id.is_some() && !thread.streaming {
+            return Err(
+                "That agent has stopped. Start or resume the conversation before sending.".into(),
+            );
+        }
+        thread.enqueue(message)?;
+        let run = thread.run_id.clone();
+        publish(app, thread);
+        run
+    };
+    if let Some(run) = run {
+        deliver_pending(app, &key, &run)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn queue_instruction(
+    app: &AppHandle,
+    scope: Scope,
+    message: UserMessage,
+) -> Result<(), String> {
+    let key = scope.key()?;
+    let run = {
+        let running = app.state::<Running>();
+        let mut state = running.0.lock().unwrap();
+        let thread = state.conversations.ensure(&scope)?;
+        thread.enqueue(message)?;
+        if !thread.streaming {
+            thread.activity = "queued".into();
+            thread.revision += 1;
+        }
+        publish(app, thread);
+        thread.streaming.then(|| thread.run_id.clone()).flatten()
+    };
+    if let Some(run) = run {
+        deliver_pending(app, &key, &run)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn note(app: &AppHandle, scope: &Scope, message: String) {
+    let Ok(key) = scope.key() else {
+        return;
+    };
+    let running = app.state::<Running>();
+    let mut state = running.0.lock().unwrap();
+    if let Some(thread) = state.conversations.0.get_mut(&key) {
+        thread.append("system", message);
+        publish(app, thread);
+    }
+}
+
+pub(crate) fn stop_and_wait(app: &AppHandle, scope: &Scope) -> Result<(), String> {
+    agent_stop(app.clone(), scope.clone())?;
+    let key = scope.key()?;
+    let start = std::time::Instant::now();
+    loop {
+        let running = app.state::<Running>();
+        let streaming = running
+            .0
+            .lock()
+            .unwrap()
+            .conversations
+            .0
+            .get(&key)
+            .is_some_and(|t| t.streaming);
+        if !streaming {
+            return Ok(());
+        }
+        if start.elapsed().as_secs() >= 5 {
+            return Err("Worker has not exited yet. Retry after it stops.".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+// Serialize only one conversation's deliveries. A slow external CLI must not
+// block another conversation, stream events, snapshots, or the UI thread.
+fn deliver_pending(app: &AppHandle, key: &str, run: &str) -> Result<(), String> {
+    let running = app.state::<Running>();
+    deliver_messages(&running.0, key, run, |thread| publish(app, thread))
+}
+
+fn deliver_messages(
+    state: &Mutex<AgentState>,
+    key: &str,
+    run: &str,
+    notify: impl Fn(&Conversation),
+) -> Result<(), String> {
+    let outbound = {
+        let state = state.lock().unwrap();
+        let Some(process) = state.live.get(run) else {
+            return Ok(());
+        };
+        process.outbound.clone()
+    };
+    let _delivery = outbound.delivery.lock().unwrap();
+    loop {
+        let (message, session) = {
+            let mut state = state.lock().unwrap();
+            let thread = state
+                .conversations
+                .for_run(key, run)
+                .ok_or("The agent run changed.")?;
+            if !thread.streaming {
+                return Err("That agent has stopped.".into());
+            }
+            let Some(message) = thread.pending().into_iter().next() else {
+                return Ok(());
+            };
+            if outbound.plan.delivery != "stdin" && thread.session_id.is_none() {
+                return Ok(());
+            }
+            (message, thread.session_id.clone())
+        };
+        // Every instruction starts a new turn, so the diff view can show what
+        // this one message produced rather than the whole run.
+        if let Some((staging, task)) = Staging::locate(Path::new(&outbound.plan.cwd)) {
+            if let Err(error) = staging.mark_turn(&task) {
+                eprintln!("could not mark the turn for {task}: {error}");
+            }
+        }
+        let result = if outbound.plan.delivery == "stdin" {
+            outbound
+                .stdin
+                .lock()
+                .unwrap()
+                .as_mut()
+                .ok_or("The agent input is closed.".to_string())
+                .and_then(|handle| {
+                    write_user_message(handle, &message.text).map_err(|e| e.to_string())
+                })
+        } else {
+            send_codex(&outbound.plan, session.as_deref().unwrap(), &message.text)
+        };
+        let mut state = state.lock().unwrap();
+        if let Some(thread) = state.conversations.for_run(key, run) {
+            thread.delivery(
+                &message.id,
+                if result.is_ok() {
+                    "delivered"
+                } else {
+                    "failed"
+                },
+            );
+            notify(thread);
+        }
+        result?;
+    }
+}
+
+fn send_codex(plan: &LaunchPlan, session: &str, message: &str) -> Result<(), String> {
+    let output = Command::new(&plan.program)
+        .args(["queue", "--thread", session, "--message", message])
+        .current_dir(&plan.cwd)
+        .envs(&plan.env)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
 fn apply_preference(plan: &mut LaunchPlan, choice: &agent_preferences::RolePreference) {
-    let model = choice.model.trim();
-    if !model.is_empty() {
+    let model = choice.model.as_deref().unwrap_or("").trim();
+    let preference_harness = choice.harness.as_deref().unwrap_or("claude-code");
+    let plan_harness = if plan.program == "codex" {
+        "codex"
+    } else {
+        "claude-code"
+    };
+    if !model.is_empty() && preference_harness == plan_harness {
         if plan.program == "codex" {
             let at = plan.args.len().saturating_sub(1);
             plan.args
@@ -332,7 +776,7 @@ fn apply_preference(plan: &mut LaunchPlan, choice: &agent_preferences::RolePrefe
                 .splice(0..0, ["--model".to_string(), model.to_string()]);
         }
     }
-    let custom = choice.system_prompt.trim();
+    let custom = choice.system_prompt.as_deref().unwrap_or("").trim();
     if custom.is_empty() {
         return;
     }
@@ -355,10 +799,21 @@ fn apply_preference(plan: &mut LaunchPlan, choice: &agent_preferences::RolePrefe
 }
 
 #[tauri::command]
-pub fn agent_stop(running: tauri::State<'_, Running>, run_id: String) -> Result<(), String> {
-    if let Some(mut live) = running.0.lock().unwrap().remove(&run_id) {
-        live.stdin.take();
-        live.child.kill().map_err(|e| e.to_string())?;
+pub fn agent_stop(app: AppHandle, scope: Scope) -> Result<(), String> {
+    let running = app.state::<Running>();
+    let mut state = running.0.lock().unwrap();
+    let thread = state.conversations.ensure(&scope)?;
+    let run = thread.run_id.clone();
+    if let Some(run) = run {
+        if let Some(live) = state.live.get_mut(&run) {
+            kill_group(&mut live.child)?;
+            live.outbound.stdin.lock().unwrap().take();
+        }
+        let thread = state.conversations.ensure(&scope)?;
+        thread.activity = "paused".into();
+        // Keep this run reserved until its reader has reaped the process.
+        thread.revision += 1;
+        publish(&app, thread);
     }
     Ok(())
 }
@@ -390,6 +845,40 @@ pub fn harness_home(app: AppHandle) -> Result<String, String> {
     Ok(home.to_string_lossy().into_owned())
 }
 
+/// Stop the agent and every process it started. The agent was spawned as the
+/// leader of its own group, so a negative pid reaches all of them.
+fn kill_group(child: &mut Child) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .args(["-TERM", "--", &format!("-{}", child.id())])
+            .status();
+    }
+    child.kill().map_err(|e| e.to_string())
+}
+
+/// The scope an agent is started under must exist in the records, or an agent
+/// could be attached to a task that was removed or moved to another project.
+fn check_scope(app: &AppHandle, scope: &Scope) -> Result<(), String> {
+    let workspace = crate::workspace::for_app(app)?.load()?;
+    let ticket = match scope.ticket_id.as_deref() {
+        None => return Ok(()),
+        Some(id) => workspace["tasks"]
+            .as_array()
+            .and_then(|tickets| tickets.iter().find(|t| t["id"] == id))
+            .filter(|t| t["projectId"] == scope.project_id)
+            .ok_or("That ticket is not in this project.")?,
+    };
+    if let Some(task) = scope.task_id.as_deref() {
+        workspace["agentTasks"]
+            .as_array()
+            .and_then(|tasks| tasks.iter().find(|t| t["id"] == task))
+            .filter(|t| t["parentTaskId"] == ticket["id"])
+            .ok_or("That task is not on this ticket.")?;
+    }
+    Ok(())
+}
+
 /// PATH for a worker, with the directory holding `berdloop-worker` in front.
 fn worker_path() -> String {
     let existing = std::env::var("PATH").unwrap_or_default();
@@ -410,63 +899,6 @@ fn write_user_message(handle: &mut ChildStdin, text: &str) -> std::io::Result<()
     });
     writeln!(handle, "{line}")?;
     handle.flush()
-}
-
-/// Interrupt a running conversation with a new instruction.
-///
-/// This is how a task agent steers a worker, and how a ticket agent steers a
-/// task agent. A conversation that has already finished cannot be reached, and
-/// says so rather than failing silently.
-#[tauri::command]
-pub fn agent_steer(
-    running: tauri::State<'_, Running>,
-    run_id: String,
-    message: String,
-) -> Result<(), String> {
-    if message.trim().is_empty() {
-        return Err("A steering message cannot be empty.".to_string());
-    }
-    let mut live = running.0.lock().unwrap();
-    let target = live
-        .get_mut(&run_id)
-        .ok_or("That conversation is no longer running.")?;
-    let handle = target
-        .stdin
-        .as_mut()
-        .ok_or("That conversation does not take messages on its input.")?;
-    write_user_message(handle, &message).map_err(|e| e.to_string())
-}
-
-/// Steer a harness that is reached from outside its own process.
-///
-/// Codex takes a message addressed by thread id, from any process, which means
-/// a queued instruction can be delivered without holding the worker's handle.
-#[tauri::command]
-pub fn agent_steer_command(
-    program: String,
-    args: Vec<String>,
-    session_id: String,
-    message: String,
-) -> Result<String, String> {
-    if message.trim().is_empty() {
-        return Err("A steering message cannot be empty.".to_string());
-    }
-    let filled: Vec<String> = args
-        .iter()
-        .map(|arg| {
-            arg.replace("{session}", &session_id)
-                .replace("{message}", &message)
-        })
-        .collect();
-    let output = Command::new(&program)
-        .args(&filled)
-        .output()
-        .map_err(|e| format!("could not run {program}: {e}"))?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
-    }
 }
 
 #[cfg(test)]
@@ -490,8 +922,9 @@ mod tests {
         apply_preference(
             &mut plan,
             &agent_preferences::RolePreference {
-                model: "claude-opus-4-1".into(),
-                system_prompt: "Check accessibility".into(),
+                harness: None,
+                model: Some("claude-opus-4-1".into()),
+                system_prompt: Some("Check accessibility".into()),
             },
         );
         assert_eq!(&plan.args[..2], ["--model", "claude-opus-4-1"]);
@@ -514,12 +947,34 @@ mod tests {
         apply_preference(
             &mut plan,
             &agent_preferences::RolePreference {
-                model: "gpt-5".into(),
-                system_prompt: "Check accessibility".into(),
+                harness: Some("codex".into()),
+                model: Some("gpt-5".into()),
+                system_prompt: Some("Check accessibility".into()),
             },
         );
         assert_eq!(&plan.args[1..3], ["--model", "gpt-5"]);
         assert!(plan.args.last().unwrap().contains("Check accessibility"));
+    }
+
+    #[test]
+    fn changing_harness_defaults_does_not_apply_incompatible_models_to_old_sessions() {
+        let mut plan = LaunchPlan {
+            program: "claude".into(),
+            args: vec!["-p".into()],
+            cwd: "/tmp".into(),
+            delivery: "stdin".into(),
+            prompt: "Task".into(),
+            env: HashMap::new(),
+        };
+        apply_preference(
+            &mut plan,
+            &agent_preferences::RolePreference {
+                harness: Some("codex".into()),
+                model: Some("codex-model".into()),
+                system_prompt: Some(String::new()),
+            },
+        );
+        assert!(!plan.args.contains(&"--model".to_string()));
     }
 
     fn chunks(harness: &str, raw: &str) -> (Vec<(&'static str, String)>, Option<String>) {
@@ -573,5 +1028,186 @@ mod tests {
             r#"{"type":"item.completed","item":{"item_type":"command_execution","command":"ls -la"}}"#,
         );
         assert_eq!(out, [("tool", "ls -la".into())]);
+    }
+    #[cfg(unix)]
+    fn live_fixture(program: &str, delivery: &str) -> Live {
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take();
+        Live {
+            child,
+            _control: None,
+            outbound: Outbound {
+                stdin: Arc::new(Mutex::new(stdin)),
+                delivery: Arc::new(Mutex::new(())),
+                plan: LaunchPlan {
+                    program: program.into(),
+                    args: vec![],
+                    cwd: "/tmp".into(),
+                    delivery: delivery.into(),
+                    prompt: String::new(),
+                    env: HashMap::new(),
+                },
+            },
+        }
+    }
+
+    #[cfg(unix)]
+    fn register(state: &mut AgentState, task: &str, live: Live) {
+        let scope = Scope {
+            organization_id: "org".into(),
+            project_id: "project".into(),
+            ticket_id: Some("ticket".into()),
+            task_id: Some(task.into()),
+            role: "worker".into(),
+        };
+        let thread = state.conversations.ensure(&scope).unwrap();
+        thread.run_id = Some(format!("run-{task}"));
+        thread.streaming = true;
+        state.live.insert(format!("run-{task}"), live);
+    }
+
+    #[cfg(unix)]
+    fn finish_fixture(live: Live) -> String {
+        live.outbound.stdin.lock().unwrap().take();
+        // cat exits on EOF, so this needs no sleeps or external services.
+        let output = live.child.wait_with_output().unwrap();
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn stdin_messages_reach_only_the_addressed_process_once() {
+        let mut state = AgentState::default();
+        register(&mut state, "a", live_fixture("cat", "stdin"));
+        register(&mut state, "b", live_fixture("cat", "stdin"));
+        for task in ["a", "b"] {
+            state
+                .conversations
+                .0
+                .get_mut(task)
+                .unwrap()
+                .enqueue(UserMessage {
+                    id: format!("message-{task}"),
+                    text: format!("hello {task}"),
+                    target: None,
+                })
+                .unwrap();
+        }
+        let state = Mutex::new(state);
+        // Delivery by stdin works before a CLI announces its session ID.
+        deliver_messages(&state, "a", "run-a", |_| {}).unwrap();
+        deliver_messages(&state, "a", "run-a", |_| {}).unwrap();
+        assert!(deliver_messages(&state, "a", "run-b", |_| {}).is_err());
+        {
+            let state = state.lock().unwrap();
+            assert_eq!(
+                state.conversations.0["a"].messages[0].delivery.as_deref(),
+                Some("delivered")
+            );
+            assert_eq!(
+                state.conversations.0["b"].messages[0].delivery.as_deref(),
+                Some("pending")
+            );
+        }
+        let mut state = state.into_inner().unwrap();
+        let a = finish_fixture(state.live.remove("run-a").unwrap());
+        let b = finish_fixture(state.live.remove("run-b").unwrap());
+        assert_eq!(a.lines().count(), 1);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&a).unwrap()["message"]["content"],
+            "hello a"
+        );
+        assert!(b.is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn codex_waits_for_its_session_and_uses_the_launch_home() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("berdloop-routing-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-codex");
+        std::fs::write(&script, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$CAPTURE\"\nprintf '%s' \"$CODEX_HOME\" > \"$CAPTURE_HOME\"\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut live = live_fixture(script.to_str().unwrap(), "argv");
+        live.outbound.plan.env.insert(
+            "CODEX_HOME".into(),
+            dir.join("private-home").display().to_string(),
+        );
+        live.outbound
+            .plan
+            .env
+            .insert("CAPTURE".into(), dir.join("args").display().to_string());
+        live.outbound.plan.env.insert(
+            "CAPTURE_HOME".into(),
+            dir.join("home").display().to_string(),
+        );
+        let mut state = AgentState::default();
+        register(&mut state, "a", live);
+        state
+            .conversations
+            .0
+            .get_mut("a")
+            .unwrap()
+            .enqueue(UserMessage {
+                id: "m1".into(),
+                text: "steer only A".into(),
+                target: None,
+            })
+            .unwrap();
+        let state = Mutex::new(state);
+        deliver_messages(&state, "a", "run-a", |_| {}).unwrap();
+        assert!(!dir.join("args").exists());
+        state
+            .lock()
+            .unwrap()
+            .conversations
+            .0
+            .get_mut("a")
+            .unwrap()
+            .session_id = Some("session-a".into());
+        deliver_messages(&state, "a", "run-a", |_| {}).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("args")).unwrap(),
+            "queue\n--thread\nsession-a\n--message\nsteer only A\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("home")).unwrap(),
+            dir.join("private-home").display().to_string()
+        );
+        let mut state = state.into_inner().unwrap();
+        assert_eq!(
+            state.conversations.0["a"].messages[0].delivery.as_deref(),
+            Some("delivered")
+        );
+        finish_fixture(state.live.remove("run-a").unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn failed_delivery_remains_visible_and_is_not_marked_sent() {
+        let mut state = AgentState::default();
+        register(&mut state, "a", live_fixture("/usr/bin/false", "argv"));
+        let thread = state.conversations.0.get_mut("a").unwrap();
+        thread.session_id = Some("session-a".into());
+        thread
+            .enqueue(UserMessage {
+                id: "m".into(),
+                text: "keep this message".into(),
+                target: None,
+            })
+            .unwrap();
+        let state = Mutex::new(state);
+        assert!(deliver_messages(&state, "a", "run-a", |_| {}).is_err());
+        let mut state = state.into_inner().unwrap();
+        let message = &state.conversations.0["a"].messages[0];
+        assert_eq!(message.delivery.as_deref(), Some("failed"));
+        assert_eq!(message.text, "keep this message");
+        finish_fixture(state.live.remove("run-a").unwrap());
     }
 }

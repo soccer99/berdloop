@@ -6,8 +6,8 @@ export interface ThreadMessage {
   id: string;
   role: "user" | "agent" | "system";
   text: string;
-  at?: string;
-  delivery?: "saved" | "pending" | "delivered" | "applied";
+  at?: string | number;
+  delivery?: "saved" | "pending" | "delivered" | "applied" | "failed";
   target?: WorkflowAction["target"];
 }
 export interface AgentThreadView {
@@ -77,6 +77,7 @@ export function ticketState(ticket: Task): string {
     queued: "Queued",
     running: "Working",
     paused: "Paused",
+    review: "Code review",
     complete: "Done",
   }[ticket.status];
 }

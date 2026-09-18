@@ -13,6 +13,16 @@
 //!   work/<task id>/          worktree for one worker, isolated
 //! ```
 //!
+//! Where work can travel, plainly:
+//!
+//! * Task branches never leave the staging repository. They are scratch space
+//!   and `close_task` deletes them.
+//! * The ticket branch reaches the user's repository through the `local`
+//!   remote only. That remote is the user's own folder on disk, never GitHub,
+//!   which is why it is not called `origin`.
+//! * GitHub is only touched later, from the user's own repository, to open the
+//!   pull request.
+//!
 //! The user's own repository is read once when the project is prepared, and
 //! written only when a finished ticket is published.
 
@@ -20,8 +30,15 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// The remote inside the staging repository that points at the user's folder.
+const LOCAL: &str = "local";
+
+/// Tail of a prepare log kept for the window. Enough to show why an install
+/// failed without holding a whole build log in the app's state.
+const PREPARE_TAIL: usize = 4000;
+
 /// Branch that collects the finished work for one ticket.
-fn ticket_branch(ticket: &str) -> String {
+pub(crate) fn ticket_branch(ticket: &str) -> String {
     format!("berdloop/{}", safe_ref(ticket))
 }
 
@@ -66,6 +83,50 @@ pub struct Prepared {
 pub struct Worktree {
     pub path: String,
     pub branch: String,
+    /// What happened while the directory was made ready for an agent. `None`
+    /// when the worktree already existed, so nothing was run.
+    pub prepare: Option<Prepare>,
+    /// The ports, tenants and env this worker was given. `None` for a project
+    /// that has no `.berd/`, and for a worktree that already existed.
+    #[serde(default)]
+    pub provision: Option<crate::devenv::Provision>,
+    /// True when this call made the directory. Only a fresh worktree is
+    /// provisioned: re-running migrations under a working agent would undo it.
+    #[serde(default)]
+    pub fresh: bool,
+}
+
+/// The install step run once, before an agent is let into a fresh worktree.
+///
+/// A failure is reported rather than raised: the directory is still usable and
+/// the agent can install what it needs itself.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Prepare {
+    pub command: String,
+    pub ok: bool,
+    pub output: String,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Changes {
+    /// One of `ticket`, `commit` or `turn`.
+    pub base: String,
+    pub base_label: String,
+    pub files: Vec<ChangedFile>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangedFile {
+    pub path: String,
+    /// `A`, `M`, `D` or `R`.
+    pub status: String,
+    /// The destination blob id, or `deleted`. The window can tell whether a
+    /// file really changed without comparing whole patches.
+    pub fingerprint: String,
+    pub diff: String,
 }
 
 #[derive(serde::Serialize)]
@@ -112,6 +173,181 @@ fn git_try(dir: &Path, args: &[&str]) -> (bool, String) {
         }
         Err(e) => (false, format!("git could not run: {e}")),
     }
+}
+
+/// Run git against a throwaway index, leaving the worker's real one alone.
+///
+/// Staging everything to answer "what has changed?" would otherwise fight the
+/// agent for its own index while it is working.
+fn git_with_index(dir: &Path, index: &Path, args: &[&str]) -> Result<String, String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_INDEX_FILE", index)
+        .output()
+        .map_err(|e| format!("git could not run: {e}"))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+/// A per-repository agent file, under `.delta/` or `.agents/`.
+///
+/// `.delta/` wins, so a repository already set up for Delta needs no second
+/// copy of the same list or script.
+fn agent_file(root: &Path, name: &str) -> Option<PathBuf> {
+    [".delta", ".agents"]
+        .iter()
+        .map(|dir| root.join(dir).join(name))
+        .find(|path| path.exists())
+}
+
+#[cfg(unix)]
+fn symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    if target.is_dir() {
+        std::os::windows::fs::symlink_dir(target, link)
+    } else {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+}
+
+fn is_executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).is_ok_and(|meta| meta.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        path.exists()
+    }
+}
+
+fn tail(text: &str) -> String {
+    let skip = text.chars().count().saturating_sub(PREPARE_TAIL);
+    text.chars().skip(skip).collect()
+}
+
+/// Share heavy, uncommitted directories with the source repository.
+///
+/// `node_modules` and friends cost minutes to install per worktree and are the
+/// same for every worker, so they are symlinked instead of copied. Only paths
+/// git ignores are linked: a tracked file behind a symlink would be committed
+/// and pushed to the user, which is exactly what the staging repository exists
+/// to prevent. Returns one note per path that was refused.
+fn link_shared_files(source: &Path, worktree: &Path) -> Vec<String> {
+    let Some(list) = agent_file(source, "linked") else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(&list) else {
+        return vec![format!("Could not read {}.", list.display())];
+    };
+    let mut notes = Vec::new();
+    for line in text.lines() {
+        let entry = line.trim().trim_end_matches('/');
+        if entry.is_empty() || entry.starts_with('#') {
+            continue;
+        }
+        let target = source.join(entry);
+        if !target.exists() {
+            continue;
+        }
+        // The link itself must be ignored, and a symlink is never a directory
+        // to git, so a `node_modules/` rule does not cover one. Ask about the
+        // plain path, which is what will actually sit there.
+        if !git_try(worktree, &["check-ignore", "-q", entry]).0 {
+            notes.push(format!(
+                "Not linked, git does not ignore it: {entry}. A rule ending in `/` does not match a symlink."
+            ));
+            continue;
+        }
+        let link = worktree.join(entry);
+        if let Some(parent) = link.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        // An existing real file must go, or the symlink cannot be made.
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&link);
+        if let Err(error) = symlink(&target, &link) {
+            notes.push(format!("Could not link {entry}: {error}"));
+        }
+    }
+    notes
+}
+
+/// The install command for a project, chosen by the lockfile it carries.
+///
+/// First match wins, so a repository with two lockfiles gets the one its
+/// developers most likely use rather than an ambiguous failure.
+fn fallback_install(worktree: &Path) -> Option<&'static [&'static str]> {
+    const BY_LOCKFILE: &[(&str, &[&str])] = &[
+        ("bun.lock", &["bun", "install", "--frozen-lockfile"]),
+        ("bun.lockb", &["bun", "install", "--frozen-lockfile"]),
+        ("pnpm-lock.yaml", &["pnpm", "install", "--frozen-lockfile"]),
+        ("yarn.lock", &["yarn", "install", "--immutable"]),
+        ("package-lock.json", &["npm", "ci"]),
+        ("uv.lock", &["uv", "sync"]),
+        ("poetry.lock", &["poetry", "install"]),
+    ];
+    BY_LOCKFILE
+        .iter()
+        .find(|(file, _)| worktree.join(file).exists())
+        .map(|(_, argv)| *argv)
+}
+
+/// Make a fresh worktree usable: a project's own script, else a plain install.
+fn run_prepare(worktree: &Path, notes: Vec<String>) -> Option<Prepare> {
+    let script = agent_file(worktree, "prepare").filter(|path| is_executable(path));
+    let (label, mut command) = match &script {
+        Some(path) => (path.display().to_string(), Command::new(path)),
+        None => match fallback_install(worktree) {
+            Some(argv) => {
+                let mut command = Command::new(argv[0]);
+                command.args(&argv[1..]);
+                (argv.join(" "), command)
+            }
+            // Nothing to install. Still report if a link was refused.
+            None if notes.is_empty() => return None,
+            None => {
+                return Some(Prepare {
+                    command: String::new(),
+                    ok: true,
+                    output: tail(notes.join("\n").trim()),
+                })
+            }
+        },
+    };
+    let result = command.current_dir(worktree).env("BERDLOOP", "1").output();
+    let mut log = notes.join("\n");
+    let ok = match result {
+        Ok(output) => {
+            if !log.is_empty() {
+                log.push('\n');
+            }
+            log.push_str(&String::from_utf8_lossy(&output.stdout));
+            log.push_str(&String::from_utf8_lossy(&output.stderr));
+            output.status.success()
+        }
+        Err(error) => {
+            if !log.is_empty() {
+                log.push('\n');
+            }
+            log.push_str(&format!("{label} could not run: {error}"));
+            false
+        }
+    };
+    Some(Prepare {
+        command: label,
+        ok,
+        output: tail(log.trim()),
+    })
 }
 
 /// One project's private staging area.
@@ -221,6 +457,16 @@ impl Staging {
         self.root.join("staging.git")
     }
 
+    /// The user's own checkout, which is what the `local` remote points at.
+    ///
+    /// Read only: `.berd/config.json` lives there, and nothing in this module
+    /// ever writes to it.
+    pub fn source(&self) -> Option<PathBuf> {
+        git(&self.bare(), &["remote", "get-url", LOCAL])
+            .ok()
+            .map(PathBuf::from)
+    }
+
     fn integration(&self, ticket: &str) -> PathBuf {
         self.root.join("integration").join(safe_ref(ticket))
     }
@@ -244,14 +490,19 @@ impl Staging {
         if !bare.exists() {
             std::fs::create_dir_all(&bare).map_err(|e| e.to_string())?;
             git(&bare, &["init", "--bare", "--quiet"])?;
-            git(
-                &bare,
-                &["remote", "add", "origin", &source.to_string_lossy()],
-            )?;
+            git(&bare, &["remote", "add", LOCAL, &source.to_string_lossy()])?;
+        }
+        // Staging areas made before the remote was renamed still say `origin`,
+        // which reads as GitHub and is not what this points at.
+        let remotes = git(&bare, &["remote"]).unwrap_or_default();
+        if !remotes.lines().any(|name| name == LOCAL)
+            && remotes.lines().any(|name| name == "origin")
+        {
+            git(&bare, &["remote", "rename", "origin", LOCAL])?;
         }
         // Refresh from the source every time, so a worker always branches
         // from what the user has actually committed.
-        git(&bare, &["fetch", "--quiet", "origin"])?;
+        git(&bare, &["fetch", "--quiet", LOCAL])?;
 
         Ok(Prepared {
             staging: bare.to_string_lossy().into_owned(),
@@ -266,7 +517,7 @@ impl Staging {
         let path = self.integration(ticket);
 
         if git(&bare, &["rev-parse", "--verify", "--quiet", &branch]).is_err() {
-            let start = format!("origin/{base_branch}");
+            let start = format!("{LOCAL}/{base_branch}");
             git(&bare, &["branch", &branch, &start])?;
         }
         if !path.exists() {
@@ -285,6 +536,9 @@ impl Staging {
         Ok(Worktree {
             path: path.to_string_lossy().into_owned(),
             branch,
+            prepare: None,
+            provision: None,
+            fresh: false,
         })
     }
 
@@ -308,6 +562,9 @@ impl Staging {
             return Ok(Worktree {
                 path: path.to_string_lossy().into_owned(),
                 branch,
+                prepare: None,
+                provision: None,
+                fresh: false,
             });
         }
         let _ = std::fs::remove_file(notes.join(format!("{}.landed", safe_ref(task_id))));
@@ -325,9 +582,137 @@ impl Staging {
                 &from,
             ],
         )?;
+        // Only a brand new directory needs this, and only once: it costs an
+        // install, and a worker that is already running would lose its work if
+        // its dependencies were reinstalled underneath it.
+        let notes = match git(&bare, &["remote", "get-url", LOCAL]) {
+            Ok(source) => link_shared_files(Path::new(&source), &path),
+            Err(error) => vec![format!("Could not find the source repository: {error}")],
+        };
         Ok(Worktree {
             path: path.to_string_lossy().into_owned(),
             branch,
+            prepare: run_prepare(&path, notes),
+            provision: None,
+            fresh: true,
+        })
+    }
+
+    /// The tree the worker's directory would make if it committed right now.
+    ///
+    /// Untracked files are included, because half of an agent's work is new
+    /// files it has not committed yet. The agent's own index is copied first
+    /// and the copy is what gets staged, so nothing here disturbs a worker
+    /// that is in the middle of a commit.
+    fn snapshot_tree(&self, task_id: &str) -> Result<String, String> {
+        let path = self.work(task_id);
+        if !path.exists() {
+            return Err("That task has no worktree.".to_string());
+        }
+        // A worktree of a bare repository keeps its index under
+        // `staging.git/worktrees/<name>/index`, so ask git where it is.
+        let index = path.join(git(&path, &["rev-parse", "--git-path", "index"])?);
+        let scratch = self.turns_dir();
+        std::fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
+        let copy = scratch.join(format!("{}.index", safe_ref(task_id)));
+        std::fs::copy(&index, &copy).map_err(|e| e.to_string())?;
+        let tree = git_with_index(&path, &copy, &["add", "-A"])
+            .and_then(|_| git_with_index(&path, &copy, &["write-tree"]));
+        let _ = std::fs::remove_file(&copy);
+        tree
+    }
+
+    fn turns_dir(&self) -> PathBuf {
+        self.root.join("turns")
+    }
+
+    fn turn_file(&self, task_id: &str) -> PathBuf {
+        self.turns_dir().join(format!("{}.tree", safe_ref(task_id)))
+    }
+
+    /// Remember what the worker's directory looked like before it was spoken to.
+    ///
+    /// This is what "what changed this turn?" is measured against, so it is
+    /// written at every point an instruction reaches an agent.
+    pub fn mark_turn(&self, task_id: &str) -> Result<(), String> {
+        let tree = self.snapshot_tree(task_id)?;
+        std::fs::create_dir_all(self.turns_dir()).map_err(|e| e.to_string())?;
+        std::fs::write(self.turn_file(task_id), tree).map_err(|e| e.to_string())
+    }
+
+    /// What a worker has changed, for the window to show as a diff.
+    ///
+    /// Both sides are trees, never the working directory, so untracked files
+    /// appear and the answer does not shift while the agent is writing.
+    pub fn changes(&self, ticket: &str, task_id: &str, base: &str) -> Result<Changes, String> {
+        let path = self.work(task_id);
+        let snapshot = self.snapshot_tree(task_id)?;
+        let head = || git(&path, &["rev-parse", "HEAD"]);
+        let (from, label) = match base {
+            "ticket" => {
+                let branch = ticket_branch(ticket);
+                let start = git(&path, &["merge-base", &branch, "HEAD"])?;
+                (start, format!("{branch} (merge base)"))
+            }
+            "commit" => (head()?, "HEAD".to_string()),
+            "turn" => match std::fs::read_to_string(self.turn_file(task_id)) {
+                Ok(tree) if !tree.trim().is_empty() => {
+                    (tree.trim().to_string(), "start of last turn".to_string())
+                }
+                _ => (head()?, "HEAD".to_string()),
+            },
+            other => return Err(format!("{other} is not a diff base.")),
+        };
+
+        let raw = git(
+            &path,
+            &["diff", "--raw", "--no-abbrev", "-M", &from, &snapshot],
+        )?;
+        let mut files = Vec::new();
+        for line in raw.lines() {
+            // `:<old mode> <new mode> <old blob> <new blob> <status>\t<path>`,
+            // with a second tab separated path when git detected a rename.
+            let Some(rest) = line.strip_prefix(':') else {
+                continue;
+            };
+            let mut parts = rest.split('\t');
+            let fields: Vec<&str> = parts
+                .next()
+                .unwrap_or_default()
+                .split_whitespace()
+                .collect();
+            let paths: Vec<&str> = parts.collect();
+            let (Some(blob), Some(status), Some(name)) =
+                (fields.get(3), fields.get(4), paths.last())
+            else {
+                continue;
+            };
+            let mut args = vec![
+                "diff",
+                "--no-color",
+                "--no-ext-diff",
+                "-M",
+                &from,
+                &snapshot,
+                "--",
+            ];
+            // A rename needs both names, or git sees a delete and an add.
+            args.extend(&paths);
+            files.push(ChangedFile {
+                path: (*name).to_string(),
+                status: status.chars().next().unwrap_or('M').to_string(),
+                fingerprint: if blob.chars().all(|c| c == '0') {
+                    "deleted".to_string()
+                } else {
+                    (*blob).to_string()
+                },
+                diff: git(&path, &args).unwrap_or_default(),
+            });
+        }
+        Ok(Changes {
+            base: base.to_string(),
+            base_label: label,
+            files,
         })
     }
 
@@ -477,13 +862,14 @@ impl Staging {
                 .join("tasks")
                 .join(format!("{}.landed", safe_ref(task_id))),
         );
+        let _ = std::fs::remove_file(self.turn_file(task_id));
         Ok(())
     }
 
     pub fn ticket_status(&self, ticket: &str, base_branch: &str) -> Result<TicketStatus, String> {
         let bare = self.bare();
         let branch = ticket_branch(ticket);
-        let range = format!("origin/{base_branch}..{branch}");
+        let range = format!("{LOCAL}/{base_branch}..{branch}");
         let commits = git(&bare, &["rev-list", "--count", &range])
             .unwrap_or_default()
             .parse()
@@ -516,7 +902,7 @@ impl Staging {
             return Err(format!("Refusing to push onto {protected}."));
         }
         let refspec = format!("{}:refs/heads/{target}", ticket_branch(ticket));
-        git(&self.bare(), &["push", "origin", &refspec])?;
+        git(&self.bare(), &["push", LOCAL, &refspec])?;
         Ok(target)
     }
 }
@@ -552,6 +938,11 @@ pub fn git_start_ticket(
     staging_for(&app, &project_id)?.start_ticket(&ticket, &base_branch)
 }
 
+/// Open a worker's directory, then give it its ports, tenants and env.
+///
+/// Provisioning happens here rather than inside `open_task` because it needs
+/// the admin credentials, and those live in the app, deliberately out of reach
+/// of anything a worker can read. A project with no `.berd/` skips all of it.
 #[tauri::command]
 pub fn git_open_task(
     app: tauri::AppHandle,
@@ -559,7 +950,37 @@ pub fn git_open_task(
     ticket: String,
     task_id: String,
 ) -> Result<Worktree, String> {
-    staging_for(&app, &project_id)?.open_task(&ticket, &task_id)
+    let staging = staging_for(&app, &project_id)?;
+    let mut tree = staging.open_task(&ticket, &task_id)?;
+    if tree.fresh {
+        if let Some(source) = staging.source() {
+            let data = tauri::Manager::path(&app)
+                .app_data_dir()
+                .map_err(|_| "Could not find the app data directory.".to_string())?;
+            let admin = crate::broker::read_admin(&data, &project_id);
+            tree.provision = Some(crate::devenv::provision(
+                &staging.root,
+                &source,
+                &task_id,
+                Path::new(&tree.path),
+                &admin,
+            ));
+        }
+    }
+    Ok(tree)
+}
+
+/// What one worker has changed, against the ticket, its last commit, or the
+/// point where it was last given an instruction.
+#[tauri::command]
+pub fn git_task_changes(
+    app: tauri::AppHandle,
+    project_id: String,
+    ticket: String,
+    task_id: String,
+    base: String,
+) -> Result<Changes, String> {
+    staging_for(&app, &project_id)?.changes(&ticket, &task_id, &base)
 }
 
 #[tauri::command]
@@ -588,6 +1009,11 @@ pub fn git_land(
     staging.land(&ticket, &task_id)
 }
 
+/// Close a task and give back everything it held.
+///
+/// The dev server is stopped, the tenants are dropped and the slot is freed
+/// before the worktree goes, so nothing is left running against a directory
+/// that no longer exists.
 #[tauri::command]
 pub fn git_close_task(
     app: tauri::AppHandle,
@@ -595,7 +1021,15 @@ pub fn git_close_task(
     ticket: String,
     task_id: String,
 ) -> Result<(), String> {
-    staging_for(&app, &project_id)?.close_task(&ticket, &task_id)
+    let staging = staging_for(&app, &project_id)?;
+    if let Some(source) = staging.source() {
+        let admin = tauri::Manager::path(&app)
+            .app_data_dir()
+            .map(|data| crate::broker::read_admin(&data, &project_id))
+            .unwrap_or_default();
+        crate::devenv::release(&staging.root, &source, &task_id, &admin);
+    }
+    staging.close_task(&ticket, &task_id)
 }
 
 #[tauri::command]
@@ -691,6 +1125,205 @@ mod tests {
         assert_eq!(ticket_branch("PROJ-1"), "berdloop/PROJ-1");
         // A worker branch must not nest under the ticket branch.
         assert_eq!(task_branch("PROJ-1", "abc"), "berdloop-work/PROJ-1/abc");
+    }
+
+    /// Everything a worker needs before it can be opened on a fresh ticket.
+    fn ready(ticket: &str) -> (PathBuf, Staging, String) {
+        let source = source_repo();
+        let staging = staging();
+        let base = staging.prepare(&source).unwrap().base_branch;
+        staging.start_ticket(ticket, &base).unwrap();
+        (source, staging, base)
+    }
+
+    #[test]
+    fn the_staging_remote_is_named_for_what_it_points_at() {
+        let source = source_repo();
+        let staging = staging();
+        staging.prepare(&source).unwrap();
+        assert_eq!(git(&staging.bare(), &["remote"]).unwrap(), "local");
+        assert_eq!(
+            git(&staging.bare(), &["remote", "get-url", "local"]).unwrap(),
+            source.to_string_lossy()
+        );
+
+        // Staging areas made by an older version still say `origin`.
+        git(&staging.bare(), &["remote", "rename", "local", "origin"]).unwrap();
+        staging.prepare(&source).unwrap();
+        assert_eq!(git(&staging.bare(), &["remote"]).unwrap(), "local");
+        // And the ticket branch still starts from the user's branch.
+        assert!(staging.start_ticket("PROJ-11", "main").is_ok());
+    }
+
+    #[test]
+    fn only_ignored_files_are_linked_into_a_worktree() {
+        let source = source_repo();
+        std::fs::write(source.join(".gitignore"), "node_modules\nsecret.env\n").unwrap();
+        std::fs::create_dir_all(source.join("node_modules/pkg")).unwrap();
+        std::fs::write(source.join("node_modules/pkg/index.js"), "shared\n").unwrap();
+        std::fs::write(source.join("secret.env"), "KEY=1\n").unwrap();
+        std::fs::create_dir_all(source.join(".agents")).unwrap();
+        std::fs::write(
+            source.join(".agents/linked"),
+            "# heavy, and the same for everyone\nnode_modules/\nsecret.env\napp.txt\nmissing.txt\n",
+        )
+        .unwrap();
+        git(&source, &["add", "-A"]).unwrap();
+        git(&source, &["commit", "--quiet", "-m", "ignore"]).unwrap();
+
+        let staging = staging();
+        let base = staging.prepare(&source).unwrap().base_branch;
+        staging.start_ticket("PROJ-20", &base).unwrap();
+        let tree = staging.open_task("PROJ-20", "linky").unwrap();
+        let work = Path::new(&tree.path);
+
+        assert!(std::fs::symlink_metadata(work.join("node_modules"))
+            .unwrap()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(work.join("node_modules/pkg/index.js")).unwrap(),
+            "shared\n"
+        );
+        assert!(std::fs::symlink_metadata(work.join("secret.env"))
+            .unwrap()
+            .is_symlink());
+        // A tracked file must stay real, or the link would be committed.
+        assert!(!std::fs::symlink_metadata(work.join("app.txt"))
+            .unwrap()
+            .is_symlink());
+        let report = tree.prepare.expect("a refused link is worth reporting");
+        assert!(report.output.contains("app.txt"), "{}", report.output);
+        // The worker's own directory still looks clean to git.
+        assert!(git(work, &["status", "--porcelain"]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_prepare_script_runs_in_the_worktree_and_a_failure_is_survivable() {
+        let source = source_repo();
+        std::fs::create_dir_all(source.join(".agents")).unwrap();
+        std::fs::write(
+            source.join(".agents/prepare"),
+            "#!/bin/sh\npwd > prepared.txt\necho \"berdloop=$BERDLOOP\"\nexit 3\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                source.join(".agents/prepare"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        git(&source, &["add", "-A"]).unwrap();
+        git(&source, &["commit", "--quiet", "-m", "prepare"]).unwrap();
+
+        let staging = staging();
+        let base = staging.prepare(&source).unwrap().base_branch;
+        staging.start_ticket("PROJ-21", &base).unwrap();
+        // A failing prepare still hands back a usable worktree.
+        let tree = staging.open_task("PROJ-21", "setup").unwrap();
+        let report = tree.prepare.expect("the script ran");
+        assert!(!report.ok, "{}", report.output);
+        assert!(report.output.contains("berdloop=1"), "{}", report.output);
+        let where_it_ran = std::fs::read_to_string(Path::new(&tree.path).join("prepared.txt"))
+            .unwrap()
+            .trim()
+            .to_string();
+        assert!(
+            std::fs::canonicalize(&where_it_ran).unwrap()
+                == std::fs::canonicalize(&tree.path).unwrap(),
+            "{where_it_ran}"
+        );
+
+        // Opening it again changes nothing: the install already happened.
+        assert!(staging
+            .open_task("PROJ-21", "setup")
+            .unwrap()
+            .prepare
+            .is_none());
+    }
+
+    #[test]
+    fn the_lockfile_chooses_the_install_command() {
+        let dir = temp("locks");
+        assert!(fallback_install(&dir).is_none());
+        std::fs::write(dir.join("package-lock.json"), "{}").unwrap();
+        assert_eq!(fallback_install(&dir).unwrap(), ["npm", "ci"]);
+        // Bun is checked first, so it wins over an npm lockfile left behind.
+        std::fs::write(dir.join("bun.lock"), "").unwrap();
+        assert_eq!(
+            fallback_install(&dir).unwrap(),
+            ["bun", "install", "--frozen-lockfile"]
+        );
+    }
+
+    #[test]
+    fn changes_cover_committed_and_untracked_work() {
+        let (_source, staging, _base) = ready("PROJ-22");
+        let tree = staging.open_task("PROJ-22", "diffy").unwrap();
+        write(&tree.path, "app.txt", "one\nchanged\nthree\n");
+        staging.commit_task("diffy", "edit").unwrap();
+        write(&tree.path, "fresh.txt", "brand new\n");
+
+        // Against the ticket: everything this worker did, committed or not.
+        let all = staging.changes("PROJ-22", "diffy", "ticket").unwrap();
+        assert_eq!(all.base_label, "berdloop/PROJ-22 (merge base)");
+        let mut seen: Vec<_> = all
+            .files
+            .iter()
+            .map(|f| (f.path.as_str(), f.status.as_str()))
+            .collect();
+        seen.sort();
+        assert_eq!(seen, [("app.txt", "M"), ("fresh.txt", "A")]);
+        assert!(all.files[0].diff.contains("changed") || all.files[1].diff.contains("changed"));
+        assert!(all.files.iter().all(|f| f.fingerprint.len() == 40));
+
+        // Against the last commit: only the file that is not committed yet.
+        let since_commit = staging.changes("PROJ-22", "diffy", "commit").unwrap();
+        assert_eq!(since_commit.base_label, "HEAD");
+        assert_eq!(since_commit.files.len(), 1);
+        assert_eq!(since_commit.files[0].path, "fresh.txt");
+
+        // A deleted file is reported as such.
+        std::fs::remove_file(Path::new(&tree.path).join("app.txt")).unwrap();
+        let removed = staging.changes("PROJ-22", "diffy", "commit").unwrap();
+        let gone = removed.files.iter().find(|f| f.path == "app.txt").unwrap();
+        assert_eq!(gone.status, "D");
+        assert_eq!(gone.fingerprint, "deleted");
+
+        assert!(staging.changes("PROJ-22", "diffy", "sideways").is_err());
+    }
+
+    #[test]
+    fn a_turn_shows_only_what_happened_after_the_agent_was_spoken_to() {
+        let (_source, staging, _base) = ready("PROJ-23");
+        let tree = staging.open_task("PROJ-23", "turny").unwrap();
+        write(&tree.path, "before.txt", "earlier\n");
+
+        // With no turn recorded yet this falls back to the last commit.
+        let fallback = staging.changes("PROJ-23", "turny", "turn").unwrap();
+        assert_eq!(fallback.base_label, "HEAD");
+        assert_eq!(fallback.files.len(), 1);
+
+        staging.mark_turn("turny").unwrap();
+        write(&tree.path, "after.txt", "later\n");
+
+        let turn = staging.changes("PROJ-23", "turny", "turn").unwrap();
+        assert_eq!(turn.base_label, "start of last turn");
+        assert_eq!(turn.files.len(), 1, "{:?}", turn.files[0].path);
+        assert_eq!(turn.files[0].path, "after.txt");
+        assert_eq!(turn.files[0].status, "A");
+
+        // Snapshots never disturb the worker's own index.
+        assert!(
+            git(Path::new(&tree.path), &["diff", "--cached", "--name-only"])
+                .unwrap()
+                .is_empty()
+        );
+
+        staging.close_task("PROJ-23", "turny").unwrap();
+        assert!(!staging.turn_file("turny").exists());
     }
 
     #[test]

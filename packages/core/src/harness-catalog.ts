@@ -1,11 +1,13 @@
 /** CLI coding agents worth considering for local session integration. */
 export const harnessCatalog = [
   {
+    id: "claude-code",
     name: "Claude Code",
     status: "sessions",
     url: "https://code.claude.com/docs/en/overview",
   },
   {
+    id: "codex",
     name: "Codex",
     status: "sessions",
     url: "https://developers.openai.com/codex/cli",

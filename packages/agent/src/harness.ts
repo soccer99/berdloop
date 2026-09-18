@@ -1,6 +1,7 @@
 import { buildTaskBrief, type BriefInput } from "./brief";
 import { forRole, renderRules, renderSkills, rules, skills } from "./rules";
 import {
+  berdloopTools,
   renderTools,
   shellCallWith,
   toolsFor,
@@ -85,6 +86,7 @@ export function standingOrders(
     "ticket-agent": "Berdloop ticket agent",
     "task-agent": "Berdloop task agent",
     worker: "Berdloop worker",
+    "pr-code-review": "Berdloop PR code review agent",
   }[role];
   return [
     `# ${title}`,
@@ -157,6 +159,15 @@ export interface ConversationInput {
   sessionId?: string;
   resume?: string;
   tools?: ToolSpec[];
+  /**
+   * The ports and connection strings this worker was given, from
+   * `.berd/config.json`. Empty for a project that has no `.berd/`.
+   *
+   * It goes into the agent's own process, not only into the worktree's env
+   * file, so that a command the agent runs by hand still lands on this
+   * worker's own ports and its own database.
+   */
+  runtime?: Record<string, string>;
   /** Defaults to `"full"`: an agent that cannot run a check cannot finish. */
   trust?: Trust;
   /** Absolute path to the berdloop-worker command. */
@@ -165,6 +176,11 @@ export interface ConversationInput {
   taskId?: string;
   /** What else the agent may load. Nothing, unless a person said so. */
   extensions?: Extensions;
+  /**
+   * Whether the beta features are on, which decides whether this agent is
+   * given the `decide` tool.
+   */
+  beta?: boolean;
   /**
    * A private configuration directory for the harness, owned by Berdloop.
    *
@@ -185,7 +201,7 @@ export interface ConversationInput {
 export function planConversation(input: ConversationInput): LaunchPlan {
   const system = standingOrders(
     input.role,
-    input.tools ?? toolsFor(input.role),
+    input.tools ?? toolsFor(input.role, berdloopTools, input.beta),
     input.binary,
   );
   const trust = input.trust ?? "full";
@@ -196,7 +212,7 @@ export function planConversation(input: ConversationInput): LaunchPlan {
     cwd: input.cwd,
     delivery: "argv",
     steering: { via: "stdin" },
-    env: {},
+    env: { ...(input.runtime ?? {}) },
     system,
     prompt: input.prompt,
   };
@@ -230,7 +246,10 @@ export function planConversation(input: ConversationInput): LaunchPlan {
       },
       // Codex keeps config, skills, plugins and MCP servers under one home.
       // Giving it ours leaves the user's untouched and unread.
-      env: input.home ? { CODEX_HOME: input.home } : {},
+      env: {
+        ...(input.runtime ?? {}),
+        ...(input.home ? { CODEX_HOME: input.home } : {}),
+      },
     };
   }
 

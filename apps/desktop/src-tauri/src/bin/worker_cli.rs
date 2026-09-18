@@ -7,13 +7,13 @@
 //! The commands match `berdloopTools` in `packages/agent/src/tools.ts`. That
 //! list is what workers are told; this is what answers them.
 
-use std::path::PathBuf;
 use std::process::ExitCode;
 
+use berdloop_lib::broker;
+use berdloop_lib::devenv;
 use berdloop_lib::git::Staging;
 use berdloop_lib::human::{now_ms, Desk, Request};
 use berdloop_lib::merge_queue::Queue;
-use berdloop_lib::queues::{Kind, Queues};
 
 /// How long `ask-human` waits for a person before giving up.
 const ASK_LIMIT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
@@ -57,13 +57,6 @@ impl Args {
         Ok(Self { command, values })
     }
 
-    fn maybe(&self, name: &str) -> Option<&str> {
-        self.values
-            .iter()
-            .find(|(key, _)| key == name)
-            .map(|(_, value)| value.as_str())
-    }
-
     fn get(&self, name: &str) -> Result<&str, String> {
         self.values
             .iter()
@@ -75,27 +68,80 @@ impl Args {
 
 fn usage() -> String {
     [
-        "Usage: berdloop <command> --task <task id> [...]",
+        "Usage: berdloop-worker <command> [--flag value ...]",
         "",
-        "  merge-request   Ask for a place in the merge queue.",
-        "  merge-wait      Wait until it is your turn.",
-        "  merge-sync      Bring the ticket branch into your worktree.",
-        "  merge-land      Move the ticket branch onto your work.",
-        "  merge-release   Give up your place.",
-        "  ask-human       Ask a person a question and wait. --question required.",
+        "For a worker, run from its own task directory:",
+        "",
+        "  merge-request   Ask for a place in the merge queue. --task required.",
+        "  merge-wait      Wait until it is your turn. --task required.",
+        "  merge-sync      Bring the ticket branch into your worktree. --task required.",
+        "  merge-land      Move the ticket branch onto your work. --task required.",
+        "  merge-release   Give up your place. --task required.",
+        "  ask-human       Ask a person a question and wait. --task and --question required.",
+        "  dev-start       Start this worktree's app and print its URL. --task required.",
+        "  dev-stop        Stop this worktree's app. --task required.",
+        "  dev-status      Show every app Berdloop is running. --task required.",
+        "  db-reset        Empty and rebuild this worktree's databases. --task required.",
+        "  task-report     Record the outcome. --task, --status and --detail required.",
         "  mcp             Answer the harness's permission prompts. Started by Berdloop.",
-        "  task-report     Record the outcome. --status and --detail required.",
         "",
-        "Queues, for a ticket agent or a task agent:",
+        "For a ticket agent, a task agent or a review agent, started by Berdloop:",
         "",
-        "  queue-show      Read a line. --kind ticket|agent-task|worker.",
-        "  ticket-reorder  Set the ticket order. --order a,b,c.",
-        "  task-reorder    Set a ticket's task order. --ticket and --order.",
+        "  queue-show      Read a line. --kind ticket|agent-task|worker [--ticket].",
+        "  decide          Ask typed questions about some text. --questions and",
+        "                  --state or --state-file. Only when a gateway is set up.",
+        "  The same six on either queue, whichever one you own:",
+        "    ticket-add ticket-edit ticket-remove ticket-split ticket-merge ticket-reorder",
+        "    task-add   task-edit   task-remove   task-split   task-merge   task-reorder",
+        "  ticket-pause ticket-resume ticket-replan",
+        "  task-steer task-stop",
+        "  pr-review-submit",
         "",
-        "An agent outside a worktree says where the project is, with",
-        "--staging <path> or the BERDLOOP_STAGING environment variable.",
+        "These reach the app through the private channel in BERDLOOP_CONTROL,",
+        "which Berdloop sets when it starts the agent. The agent's own project",
+        "and ticket are fixed by the app; they are never passed as flags.",
     ]
     .join("\n")
+}
+
+/// Ask the decision model a set of typed questions.
+///
+/// Prints the answers as JSON, one entry per question, each with the value and
+/// a confidence from 0 to 1. The agent reads that and decides what to do with
+/// it; nothing here acts on an answer.
+fn decide(args: &Args) -> Result<String, String> {
+    let jev = berdloop_lib::jev::Jev::from_env()
+        .ok_or("Decisions are not turned on. Ask the person running Berdloop to add a gateway key in settings.")?;
+    let questions: serde_json::Value = serde_json::from_str(args.get("questions")?)
+        .map_err(|error| format!("--questions is not valid JSON: {error}"))?;
+    if !questions.is_object() {
+        return Err("--questions must be a JSON object keyed by question id.".to_string());
+    }
+    let state = match args.values.iter().find(|(key, _)| key == "state-file") {
+        Some((_, path)) => std::fs::read_to_string(path)
+            .map_err(|error| format!("Could not read {path}: {error}"))?,
+        None => args
+            .get("state")
+            .map_err(|_| "Give --state or --state-file.".to_string())?
+            .to_string(),
+    };
+    let answers = jev.decide(&state, &questions)?;
+    if answers.is_empty() {
+        return Err("The model returned no answers. Check the shape of --questions.".to_string());
+    }
+    let readable: serde_json::Map<String, serde_json::Value> = answers
+        .into_iter()
+        .map(|(id, answer)| {
+            (
+                id,
+                serde_json::json!({
+                    "value": answer.value,
+                    "confidence": (answer.confidence * 100.0).round() / 100.0,
+                }),
+            )
+        })
+        .collect();
+    serde_json::to_string_pretty(&readable).map_err(|error| error.to_string())
 }
 
 /// Work out where we are, which task this is, and which ticket it serves.
@@ -113,25 +159,6 @@ fn here(task: &str) -> Result<(Staging, String, Queue), String> {
     Ok((staging, ticket, queue))
 }
 
-/// Where the project is, for an agent that is not standing in a worktree.
-///
-/// A worker is always inside its own task directory, so it needs nothing. A
-/// ticket agent and a task agent are not, so they are told, by flag or by the
-/// environment the app started them in.
-fn staging_of(args: &Args) -> Result<Staging, String> {
-    if let Some(path) = args.maybe("staging") {
-        return Ok(Staging::new(PathBuf::from(path)));
-    }
-    if let Ok(path) = std::env::var("BERDLOOP_STAGING") {
-        return Ok(Staging::new(PathBuf::from(path)));
-    }
-    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    Staging::locate(&cwd).map(|(staging, _)| staging).ok_or_else(|| {
-        "This is not a Berdloop project. Pass --staging <path>, or run from your task directory."
-            .to_string()
-    })
-}
-
 /// Refuse to touch the repository unless this worker holds the lock.
 fn require_turn(queue: &Queue, task: &str) -> Result<(), String> {
     if queue.line().first().map(String::as_str) == Some(task) {
@@ -144,38 +171,58 @@ fn require_turn(queue: &Queue, task: &str) -> Result<(), String> {
     )
 }
 
+/// Keep the merge place alive while a git operation runs.
+///
+/// A holder that goes quiet for the reaping limit is assumed dead and loses
+/// its turn. A long sync or land must not look like that, so this touches the
+/// slot until it is dropped.
+struct Heartbeat(
+    Option<std::thread::JoinHandle<()>>,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+);
+
+impl Heartbeat {
+    fn start(dir: std::path::PathBuf, task: String) -> Self {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        let handle = std::thread::spawn(move || {
+            let queue = Queue::new(dir);
+            while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                if !flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    queue.touch(&task);
+                }
+            }
+        });
+        Self(Some(handle), stop)
+    }
+}
+
+impl Drop for Heartbeat {
+    fn drop(&mut self) {
+        self.1.store(true, std::sync::atomic::Ordering::SeqCst);
+        // The thread wakes at most 30 seconds later and exits; nothing waits on it.
+        self.0.take();
+    }
+}
+
 fn run() -> Result<String, String> {
     let args = Args::parse()?;
     if args.command == "help" || args.command == "--help" {
         return Ok(usage());
     }
-    // These read and write a line. They belong to the agents above a worker,
-    // which hold no worktree and no task id.
-    match args.command.as_str() {
-        "queue-show" => {
-            let queues = Queues::new(staging_of(&args)?);
-            let kind = Kind::parse(args.get("kind")?)?;
-            let line = queues.line(kind, args.maybe("ticket").unwrap_or_default());
-            return Ok(if line.is_empty() {
-                "The line is empty.".to_string()
-            } else {
-                line.join("\n")
-            });
-        }
-        "ticket-reorder" => {
-            let queues = Queues::new(staging_of(&args)?);
-            let order = order_of(args.get("order")?);
-            queues.set(Kind::Ticket, "", &order)?;
-            return Ok(format!("{} ticket(s) in line.", order.len()));
-        }
-        "task-reorder" => {
-            let queues = Queues::new(staging_of(&args)?);
-            let ticket = args.get("ticket")?;
-            let order = order_of(args.get("order")?);
-            queues.set(Kind::AgentTask, ticket, &order)?;
-            return Ok(format!("{} task(s) in line on {ticket}.", order.len()));
-        }
-        _ => {}
+    // Answered here rather than through the app, because the gateway and key
+    // arrive in this process's environment and nothing about a decision needs
+    // the app's state. Any agent role may call it; the tool is only put in an
+    // agent's orders when a gateway is set up.
+    if args.command == "decide" {
+        return decide(&args);
+    }
+    if berdloop_lib::control::COMMANDS.contains(&args.command.as_str()) {
+        return berdloop_lib::control::call(berdloop_lib::control::Request {
+            command: args.command,
+            args: args.values.into_iter().collect(),
+        });
     }
 
     let task = args.get("task")?.to_string();
@@ -213,6 +260,7 @@ fn run() -> Result<String, String> {
 
         "merge-sync" => {
             require_turn(&queue, &task)?;
+            let _alive = Heartbeat::start(staging.queue_dir(&ticket), task.clone());
             staging.commit_task(&task, &format!("Work on {task}"))?;
             let result = staging.sync_from_ticket(&ticket, &task)?;
             if result.merged {
@@ -227,7 +275,12 @@ fn run() -> Result<String, String> {
 
         "merge-land" => {
             require_turn(&queue, &task)?;
+            let _alive = Heartbeat::start(staging.queue_dir(&ticket), task.clone());
             staging.commit_task(&task, &format!("Work on {task}"))?;
+            // Committing can take a while on a big tree. Check the turn again
+            // right before the ticket branch moves, so a reaped holder cannot
+            // land on top of whoever was promoted in the meantime.
+            require_turn(&queue, &task)?;
             let result = staging.land(&ticket, &task)?;
             if result.merged {
                 queue.release(&task);
@@ -306,6 +359,78 @@ fn run() -> Result<String, String> {
             }
         }
 
+        "dev-start" => {
+            let task = args.get("task")?;
+            let (staging, _ticket, _queue) = here(task)?;
+            let source = staging
+                .source()
+                .ok_or("This project's source repository could not be found.")?;
+            let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+            // The agent's own environment already holds this worker's ports and
+            // connection strings, put there when it was started, so the server
+            // inherits exactly what the worktree is configured for.
+            let env: std::collections::BTreeMap<String, String> = std::env::vars().collect();
+            let server = devenv::start(&staging.root, &source, task, &cwd, &env)?;
+            Ok(format!(
+                "Running at {}. Log: {}. It stops on its own once you leave it alone.",
+                server.url, server.log
+            ))
+        }
+        "dev-stop" => {
+            let task = args.get("task")?;
+            let (staging, _ticket, _queue) = here(task)?;
+            devenv::stop(&staging.root, task);
+            Ok("Stopped.".to_string())
+        }
+        "dev-status" => {
+            let task = args.get("task")?;
+            let (staging, _ticket, _queue) = here(task)?;
+            let running = devenv::servers(&staging.root);
+            if running.is_empty() {
+                return Ok("No app is running.".to_string());
+            }
+            Ok(running
+                .iter()
+                .map(|server| {
+                    format!(
+                        "{}{} at {}",
+                        server.task,
+                        if server.task == *task { " (yours)" } else { "" },
+                        server.url
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"))
+        }
+        "db-reset" => {
+            let task = args.get("task")?;
+            let (staging, _ticket, _queue) = here(task)?;
+            let desk = broker::Desk::new(&staging.root);
+            desk.ask(task, "reset")?;
+            // Berdloop holds the database credentials, not this worker, so the
+            // work is done by the app. Wait for it to say the tenant is ready
+            // rather than connecting to one that is still being rebuilt.
+            let before = desk.lease(task).map(|lease| lease.at).unwrap_or(0);
+            let deadline = std::time::Instant::now() + broker::GRANT_LIMIT;
+            while std::time::Instant::now() < deadline {
+                if let Some(lease) = desk.lease(task) {
+                    if lease.at > before {
+                        let mut said = vec![format!(
+                            "Ready. {}",
+                            if lease.granted.is_empty() {
+                                "This project has no databases.".to_string()
+                            } else {
+                                lease.granted.join("; ")
+                            }
+                        )];
+                        said.extend(lease.notes);
+                        return Ok(said.join("\n"));
+                    }
+                }
+                std::thread::sleep(POLL);
+            }
+            Err("Berdloop did not rebuild the databases in time. Tell a person.".to_string())
+        }
         "task-report" => {
             let status = args.get("status")?;
             if status != "complete" && status != "blocked" {
@@ -328,15 +453,4 @@ fn run() -> Result<String, String> {
 
         other => Err(format!("Unknown command {other}.\n\n{}", usage())),
     }
-}
-
-/// Read a comma separated order. Blanks are dropped, so trailing commas and
-/// stray spaces from an agent are not an error.
-fn order_of(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-        .map(str::to_string)
-        .collect()
 }

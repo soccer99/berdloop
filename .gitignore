@@ -5,6 +5,7 @@ context/
 node_modules/
 dist/
 target/
+apps/desktop/src-tauri/binaries/
 .DS_Store
 .env
 .env.*

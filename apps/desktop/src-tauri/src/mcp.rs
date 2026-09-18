@@ -54,6 +54,18 @@ fn ask(
         .map(str::to_string)
         .unwrap_or_else(|| input.to_string());
 
+    // Beta: let a decision model clear the plainly read-only commands, so a
+    // person is only woken for work that changes something. It can never
+    // refuse and it can never clear anything but read-only, so the worst it
+    // does when it is wrong is run a command that reads.
+    if let crate::jev::Screen::Allow(confidence) = crate::jev::screen_command(tool_name, &command) {
+        return verdict(
+            true,
+            &input,
+            &format!("Read-only, {:.0}% sure.", confidence * 100.0),
+        );
+    }
+
     let id = format!("{task}-{}", now_ms());
     let request = Request {
         id: id.clone(),

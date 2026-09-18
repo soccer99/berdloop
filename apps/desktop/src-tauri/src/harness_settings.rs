@@ -24,6 +24,18 @@ pub struct HarnessSettings {
     /// Whether the user's own skills may load. All or nothing.
     #[serde(default)]
     pub user_skills: bool,
+    /// An OpenRouter key. Optional.
+    #[serde(default)]
+    pub openrouter_key: String,
+    /// A Vercel AI Gateway key. Optional. Either key serves the beta.
+    #[serde(default)]
+    pub vercel_key: String,
+    /// Whether the beta features may use those keys.
+    ///
+    /// Separate from the keys, because a key is a thing a person pastes once
+    /// and a beta is a thing they turn off the moment it annoys them.
+    #[serde(default)]
+    pub beta: bool,
 }
 
 fn full_trust() -> String {
@@ -36,6 +48,9 @@ impl Default for HarnessSettings {
             trust: full_trust(),
             mcp_servers: Vec::new(),
             user_skills: false,
+            openrouter_key: String::new(),
+            vercel_key: String::new(),
+            beta: false,
         }
     }
 }
@@ -150,5 +165,13 @@ mod tests {
         assert_eq!(settings.trust, "workspace");
         assert_eq!(settings.mcp_servers, ["perplexity"]);
         assert!(settings.user_skills);
+    }
+
+    #[test]
+    fn the_beta_and_its_keys_default_to_off_and_empty() {
+        let settings = HarnessSettings::default();
+        assert!(!settings.beta);
+        assert!(settings.openrouter_key.is_empty());
+        assert!(settings.vercel_key.is_empty());
     }
 }

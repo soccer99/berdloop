@@ -12,17 +12,17 @@ export function LoopBar({
   loop,
   ticketId,
   project,
+  busy,
   onWorkersChange,
 }: {
   loop: LoopStatus;
   ticketId: string;
   project?: Project;
+  /** Worker processes alive right now, counted from the live conversations. */
+  busy: number;
   onWorkersChange: (workers: number) => void;
 }) {
-  const ready = Boolean(project?.path) && Boolean(ticketId);
-  const busy = Object.values(loop.active).filter(
-    (run) => run.state !== "finished",
-  ).length;
+  const ready = Boolean(project?.path) && (Boolean(ticketId) || loop.running);
   const label = loop.running ? "Pause the loop" : "Start the loop";
 
   return (
@@ -49,9 +49,9 @@ export function LoopBar({
           {busy} {busy === 1 ? "worker" : "workers"}
         </Badge>
       )}
-      <span className="loop-bar-note muted">
-        {project?.path ? loop.note : "Link a project folder before starting."}
-      </span>
+      {project?.path && (
+        <span className="loop-bar-note muted">{loop.note}</span>
+      )}
       <Tooltip
         label={ready ? label : "Link a project folder and queue a ticket"}
       >
@@ -60,8 +60,17 @@ export function LoopBar({
           size="lg"
           variant="filled"
           color={loop.running ? "yellow" : "lime"}
-          disabled={!ready}
-          onClick={() => (loop.running ? loop.pause() : loop.start())}
+          data-disabled={!ready || undefined}
+          aria-disabled={!ready}
+          onClick={(event) => {
+            if (!ready) {
+              event.preventDefault();
+            } else if (loop.running) {
+              loop.pause();
+            } else {
+              loop.start();
+            }
+          }}
         >
           {loop.running ? (
             <IconPlayerPause size={18} />
