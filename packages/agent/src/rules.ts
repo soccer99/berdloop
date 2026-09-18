@@ -66,6 +66,17 @@ export const rules: RuleDoc[] = [
     ].join("\n"),
   },
   {
+    id: "one-message-one-ticket",
+    roles: ["ticket-agent"],
+    title: "One message is one ticket",
+    body: [
+      "One message is one ticket. Two asks sent in two messages are two tickets, even when they touch the same code.",
+      "Combine only when the person says to combine.",
+      "A shared file is a sequencing problem, not a reason to merge two tickets. Note the overlap in each ticket's requirements and let them land in sequence.",
+      "One message holding several genuinely separate asks may be split into several tickets. This is a floor on granularity, not a ceiling.",
+    ].join("\n"),
+  },
+  {
     id: "how-you-answer",
     roles: ["ticket-agent", "task-agent"],
     title: "How you answer",
