@@ -39,6 +39,12 @@
  *   changes while the person is still typing.
  * - `prefix` — the localStorage namespace. Only tests should set it.
  *
+ * The module-level helpers take one option the hook does not, `storage`, so a
+ * test can hand them a store of its own. `useDraft` writes through Mantine's
+ * `useLocalStorage`, which always writes the window's store, so an injected
+ * one could only ever be half honoured: read from, never written to. Rather
+ * than hand callers that trap, the hook does not accept it.
+ *
  * Whitespace-only text is never written, and setting a value back to empty
  * removes the stored entry.
  *
@@ -67,7 +73,10 @@ export interface DraftOptions {
   base?: string;
   /** localStorage namespace. Only tests should set it. */
   prefix?: string;
-  /** Storage to read and write. Defaults to the window's localStorage. */
+  /**
+   * Storage the helpers in this module read and write. Defaults to the
+   * window's localStorage. `useDraft` does not take it; see `UseDraftOptions`.
+   */
   storage?: DraftStorage;
 }
 
@@ -79,6 +88,13 @@ export interface DraftStorage {
   readonly length: number;
   key(index: number): string | null;
 }
+
+/**
+ * What `useDraft` accepts: `DraftOptions` without `storage`. The hook's writes
+ * go through `useLocalStorage`, which only ever writes the window's store, so
+ * an injected store would be read from and never written to.
+ */
+export type UseDraftOptions = Omit<DraftOptions, "storage">;
 
 export type UseDraftResult = [
   value: string,
@@ -300,10 +316,10 @@ interface DraftState {
  */
 export function useDraft(
   key: string,
-  options: DraftOptions = {},
+  options: UseDraftOptions = {},
 ): UseDraftResult {
-  const { seed, base, prefix, storage } = options;
-  const settings: DraftOptions = { seed, base, prefix, storage };
+  const { seed, base, prefix } = options;
+  const settings: UseDraftOptions = { seed, base, prefix };
   const storageKey = draftStorageKey(key, settings);
   const recordBase = baseOf(settings);
 
