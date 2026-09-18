@@ -1,0 +1,26 @@
+{
+  "name": "@berdloop/web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 5173 --strictPort",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --host 127.0.0.1 --port 5173 --strictPort",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@berdloop/core": "workspace:*",
+    "@berdloop/ui": "workspace:*",
+    "@mantine/core": "9.6.1",
+    "@mantine/hooks": "9.6.1",
+    "@tabler/icons-react": "3.46.0",
+    "motion": "13.4.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0"
+  },
+  "devDependencies": {
+    "vite": "8.3.0",
+    "@vitejs/plugin-react": "6.1.1"
+  }
+}

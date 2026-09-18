@@ -1,0 +1,79 @@
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+}
+button,
+a,
+input,
+textarea {
+  -webkit-tap-highlight-color: transparent;
+}
+a {
+  color: inherit;
+}
+:focus-visible {
+  outline: 2px solid #b8e66c;
+  outline-offset: 4px;
+}
+::selection {
+  background: #b8e66c;
+  color: #111713;
+}
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 23px;
+  font-weight: 650;
+  letter-spacing: -1px;
+  color: #eef3ed;
+}
+.brand svg {
+  color: #b8e66c;
+}
+.brand-mark .bird-wing {
+  transform-origin: 31px 34px;
+  transition: transform 220ms ease;
+}
+.brand:hover .bird-wing {
+  transform: rotate(-7deg) translateY(-2px);
+}
+@media (prefers-reduced-motion: reduce) {
+  .brand-mark .bird-wing {
+    transition: none;
+  }
+}
+.brand-dot {
+  color: #b8e66c;
+  margin-left: -6px;
+}
+.loop-rail {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+}
+.loop-rail li {
+  position: relative;
+  border-top: 2px solid #354239;
+  padding-top: 13px;
+  font-size: 13px;
+  color: #94a397;
+}
+.loop-rail li span {
+  margin-right: 8px;
+  font-family: monospace;
+  font-size: 11px;
+}
+.loop-rail .active {
+  border-color: #b8e66c;
+  color: #b8e66c;
+}
+.loop-rail .complete {
+  border-color: #688638;
+  color: #d1dfca;
+}

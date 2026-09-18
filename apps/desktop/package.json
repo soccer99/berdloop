@@ -1,0 +1,33 @@
+{
+  "name": "@berdloop/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 1420 --strictPort",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --host 127.0.0.1 --port 1420 --strictPort",
+    "typecheck": "tsc --noEmit",
+    "desktop": "tauri dev",
+    "desktop:build": "tauri build"
+  },
+  "dependencies": {
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "@mantine/core": "9.6.1",
+    "@mantine/hooks": "9.6.1",
+    "@tabler/icons-react": "3.46.0",
+    "@berdloop/ui": "workspace:*",
+    "@berdloop/core": "workspace:*",
+    "@berdloop/state": "workspace:*",
+    "@tauri-apps/api": "2.11.1",
+    "@tauri-apps/plugin-dialog": "2.7.3",
+    "@tauri-apps/plugin-fs": "2.5.2",
+    "@berdloop/agent": "workspace:*"
+  },
+  "devDependencies": {
+    "vite": "8.3.0",
+    "@vitejs/plugin-react": "6.1.1",
+    "@tauri-apps/cli": "2.11.4"
+  }
+}

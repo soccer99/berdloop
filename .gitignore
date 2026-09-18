@@ -1,0 +1,15 @@
+# Local research and source material; keep out of version control.
+context/
+.firecrawl/
+
+node_modules/
+dist/
+target/
+.DS_Store
+.env
+.env.*
+!.env.example
+*.tsbuildinfo
+
+# Local development supervisor state and logs.
+.berdloop/

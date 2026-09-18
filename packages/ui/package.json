@@ -1,0 +1,27 @@
+{
+  "name": "@berdloop/ui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.tsx"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "@mantine/core": "9.6.1",
+    "@mantine/hooks": "9.6.1",
+    "@tabler/icons-react": "3.46.0",
+    "@mantine/form": "9.6.1",
+    "@mantine/dates": "9.6.1",
+    "@mantine/notifications": "9.6.1",
+    "@mantine/spotlight": "9.6.1",
+    "@mantine/dropzone": "9.6.1",
+    "@mantine/charts": "9.6.1",
+    "dayjs": "1.11.23",
+    "recharts": "3.10.1"
+  }
+}

@@ -1,0 +1,29 @@
+name: Verify
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+      - run: bun install --frozen-lockfile
+      - run: bun run format:check
+      - run: bun run check
+  desktop:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+      - uses: dtolnay/rust-toolchain@stable
+      - run: bun install --frozen-lockfile
+      - run: bun run --filter @berdloop/desktop build
+      - run: cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml --check
+      - run: cargo check --locked --manifest-path apps/desktop/src-tauri/Cargo.toml

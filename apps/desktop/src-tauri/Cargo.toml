@@ -1,0 +1,36 @@
+[package]
+name = "berdloop"
+default-run = "berdloop"
+version = "0.1.0"
+description = "Plan agent tasks. Control each step from branch to deploy."
+authors = ["Berdloop"]
+edition = "2021"
+rust-version = "1.92"
+
+[lib]
+name = "berdloop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "berdloop"
+path = "src/main.rs"
+
+# The command workers run to reach the merge queue. It links against the same
+# library as the app, so there is one implementation of the git rules.
+[[bin]]
+name = "berdloop-worker"
+path = "src/bin/worker_cli.rs"
+
+[build-dependencies]
+tauri-build = { version = "=2.6.3", features = [] }
+
+[dependencies]
+tauri = { version = "=2.11.5", features = [] }
+tauri-plugin-dialog = "=2.7.3"
+# The queue files change under the app, so the window watches them.
+tauri-plugin-fs = { version = "=2.5.2", features = ["watch"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+base64 = "0.22"

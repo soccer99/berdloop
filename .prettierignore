@@ -1,0 +1,9 @@
+node_modules
+**/dist
+**/target
+**/gen
+**/icons
+context
+.firecrawl
+bun.lock
+**/Cargo.lock
