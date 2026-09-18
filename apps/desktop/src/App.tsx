@@ -60,17 +60,21 @@ import {
 
 import { HarnessModelSelects } from "./harness-model-selects";
 import { useHarnessCatalog } from "./harness-catalog";
+import { pruneDraftsForOwners, useDraft } from "./drafts";
 
 // The WorkOS adapter will provide this after account auth is connected.
 const workosSession: AccountSession | null = null;
 
-interface Draft {
-  title: string;
+/**
+ * The two pickers in the new-ticket form. What a person types there is
+ * unsent work and lives in `useDraft`; these are re-aimed at the project in
+ * view every time the form opens, so there is nothing to keep.
+ */
+interface DraftTarget {
   projectId: string;
   source: TicketProvider;
-  ticket: string;
-  criteria: string;
 }
+/** What `fetch_external_issue` is handed. Built at the call, never stored. */
 interface ImportDraft {
   provider: ExternalProvider;
   reference: string;
@@ -78,13 +82,6 @@ interface ImportDraft {
   jiraSite: string;
   jiraEmail: string;
 }
-const emptyImportDraft: ImportDraft = {
-  provider: "Linear",
-  reference: "",
-  token: "",
-  jiraSite: "",
-  jiraEmail: "",
-};
 interface ProjectInfo {
   path: string;
   name: string;
@@ -93,13 +90,46 @@ interface ProjectInfo {
   remoteUrl: string | null;
   provider: string | null;
 }
-const emptyDraft: Draft = {
-  title: "",
-  projectId: "",
-  source: "Local",
-  ticket: "",
-  criteria: "",
-};
+const emptyDraftTarget: DraftTarget = { projectId: "", source: "Local" };
+
+/**
+ * One role's extra instructions. Typing commits straight into preferences,
+ * but a draft is kept alongside so a prompt written before a scope exists —
+ * when `setRolePreference` has nowhere to put it — is not typed into thin
+ * air. Its own component so `useDraft` is not called inside the roles loop.
+ */
+function RoleSystemPrompt({
+  role,
+  label,
+  scope,
+  committed,
+  onChange,
+}: {
+  role: AgentRoleSetting;
+  label: string;
+  scope: string;
+  committed: string;
+  onChange: (systemPrompt: string) => void;
+}) {
+  const [text, setText] = useDraft(`role-prompt:${scope}:${role}`, {
+    seed: committed,
+  });
+  return (
+    <Textarea
+      size="xs"
+      autosize
+      minRows={1}
+      maxRows={6}
+      aria-label={`${label} system prompt`}
+      placeholder="Additional system prompt"
+      value={text}
+      onChange={(event) => {
+        setText(event.currentTarget.value);
+        onChange(event.currentTarget.value);
+      }}
+    />
+  );
+}
 
 export default function App() {
   const [accessMode, setAccessMode] = useLocalStorage<"local" | null>({
@@ -246,13 +276,27 @@ export default function App() {
   const [selectedId, setSelectedId] = useState("");
   const [taskOpened, setTaskOpened] = useState(false);
   const [importOpened, setImportOpened] = useState(false);
-  const [importDraft, setImportDraft] = useState<ImportDraft>(emptyImportDraft);
+  const [importProvider, setImportProvider] =
+    useState<ExternalProvider>("Linear");
+  // A provider credential. Never a draft: it is held in memory for this one
+  // import and deliberately never written to storage.
+  const [importToken, setImportToken] = useState("");
+  const [importReference, setImportReference, clearImportReference] = useDraft(
+    `import-ticket:${importProvider}:reference`,
+  );
+  const [importJiraSite, setImportJiraSite, clearImportJiraSite] = useDraft(
+    "import-ticket:jira-site",
+  );
+  const [importJiraEmail, setImportJiraEmail, clearImportJiraEmail] = useDraft(
+    "import-ticket:jira-email",
+  );
   const [importBusy, setImportBusy] = useState(false);
   const [importError, setImportError] = useState<string | null>(null);
   const [organizationOpened, setOrganizationOpened] = useState(false);
   const [projectOpened, setProjectOpened] = useState(false);
   const [linkProjectId, setLinkProjectId] = useState<string | null>(null);
-  const [organizationName, setOrganizationName] = useState("");
+  const [organizationName, setOrganizationName, clearOrganizationName] =
+    useDraft("new-organization:name");
   const [projectSource, setProjectSource] = useState<"local" | "clone">(
     "local",
   );
@@ -267,7 +311,21 @@ export default function App() {
     created: boolean;
     notes: string[];
   } | null>(null);
-  const [draft, setDraft] = useState<Draft>(emptyDraft);
+  const [draft, setDraft] = useState<DraftTarget>(emptyDraftTarget);
+  // Everything typed into the new-ticket form, kept against the project in
+  // view, so closing the modal or leaving the view never throws it away.
+  const [ticketCriteriaSeed, setTicketCriteriaSeed] = useState("");
+  const newTicketKey = `new-ticket:${projectId || "none"}`;
+  const [ticketTitle, setTicketTitle, clearTicketTitle] = useDraft(
+    `${newTicketKey}:title`,
+  );
+  const [ticketReference, setTicketReference, clearTicketReference] = useDraft(
+    `${newTicketKey}:reference`,
+  );
+  const [ticketCriteria, setTicketCriteria, clearTicketCriteria] = useDraft(
+    `${newTicketKey}:criteria`,
+    { seed: ticketCriteriaSeed },
+  );
   const [runtime, setRuntime] = useState("Browser preview");
 
   useEffect(() => {
@@ -311,6 +369,23 @@ export default function App() {
     }
   }, [projects, tasks, tasksReady, updateWorkspace]);
 
+  // Drafts outlive the editor they were typed in, so a deleted ticket or task
+  // would otherwise leave its unsent text behind for good. This is the one
+  // place that knows every ticket and task across every project: the queue
+  // view only ever sees one project's worth, and pruning from there would read
+  // the other projects' work as deleted. Gated on `tasksReady`, because an
+  // empty workspace before the store answers is not an empty workspace.
+  // Joined so the effect depends on the ids themselves, not on an array that
+  // is rebuilt every render: pruning runs when something is deleted, not always.
+  const liveSubjectKey = [
+    ...workspace.tasks.map((item) => item.id),
+    ...workspace.agentTasks.map((item) => item.id),
+  ].join("\n");
+  useEffect(() => {
+    if (!tasksReady) return;
+    pruneDraftsForOwners(liveSubjectKey ? liveSubjectKey.split("\n") : []);
+  }, [tasksReady, liveSubjectKey]);
+
   const organization =
     organizations.find((item) => item.id === organizationId) ??
     organizations[0];
@@ -350,6 +425,13 @@ export default function App() {
       organizationSources[organization?.id ?? ""] ??
       [])
     : (organizationSources[organization?.id ?? ""] ?? []);
+  // The scope a role's extra instructions belong to, so a prompt typed for
+  // one project is never shown under another.
+  const rolePromptScope =
+    sourceSettingsProjectId ||
+    settingsProject?.organizationId ||
+    organization?.id ||
+    "none";
   function rolePreference(role: AgentRoleSetting): Required<RolePreference> {
     return resolveRolePreference(
       agentPreferences,
@@ -462,7 +544,7 @@ export default function App() {
     setOrganizationId(next.id);
     setProjectId("");
     setSelectedId("");
-    setOrganizationName("");
+    clearOrganizationName();
     setOrganizationOpened(false);
     setProjectOpened(false);
     setView("organization");
@@ -585,23 +667,26 @@ export default function App() {
   function openTaskDraft(criteria = "") {
     const target = project ?? organizationProjects[0];
     if (!target) return;
-    setDraft({ ...emptyDraft, projectId: target.id, criteria });
+    setDraft({ ...emptyDraftTarget, projectId: target.id });
+    setTicketCriteriaSeed(criteria);
     setTaskOpened(true);
   }
   function addTask() {
     const targetProject = projects.find((item) => item.id === draft.projectId);
+    const title = ticketTitle.trim();
+    const criteria = ticketCriteria.trim();
     if (
       !targetProject ||
       targetProject.organizationId !== organization?.id ||
-      !draft.title.trim() ||
-      !draft.criteria.trim()
+      !title ||
+      !criteria
     )
       return;
     const next: Task = {
       ...draft,
-      title: draft.title.trim(),
-      criteria: draft.criteria.trim(),
-      ticket: draft.ticket.trim() || "Local draft",
+      title,
+      criteria,
+      ticket: ticketReference.trim() || "Local draft",
       id: crypto.randomUUID(),
       stage: "Branch",
       status: "queued",
@@ -614,7 +699,11 @@ export default function App() {
     setOrganizationId(targetProject.organizationId);
     setProjectId(targetProject.id);
     setSelectedId(next.id);
-    setDraft(emptyDraft);
+    setDraft(emptyDraftTarget);
+    setTicketCriteriaSeed("");
+    clearTicketTitle();
+    clearTicketReference();
+    clearTicketCriteria();
     setTaskOpened(false);
     setView("loops");
   }
@@ -623,8 +712,15 @@ export default function App() {
     setImportBusy(true);
     setImportError(null);
     try {
+      const input: ImportDraft = {
+        provider: importProvider,
+        reference: importReference,
+        token: importToken,
+        jiraSite: importJiraSite,
+        jiraEmail: importJiraEmail,
+      };
       const issue = await invoke<ExternalIssue>("fetch_external_issue", {
-        input: importDraft,
+        input,
       });
       let importedId = "";
       updateWorkspace((current) => {
@@ -633,7 +729,10 @@ export default function App() {
         return imported.workspace;
       });
       setSelectedId(importedId);
-      setImportDraft(emptyImportDraft);
+      setImportToken("");
+      clearImportReference();
+      clearImportJiraSite();
+      clearImportJiraEmail();
       setImportOpened(false);
       setView("loops");
     } catch (cause) {
@@ -892,10 +991,8 @@ export default function App() {
             onNewTicket={() => openTaskDraft()}
             onImportTicket={(provider) => {
               setImportError(null);
-              setImportDraft({
-                ...emptyImportDraft,
-                provider: provider ?? "Linear",
-              });
+              setImportProvider(provider ?? "Linear");
+              setImportToken("");
               setImportOpened(true);
             }}
             onNewProject={() => setProjectOpened(true)}
@@ -1084,18 +1181,13 @@ export default function App() {
                         connected={harnessOptions.connected}
                         onChange={(patch) => setRolePreference(id, patch)}
                       />
-                      <Textarea
-                        size="xs"
-                        autosize
-                        minRows={1}
-                        maxRows={6}
-                        aria-label={`${label} system prompt`}
-                        placeholder="Additional system prompt"
-                        value={preference.systemPrompt}
-                        onChange={(event) =>
-                          setRolePreference(id, {
-                            systemPrompt: event.currentTarget.value,
-                          })
+                      <RoleSystemPrompt
+                        role={id}
+                        label={label}
+                        scope={rolePromptScope}
+                        committed={preference.systemPrompt}
+                        onChange={(systemPrompt) =>
+                          setRolePreference(id, { systemPrompt })
                         }
                       />
                       {overridden && (
@@ -1140,6 +1232,7 @@ export default function App() {
                       <label htmlFor="openrouter-key">OpenRouter key</label>
                       <p>Kept on this machine. It never reaches the window.</p>
                     </div>
+                    {/* A secret: never a draft. It is kept by harnessSettings. */}
                     <PasswordInput
                       id="openrouter-key"
                       size="xs"
@@ -1158,6 +1251,7 @@ export default function App() {
                       <label htmlFor="vercel-key">Vercel AI Gateway key</label>
                       <p>Kept on this machine. It never reaches the window.</p>
                     </div>
+                    {/* A secret: never a draft. It is kept by harnessSettings. */}
                     <PasswordInput
                       id="vercel-key"
                       size="xs"
@@ -1483,7 +1577,7 @@ export default function App() {
         onClose={() => {
           if (!importBusy) {
             setImportOpened(false);
-            setImportDraft(emptyImportDraft);
+            setImportToken("");
           }
         }}
         title="Import a source ticket"
@@ -1495,32 +1589,26 @@ export default function App() {
             void importTask();
           }}
         >
-          <p className="app-eyebrow">{importDraft.provider.toUpperCase()}</p>
-          {importDraft.provider === "Jira" && (
+          <p className="app-eyebrow">{importProvider.toUpperCase()}</p>
+          {importProvider === "Jira" && (
             <>
               <TextInput
                 required
                 mt="md"
                 label="Jira Cloud site"
                 placeholder="https://your-team.atlassian.net"
-                value={importDraft.jiraSite}
+                value={importJiraSite}
                 onChange={(event) =>
-                  setImportDraft({
-                    ...importDraft,
-                    jiraSite: event.currentTarget.value,
-                  })
+                  setImportJiraSite(event.currentTarget.value)
                 }
               />
               <TextInput
                 required
                 mt="md"
                 label="Atlassian account email"
-                value={importDraft.jiraEmail}
+                value={importJiraEmail}
                 onChange={(event) =>
-                  setImportDraft({
-                    ...importDraft,
-                    jiraEmail: event.currentTarget.value,
-                  })
+                  setImportJiraEmail(event.currentTarget.value)
                 }
               />
             </>
@@ -1528,37 +1616,26 @@ export default function App() {
           <TextInput
             required
             mt="md"
-            label={
-              importDraft.provider === "Asana" ? "Task GID" : "Issue ID or key"
-            }
+            label={importProvider === "Asana" ? "Task GID" : "Issue ID or key"}
             placeholder={
-              importDraft.provider === "Asana" ? "1200123456789" : "BRD-128"
+              importProvider === "Asana" ? "1200123456789" : "BRD-128"
             }
-            value={importDraft.reference}
-            onChange={(event) =>
-              setImportDraft({
-                ...importDraft,
-                reference: event.currentTarget.value,
-              })
-            }
+            value={importReference}
+            onChange={(event) => setImportReference(event.currentTarget.value)}
           />
+          {/* A credential: never a draft, so it is not written to storage. */}
           <TextInput
             required
             mt="md"
             type="password"
             label={
-              importDraft.provider === "Jira"
+              importProvider === "Jira"
                 ? "Atlassian API token"
                 : "Personal access token"
             }
             description="Used for this import only. Berdloop does not save it."
-            value={importDraft.token}
-            onChange={(event) =>
-              setImportDraft({
-                ...importDraft,
-                token: event.currentTarget.value,
-              })
-            }
+            value={importToken}
+            onChange={(event) => setImportToken(event.currentTarget.value)}
           />
           {importError && (
             <p role="alert" className="task-error">
@@ -1571,9 +1648,7 @@ export default function App() {
             type="submit"
             loading={importBusy}
             disabled={
-              !project ||
-              !importDraft.reference.trim() ||
-              !importDraft.token.trim()
+              !project || !importReference.trim() || !importToken.trim()
             }
           >
             Import into {project?.name ?? "project"}
@@ -1596,10 +1671,8 @@ export default function App() {
             required
             label="Ticket title"
             placeholder="Add the paused state check"
-            value={draft.title}
-            onChange={(event) =>
-              setDraft({ ...draft, title: event.currentTarget.value })
-            }
+            value={ticketTitle}
+            onChange={(event) => setTicketTitle(event.currentTarget.value)}
           />
           <Select
             required
@@ -1625,10 +1698,8 @@ export default function App() {
             mt="md"
             label="Ticket ID or reference"
             placeholder="BRD-128"
-            value={draft.ticket}
-            onChange={(event) =>
-              setDraft({ ...draft, ticket: event.currentTarget.value })
-            }
+            value={ticketReference}
+            onChange={(event) => setTicketReference(event.currentTarget.value)}
           />
           <Textarea
             required
@@ -1637,17 +1708,15 @@ export default function App() {
             autosize
             label="Requirements & acceptance criteria"
             placeholder="A paused task does not advance to the next stage."
-            value={draft.criteria}
-            onChange={(event) =>
-              setDraft({ ...draft, criteria: event.currentTarget.value })
-            }
+            value={ticketCriteria}
+            onChange={(event) => setTicketCriteria(event.currentTarget.value)}
           />
           <Button
             fullWidth
             mt="xl"
             type="submit"
             disabled={
-              !draft.title.trim() || !draft.criteria.trim() || !draft.projectId
+              !ticketTitle.trim() || !ticketCriteria.trim() || !draft.projectId
             }
           >
             Create ticket
