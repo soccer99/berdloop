@@ -122,6 +122,22 @@ describe("planLoop", () => {
     expect(steps[0]).toMatchObject({ kind: "wait" });
   });
 
+  test("names the real problem when a task runs with no worker on it", () => {
+    const steps = planLoop(
+      withTasks([task("a", "running"), task("b", "queued", ["a"])], {
+        active: {},
+        slots: 1,
+      }),
+    );
+    expect(steps).toEqual([
+      {
+        kind: "wait",
+        reason:
+          "One task says it is running with no worker on it. Start the loop again to recover it.",
+      },
+    ]);
+  });
+
   test("says so when everything left is blocked", () => {
     const steps = planLoop(
       withTasks([task("a", "blocked"), task("b", "complete")]),

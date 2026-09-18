@@ -459,7 +459,11 @@ impl Queue {
     /// Every id named by a comma separated flag, in the order given.
     fn resolve_all(&self, w: &Value, references: &str) -> Result<Vec<String>, String> {
         let mut ids = Vec::new();
-        for reference in references.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        for reference in references
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             let id = self.resolve(w, reference)?;
             if ids.contains(&id) {
                 return Err(format!("{} named twice", self.noun));
@@ -510,7 +514,13 @@ impl Queue {
     }
 
     /// One new record, shaped for whichever queue this is.
-    fn record(&self, title: &str, criteria: &str, prompt: Option<&str>, after: Vec<Value>) -> Value {
+    fn record(
+        &self,
+        title: &str,
+        criteria: &str,
+        prompt: Option<&str>,
+        after: Vec<Value>,
+    ) -> Value {
         let id = uuid::Uuid::new_v4().to_string();
         let now = workspace::now();
         if !self.dependent {
@@ -591,7 +601,11 @@ pub fn mutate(w: &mut Value, scope: &Scope, request: &Request) -> Result<String,
         if ticket["status"] == json!("complete") {
             return Err("This ticket is complete".into());
         }
-        ticket["status"] = json!(if operation == "pause" { "paused" } else { "running" });
+        ticket["status"] = json!(if operation == "pause" {
+            "paused"
+        } else {
+            "running"
+        });
         ticket["updatedAt"] = json!(workspace::now());
         return Ok(format!("Ticket {operation}d"));
     }
@@ -665,15 +679,13 @@ pub fn mutate(w: &mut Value, scope: &Scope, request: &Request) -> Result<String,
             let id = queue.resolve(w, required(args, queue.arg)?)?;
             queue.changeable(w, &id)?;
             if queue.dependent
-                && w[queue.collection]
-                    .as_array()
-                    .is_some_and(|list| {
-                        list.iter().any(|t| {
-                            t["dependencyIds"]
-                                .as_array()
-                                .is_some_and(|d| d.contains(&json!(id)))
-                        })
+                && w[queue.collection].as_array().is_some_and(|list| {
+                    list.iter().any(|t| {
+                        t["dependencyIds"]
+                            .as_array()
+                            .is_some_and(|d| d.contains(&json!(id)))
                     })
+                })
             {
                 return Err("Remove dependencies on this task first".into());
             }
@@ -718,12 +730,7 @@ pub fn mutate(w: &mut Value, scope: &Scope, request: &Request) -> Result<String,
                         queue.criteria_arg
                     ));
                 };
-                records.push(queue.record(
-                    title,
-                    criteria,
-                    part["prompt"].as_str(),
-                    after.clone(),
-                ));
+                records.push(queue.record(title, criteria, part["prompt"].as_str(), after.clone()));
             }
             let ids: Vec<Value> = records.iter().map(|r| r["id"].clone()).collect();
             queue.rewire(w, std::slice::from_ref(&id), &ids);
@@ -771,7 +778,7 @@ pub fn mutate(w: &mut Value, scope: &Scope, request: &Request) -> Result<String,
             let list = w[queue.collection].as_array_mut().ok_or("Invalid queue")?;
             if operation == "show" {
                 return Ok(
-                    Value::Array(positions.iter().map(|i| list[*i].clone()).collect()).to_string()
+                    Value::Array(positions.iter().map(|i| list[*i].clone()).collect()).to_string(),
                 );
             }
             let mut selected: Vec<Value> = Vec::new();
@@ -954,13 +961,7 @@ mod tests {
         );
         // "two" waits for "one".
         store
-            .change(|w| {
-                mutate(
-                    w,
-                    &tt,
-                    &request("task-remove", &[("task", &two)]),
-                )
-            })
+            .change(|w| mutate(w, &tt, &request("task-remove", &[("task", &two)])))
             .unwrap();
         store
             .change(|w| {
@@ -1000,7 +1001,11 @@ mod tests {
             .iter()
             .map(|t| t["title"].as_str().unwrap())
             .collect();
-        assert_eq!(titles, ["a", "b", "two"], "halves take the original's place");
+        assert_eq!(
+            titles,
+            ["a", "b", "two"],
+            "halves take the original's place"
+        );
         let (a, b) = (
             w["agentTasks"][0]["id"].clone(),
             w["agentTasks"][1]["id"].clone(),
@@ -1039,7 +1044,10 @@ mod tests {
                     "ticket-split",
                     &[
                         ("ticket", at.ticket_id.as_deref().unwrap()),
-                        ("parts", r#"[{"title":"x","requirements":"R"},{"title":"y","requirements":"R"}]"#),
+                        (
+                            "parts",
+                            r#"[{"title":"x","requirements":"R"},{"title":"y","requirements":"R"}]"#
+                        ),
                     ],
                 )
             ))
@@ -1081,7 +1089,10 @@ mod tests {
             .map(|t| t["title"].as_str().unwrap())
             .collect();
         assert_eq!(titles, ["T", "x", "y"], "halves take the original's place");
-        assert!(w["tasks"][1]["ticket"].as_str().unwrap().starts_with("LOCAL-"));
+        assert!(w["tasks"][1]["ticket"]
+            .as_str()
+            .unwrap()
+            .starts_with("LOCAL-"));
 
         // A task agent may never touch the ticket queue.
         assert!(store

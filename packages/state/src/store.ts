@@ -80,6 +80,14 @@ export interface BerdloopState {
   organizationId: string;
   projectId: string;
   ticketId: string;
+  /**
+   * Whether the loop was handing out work when the window last drew.
+   *
+   * The loop lives in the window, so a reload or a rebuild stops it. Nothing
+   * about the work asked it to stop, so this is what tells the next window to
+   * start it again.
+   */
+  loopRunning: boolean;
 
   setOrganizations: (organizations: Organization[]) => void;
   upsertOrganization: (organization: Organization) => void;
@@ -117,6 +125,7 @@ export interface BerdloopState {
   setOrganizationId: (id: string) => void;
   setProjectId: (id: string) => void;
   setTicketId: (id: string) => void;
+  setLoopRunning: (running: boolean) => void;
 }
 
 function upsertBy<T extends { id: string }>(list: T[], item: T): T[] {
@@ -200,6 +209,7 @@ export const useBerdloop = create<BerdloopState>()(
       ),
       projectId: legacy("berdloop.preview.project-selection.v1", ""),
       ticketId: legacy("berdloop.loop.ticket.v1", ""),
+      loopRunning: false,
 
       setOrganizations: (organizations) =>
         set((state) => ({
@@ -311,6 +321,7 @@ export const useBerdloop = create<BerdloopState>()(
       setOrganizationId: (organizationId) => set({ organizationId }),
       setProjectId: (projectId) => set({ projectId }),
       setTicketId: (ticketId) => set({ ticketId }),
+      setLoopRunning: (loopRunning) => set({ loopRunning }),
     }),
     {
       name: "berdloop.state.v1",
@@ -323,6 +334,7 @@ export const useBerdloop = create<BerdloopState>()(
         organizationId: state.organizationId,
         projectId: state.projectId,
         ticketId: state.ticketId,
+        loopRunning: state.loopRunning,
       }),
     },
   ),

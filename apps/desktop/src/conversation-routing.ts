@@ -17,6 +17,17 @@ export interface ConversationSnapshot extends AgentThreadView {
   runId?: string;
   sessionId?: string;
   harness: HarnessId;
+  /** File edits the current run has made. */
+  edits?: number;
+  /** When the current run started, in milliseconds. */
+  startedAt?: number;
+  /**
+   * The app stopped while this thread was running.
+   *
+   * Set by the native side when it reads the saved threads back, and cleared
+   * the moment the agent is started again.
+   */
+  interrupted?: boolean;
 }
 
 export function conversationKey(scope: AgentScope): string {
