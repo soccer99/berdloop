@@ -23,6 +23,7 @@ import {
   IconPlayerStop,
   IconPlus,
   IconSearch,
+  IconSparkles,
   IconTerminal2,
   IconTrash,
 } from "@tabler/icons-react";
@@ -46,6 +47,9 @@ import {
 } from "./workflow-ui";
 import "./workflow.css";
 import type { Runtime } from "./workflow-runtime";
+import { HumanRequestCard } from "./agent-chat";
+import { orderAgentTasks, orderTickets, routeSteering } from "./jev";
+import { ChangesPanel } from "./changes-panel";
 
 interface QueueProps {
   workspace: TaskWorkspace;
@@ -68,6 +72,8 @@ interface QueueProps {
   ready: boolean;
   runtime?: Runtime;
   onPrepareAgent?: () => Promise<void>;
+  /** Beta: a decision model orders the queues and checks where a message goes. */
+  beta?: boolean;
 }
 
 function Status({
@@ -146,7 +152,7 @@ function Log({
                   : "Activity"}
             </strong>
             {message.at && (
-              <time dateTime={message.at}>
+              <time dateTime={new Date(message.at).toISOString()}>
                 {new Date(message.at).toLocaleTimeString([], {
                   hour: "2-digit",
                   minute: "2-digit",
@@ -184,6 +190,7 @@ function Composer({
   onSend,
   targets,
   inlineSend = false,
+  quote,
 }: {
   label: string;
   placeholder: string;
@@ -191,11 +198,27 @@ function Composer({
   onSend: (text: string, target: WorkflowAction["target"]) => Promise<void>;
   targets?: { value: string; label: string }[];
   inlineSend?: boolean;
+  quote?: { id: number; text: string };
 }) {
   const [text, setText] = useState("");
   const [target, setTarget] = useState(targets?.[0]?.value ?? "worker");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const input = useRef<HTMLTextAreaElement>(null);
+  const applied = useRef(0);
+  const quoted = useRef("");
+  useEffect(() => {
+    if (!quote || applied.current === quote.id) return;
+    applied.current = quote.id;
+    // Replace the quote still at the top of the draft, else add to it.
+    setText((current) =>
+      quoted.current && current.startsWith(quoted.current)
+        ? quote.text + current.slice(quoted.current.length)
+        : quote.text + current,
+    );
+    quoted.current = quote.text;
+    input.current?.focus();
+  }, [quote]);
   const sendButton = (
     <Button
       size="xs"
@@ -227,6 +250,7 @@ function Composer({
     >
       <div className="wf-composer-input">
         <Textarea
+          ref={input}
           aria-label={label}
           placeholder={placeholder}
           autosize
@@ -248,31 +272,71 @@ function Composer({
           </ActionIcon>
         )}
       </div>
-      <div className="wf-composer-footer">
-        {targets && targets.length > 1 ? (
-          <Select
-            aria-label="Send instruction to"
-            data={targets}
-            value={target}
-            onChange={(value) => value && setTarget(value)}
-            allowDeselect={false}
-            size="xs"
-          />
-        ) : (
-          <small>
-            {connected
-              ? "Instructions stay with this thread."
-              : "Saved locally until agents are connected."}
-          </small>
-        )}
-        {!inlineSend && sendButton}
-      </div>
+      {(!inlineSend || (targets?.length ?? 0) > 1) && (
+        <div className="wf-composer-footer">
+          {targets && targets.length > 1 ? (
+            <Select
+              aria-label="Send instruction to"
+              data={targets}
+              value={target}
+              onChange={(value) => value && setTarget(value)}
+              allowDeselect={false}
+              size="xs"
+            />
+          ) : (
+            <small>
+              {connected
+                ? "Instructions stay with this thread."
+                : "Saved locally until agents are connected."}
+            </small>
+          )}
+          {!inlineSend && sendButton}
+        </div>
+      )}
       {error && (
         <p className="task-error" role="alert">
           {error}
         </p>
       )}
     </form>
+  );
+}
+
+function AgentConversation({
+  messages,
+  streaming,
+  label,
+  placeholder,
+  connected,
+  onSend,
+  targets,
+  inlineSend,
+  quote,
+}: {
+  messages: ThreadMessage[];
+  streaming?: boolean;
+  label: string;
+  placeholder: string;
+  connected: boolean;
+  onSend: (text: string, target: WorkflowAction["target"]) => Promise<void>;
+  targets?: { value: string; label: string }[];
+  inlineSend?: boolean;
+  /** Text to put at the top of the draft. A new id applies it again. */
+  quote?: { id: number; text: string };
+}) {
+  return (
+    <>
+      <Log messages={messages} streaming={streaming} />
+      <Composer
+        label={label}
+        placeholder={placeholder}
+        connected={connected}
+        onSend={onSend}
+        targets={targets}
+        inlineSend={inlineSend}
+        quote={quote}
+      />
+    </>
   );
 }
 
@@ -295,6 +359,30 @@ function Coordinator({
     key: `berdloop.ui.chat-open.${threadKey}`,
     defaultValue: true,
   });
+  const [height, setHeight] = useLocalStorage({
+    key: `berdloop.ui.chat-height.${threadKey}`,
+    defaultValue: 300,
+  });
+  const body = useRef<HTMLDivElement>(null);
+  /** Drag the bottom edge. The 80% cap is `max-height: 80vh` in the CSS. */
+  const resize = (event: React.PointerEvent) => {
+    event.preventDefault();
+    const startY = event.clientY;
+    const startHeight = body.current?.offsetHeight ?? height;
+    const move = (e: PointerEvent) =>
+      setHeight(
+        Math.min(
+          window.innerHeight * 0.8,
+          Math.max(150, startHeight + e.clientY - startY),
+        ),
+      );
+    const stop = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", stop);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", stop);
+  };
   const thread = runtime?.threads[threadKey];
   const title =
     kind === "ticket" ? "Ticket agent" : "Planning & steering agent";
@@ -339,12 +427,15 @@ function Coordinator({
         )}
       </button>
       {expanded && (
-        <div id={`chat-${threadKey}`} className="wf-coordinator-body">
-          <Log
+        <div
+          id={`chat-${threadKey}`}
+          className="wf-coordinator-body"
+          ref={body}
+          style={{ height }}
+        >
+          <AgentConversation
             messages={threadMessages(thread?.messages, messages)}
             streaming={thread?.streaming}
-          />
-          <Composer
             label={`Message ${title}`}
             placeholder={
               kind === "ticket"
@@ -352,7 +443,7 @@ function Coordinator({
                 : "Break down the work, reorder tasks, or give the workers new context…"
             }
             connected={!!runtime?.connected}
-            inlineSend={kind === "planner"}
+            inlineSend={kind === "ticket"}
             onSend={onSend}
             targets={
               kind === "planner"
@@ -365,18 +456,16 @@ function Coordinator({
           />
         </div>
       )}
+      {expanded && (
+        <div
+          className="wf-coordinator-resize"
+          onPointerDown={resize}
+          role="separator"
+          aria-label={`Resize ${title} panel`}
+          aria-orientation="horizontal"
+        />
+      )}
     </section>
-  );
-}
-
-/**
- * The ticket the loop takes when nobody has picked one: the top of the queue
- * as this list shows it, working and paused tickets before queued ones.
- */
-export function topTicket(tickets: Task[]): Task | undefined {
-  return (
-    tickets.find((item) => ["running", "paused"].includes(item.status)) ??
-    tickets.find((item) => item.status === "queued")
   );
 }
 
@@ -400,6 +489,7 @@ export function QueueView({
   ready,
   runtime,
   onPrepareAgent,
+  beta = false,
 }: QueueProps) {
   const [selectedTaskId, setSelectedTaskId] = useState("");
   const dragging = useRef<{ kind: "ticket" | "task"; id: string } | null>(null);
@@ -407,6 +497,7 @@ export function QueueView({
   const [step, setStep] = useState("work");
   const [search, setSearch] = useState("");
   const [notice, setNotice] = useState("");
+  const [quote, setQuote] = useState<{ id: number; text: string }>();
   const [editTicket, setEditTicket] = useState(false);
   const [taskEditor, setTaskEditor] = useState<AgentTask | "new" | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<{
@@ -420,12 +511,6 @@ export function QueueView({
   const [legacyNotes] = useLocalStorage<
     Record<string, { id: string; text: string; at: string }[]>
   >({ key: "berdloop.preview.notes.v1", defaultValue: {} });
-  const [promptOverrides, setPromptOverrides] = useLocalStorage<
-    Record<string, string>
-  >({ key: "berdloop.ui.task-prompts.v1", defaultValue: {} });
-  const [mergePolicies, setMergePolicies] = useLocalStorage<
-    Record<string, string>
-  >({ key: "berdloop.ui.merge-policies.v1", defaultValue: {} });
   const tickets = workspace.tasks.filter(
     (ticket) =>
       projects.some((project) => project.id === ticket.projectId) &&
@@ -456,6 +541,10 @@ export function QueueView({
   const visibleTickets = tickets.filter((item) =>
     `${item.title} ${item.ticket}`.toLowerCase().includes(search.toLowerCase()),
   );
+  // Only work nobody has started can be reordered.
+  const queuedTickets = visibleTickets.filter(
+    (item) => item.status === "queued",
+  );
   const activeTasks = tasks.filter(
     (item) =>
       !["queued", "done"].includes(
@@ -483,26 +572,64 @@ export function QueueView({
     }
   }, [selectedTaskId, step]);
 
+  /** What a person calls each chat, for the routing hint. */
+  const chatNames: Record<string, string> = {
+    "ticket-agent": "ticket agent",
+    planner: "planning agent",
+    "all-workers": "workers",
+  };
+
+  /**
+   * Beta: check where an instruction was really aimed.
+   *
+   * A hint, never a redirect. The message goes where the person sent it and
+   * the notice says another chat may have been meant, because sending a
+   * correction to the wrong agent is a mistake nobody sees until the wrong
+   * code arrives. Nothing waits on the answer, so the send is never slowed.
+   */
+  function checkRoute(text: string, target: WorkflowAction["target"]) {
+    if (!beta || !target || !chatNames[target]) return;
+    void routeSteering(text, {
+      ticket: ticket?.title,
+      tasks: activeTasks.map((task) => task.title),
+    })
+      .then((route) => {
+        if (!route || route === target) return;
+        setNotice(
+          `Sent to the ${chatNames[target]}. That instruction reads as one for the ${chatNames[route]}.`,
+        );
+      })
+      .catch(() => {});
+  }
+
   async function send(
     threadKey: string,
     text: string,
     target: WorkflowAction["target"],
     taskId?: string,
   ) {
+    checkRoute(text, target);
     const clientMessageId = crypto.randomUUID();
     const starting =
       connected &&
       !!project?.path &&
       !!runtime?.start &&
-      !runtime.threads[threadKey] &&
+      !runtime.threads[threadKey]?.streaming &&
       (target === "ticket-agent" || target === "planner");
     if (starting) {
       await onPrepareAgent?.();
-      await runtime!.start(threadKey, project!.path!, text, {
-        organizationId,
-        projectId: project!.id,
-        role: target === "ticket-agent" ? "ticket-agent" : "task-agent",
-      });
+      await runtime!.start(
+        threadKey,
+        project!.path!,
+        text,
+        {
+          organizationId,
+          projectId: project!.id,
+          role: target === "ticket-agent" ? "ticket-agent" : "task-agent",
+          ticketId: target === "planner" ? ticket?.id : undefined,
+        },
+        clientMessageId,
+      );
     } else if (connected)
       await runtime!.dispatch({
         kind: "message",
@@ -514,6 +641,8 @@ export function QueueView({
         text,
         clientMessageId,
       });
+    // Connected histories, including user messages, come only from Rust.
+    if (connected) return;
     setSavedMessages((current) => ({
       ...current,
       [threadKey]: [
@@ -544,11 +673,60 @@ export function QueueView({
       setNotice(String(cause));
     }
   }
+  const [ordering, setOrdering] = useState(false);
+
+  /**
+   * Beta: let a decision model put a queue in build order.
+   *
+   * It moves records, it never changes them. Anything the model did not rank
+   * keeps the place it had, so a queue the person arranged by hand is only
+   * disturbed where there was an answer to disturb it with.
+   */
+  async function orderQueue(kind: "ticket" | "task") {
+    const list = kind === "ticket" ? queuedTickets : queuedTasks;
+    if (list.length < 2 || ordering) return;
+    setOrdering(true);
+    setNotice("");
+    try {
+      const order =
+        kind === "ticket"
+          ? await orderTickets(list as Task[])
+          : await orderAgentTasks(list as AgentTask[]);
+      if (!order) {
+        setNotice("The decision model had no answer. The queue is unchanged.");
+        return;
+      }
+      const key = kind === "ticket" ? "tasks" : "agentTasks";
+      const rank = new Map(order.map((id, at) => [id, at]));
+      update((current) => {
+        // Only the queued ones move. Their slots in the full list stay put, so
+        // running and finished work is never reordered around them.
+        const list = [...current[key]];
+        const slots = list
+          .map((item, at) => (rank.has(item.id) ? at : -1))
+          .filter((at) => at >= 0);
+        const moved = slots
+          .map((at) => list[at]!)
+          .sort((a, b) => rank.get(a.id)! - rank.get(b.id)!);
+        slots.forEach((at, i) => {
+          list[at] = moved[i]!;
+        });
+        return { ...current, [key]: list } as TaskWorkspace;
+      });
+      setNotice(
+        kind === "ticket"
+          ? "Tickets reordered by what each one builds on."
+          : "Agent tasks reordered by urgency and what each one needs first.",
+      );
+    } catch (cause) {
+      setNotice(String(cause));
+    } finally {
+      setOrdering(false);
+    }
+  }
+
   function move(kind: "ticket" | "task", id: string, direction: number) {
-    const group =
-      kind === "ticket"
-        ? visibleTickets.filter((item) => item.status === "queued")
-        : queuedTasks;
+    const group = kind === "ticket" ? queuedTickets : queuedTasks;
     const at = group.findIndex((item) => item.id === id);
     const other = group[at + direction];
     if (!other) return;
@@ -690,6 +868,11 @@ export function QueueView({
                 )}
               </span>
               <Status activity={activity} />
+              {runtime?.stalled?.[item.id] && (
+                <Badge size="xs" color="yellow" variant="light">
+                  Going in circles
+                </Badge>
+              )}
             </div>
             <strong>{item.title}</strong>
             <small>
@@ -815,6 +998,18 @@ export function QueueView({
             <h2>
               Ticket queue <span>{tickets.length}</span>
             </h2>
+            {beta && queuedTickets.length > 1 && (
+              <Button
+                size="xs"
+                variant="default"
+                loading={ordering}
+                leftSection={<IconSparkles size={14} />}
+                title="Put the queued tickets in the order their features build on each other"
+                onClick={() => void orderQueue("ticket")}
+              >
+                Order by dependency
+              </Button>
+            )}
             <TextInput
               aria-label="Search tickets"
               placeholder="Find a ticket…"
@@ -844,6 +1039,12 @@ export function QueueView({
                 label: "Working & paused",
                 items: visibleTickets.filter((item) =>
                   ["running", "paused"].includes(item.status),
+                ),
+              },
+              {
+                label: "Code review",
+                items: visibleTickets.filter(
+                  (item) => item.status === "review",
                 ),
               },
               {
@@ -915,13 +1116,15 @@ export function QueueView({
                           <Status
                             label={ticketState(item)}
                             activity={
-                              item.status === "running"
-                                ? "coding"
-                                : item.status === "complete"
-                                  ? "done"
-                                  : item.status === "paused"
-                                    ? "paused"
-                                    : "queued"
+                              item.status === "review"
+                                ? "reviewing"
+                                : item.status === "running"
+                                  ? "coding"
+                                  : item.status === "complete"
+                                    ? "done"
+                                    : item.status === "paused"
+                                      ? "paused"
+                                      : "queued"
                             }
                           />
                           <IconChevronRight size={16} />
@@ -1057,6 +1260,18 @@ export function QueueView({
                     {doneTasks.length}/{tasks.length} done
                   </span>
                 </h2>
+                {beta && queuedTasks.length > 1 && (
+                  <Button
+                    size="xs"
+                    variant="default"
+                    loading={ordering}
+                    leftSection={<IconSparkles size={14} />}
+                    title="Put the queued tasks in order of urgency and what each one needs first"
+                    onClick={() => void orderQueue("task")}
+                  >
+                    Order by priority
+                  </Button>
+                )}
                 <Button
                   size="xs"
                   leftSection={<IconPlus size={14} />}
@@ -1167,7 +1382,7 @@ export function QueueView({
                           </Button>
                         </div>
                         <p>
-                          {promptOverrides[selected.id] ??
+                          {selected.prompt ??
                             `${selected.title}\n\n${selected.criteria}`}
                         </p>
                         {selected.dependencyIds.length > 0 && (
@@ -1183,6 +1398,21 @@ export function QueueView({
                           </small>
                         )}
                       </div>
+                      {thread?.worktree && (
+                        <ChangesPanel
+                          projectId={ticket.projectId}
+                          ticket={ticket.ticket}
+                          taskId={selected.id}
+                          streaming={thread.streaming}
+                          messageCount={thread.messages.length}
+                          onQuote={(text) =>
+                            setQuote((current) => ({
+                              id: (current?.id ?? 0) + 1,
+                              text,
+                            }))
+                          }
+                        />
+                      )}
                       <div className="wf-thread-subheading">
                         <IconMessage size={14} />
                         Agent thread
@@ -1192,14 +1422,26 @@ export function QueueView({
                           </Badge>
                         )}
                       </div>
-                      <Log
+                      {(runtime?.requests[selected.id] ?? []).map((request) => (
+                        <HumanRequestCard
+                          key={request.id}
+                          request={request}
+                          onAnswer={(id, approved, text) =>
+                            runtime!.answer(
+                              ticket.projectId,
+                              id,
+                              approved,
+                              text,
+                            )
+                          }
+                        />
+                      ))}
+                      <AgentConversation
                         messages={threadMessages(
                           thread?.messages,
                           savedMessages[selected.id],
                         )}
                         streaming={thread?.streaming}
-                      />
-                      <Composer
                         label="Message task agent"
                         placeholder={
                           taskActivity(selected, thread) === "queued"
@@ -1207,6 +1449,7 @@ export function QueueView({
                             : "Give this agent new context or direction…"
                         }
                         connected={connected}
+                        quote={quote}
                         onSend={(text, target) =>
                           send(selected.id, text, target, selected.id)
                         }
@@ -1321,9 +1564,14 @@ export function QueueView({
                     : "Finish the agent tasks and their merges first."}
                 </Empty>
               )}
+              {ticket.pullRequest?.summary && (
+                <p className="wf-prewrap muted">
+                  Review: {ticket.pullRequest.summary}
+                </p>
+              )}
               <Select
                 label="Final merge policy"
-                description="Saved preference. Applied when the agent system is connected."
+                description="Saved with the ticket. Automatic merges only the reviewed commit, and only when the forge reports every check green."
                 data={[
                   { value: "manual", label: "Manual — a human merges" },
                   {
@@ -1331,13 +1579,22 @@ export function QueueView({
                     label: "Automatic — after required checks and review",
                   },
                 ]}
-                value={mergePolicies[ticket.id] ?? "manual"}
+                value={ticket.mergePolicy ?? "manual"}
                 allowDeselect={false}
+                disabled={!ready}
                 onChange={(value) =>
-                  value &&
-                  setMergePolicies((current) => ({
+                  (value === "manual" || value === "automatic") &&
+                  update((current) => ({
                     ...current,
-                    [ticket.id]: value,
+                    tasks: current.tasks.map((item) =>
+                      item.id === ticket.id
+                        ? {
+                            ...item,
+                            mergePolicy: value,
+                            updatedAt: new Date().toISOString(),
+                          }
+                        : item,
+                    ),
                   }))
                 }
               />
@@ -1357,9 +1614,7 @@ export function QueueView({
           ticket={ticket}
           siblings={tasks}
           prompt={
-            taskEditor && taskEditor !== "new"
-              ? promptOverrides[taskEditor.id]
-              : undefined
+            taskEditor && taskEditor !== "new" ? taskEditor.prompt : undefined
           }
           onClose={() => setTaskEditor(null)}
           onSave={(input, prompt) => {
@@ -1374,7 +1629,10 @@ export function QueueView({
                       ? {
                           ...item,
                           ...input,
-                          status: ["queued", "ready"].includes(item.status)
+                          prompt,
+                          status: ["queued", "ready", "blocked"].includes(
+                            item.status,
+                          )
                             ? input.dependencyIds.some(
                                 (id) =>
                                   current.agentTasks.find(
@@ -1392,16 +1650,13 @@ export function QueueView({
               }
               const next = addAgentTask(current, {
                 ...input,
+                prompt,
                 parentTaskId: ticket.id,
               });
               savedId = next.agentTasks.at(-1)!.id;
               return next;
             });
             if (savedId) {
-              setPromptOverrides((current) => ({
-                ...current,
-                [savedId]: prompt,
-              }));
               setSelectedTaskId(savedId);
             }
             setTaskEditor(null);

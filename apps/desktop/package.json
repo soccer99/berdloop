@@ -9,7 +9,8 @@
     "preview": "vite preview --host 127.0.0.1 --port 1420 --strictPort",
     "typecheck": "tsc --noEmit",
     "desktop": "tauri dev",
-    "desktop:build": "tauri build"
+    "sidecar": "bun scripts/sidecar.mjs",
+    "desktop:build": "bun run sidecar && tauri build"
   },
   "dependencies": {
     "react": "19.3.0",

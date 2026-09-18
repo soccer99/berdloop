@@ -6,7 +6,9 @@ import {
   importIssue,
   setAgentTaskStatus,
   TaskRepository,
+  topTicket,
   type CloudWorkspaceStore,
+  type Task,
   type TaskWorkspace,
   type WorkspaceStore,
 } from "./index";
@@ -195,5 +197,33 @@ describe("local-first persistence", () => {
       "another cloud account",
     );
     expect(sent).toEqual([]);
+  });
+});
+
+describe("the ticket the loop takes", () => {
+  const ticket = (id: string, status: Task["status"]): Task => ({
+    id,
+    projectId: "project",
+    title: id,
+    source: "Local",
+    ticket: id.toUpperCase(),
+    stage: "Engineer",
+    status,
+    criteria: "",
+  });
+
+  test("working and paused tickets come before queued ones, complete never", () => {
+    expect(
+      topTicket([
+        ticket("done", "complete"),
+        ticket("next", "queued"),
+        ticket("open", "running"),
+      ])?.id,
+    ).toBe("open");
+    expect(
+      topTicket([ticket("done", "complete"), ticket("next", "queued")])?.id,
+    ).toBe("next");
+    expect(topTicket([ticket("done", "complete")])).toBeUndefined();
+    expect(topTicket([])).toBeUndefined();
   });
 });

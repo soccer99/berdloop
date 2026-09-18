@@ -15,6 +15,8 @@ interface WorkspaceHeaderProps {
   loop: LoopStatus;
   loopTicketId: string;
   loopProject?: Project;
+  /** Worker processes alive right now. */
+  busyWorkers: number;
   onWorkersChange: (workers: number) => void;
 }
 
@@ -28,6 +30,7 @@ export function WorkspaceHeader({
   loop,
   loopTicketId,
   loopProject,
+  busyWorkers,
   onWorkersChange,
 }: WorkspaceHeaderProps) {
   const isQueue = view === "loops" || view === "queue";
@@ -70,6 +73,7 @@ export function WorkspaceHeader({
           loop={loop}
           ticketId={loopTicketId}
           project={loopProject}
+          busy={busyWorkers}
           onWorkersChange={onWorkersChange}
         />
       </div>

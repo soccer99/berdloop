@@ -1,7 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { planLaunch, standingOrders, type LaunchInput } from "./harness";
+import {
+  planConversation,
+  planLaunch,
+  standingOrders,
+  type LaunchInput,
+} from "./harness";
 import { berdloopTools, renderTools, shellCall, toolsFor } from "./tools";
-import { rules, skills } from "./rules";
+import { forRole, rules, skills } from "./rules";
 import type { AgentTask, Task } from "@berdloop/core";
 
 const ticket: Task = {
@@ -38,8 +43,10 @@ describe("standingOrders", () => {
   const orders = standingOrders("worker");
 
   test("carries every rule, skill and tool for the role", () => {
-    for (const rule of rules) expect(orders).toContain(rule.title);
-    for (const skill of skills) expect(orders).toContain(skill.when);
+    for (const rule of forRole(rules, "worker"))
+      expect(orders).toContain(rule.title);
+    for (const skill of forRole(skills, "worker"))
+      expect(orders).toContain(skill.when);
     for (const tool of toolsFor("worker")) expect(orders).toContain(tool.name);
   });
 
@@ -49,7 +56,7 @@ describe("standingOrders", () => {
     expect(orders).not.toContain("task_steer");
 
     const ticketAgent = standingOrders("ticket-agent");
-    expect(ticketAgent).toContain("ticket_requirements");
+    expect(ticketAgent).toContain("ticket_edit");
     expect(ticketAgent).not.toContain("merge_land");
 
     const taskAgent = standingOrders("task-agent");
@@ -57,13 +64,81 @@ describe("standingOrders", () => {
     expect(taskAgent).not.toContain("ticket_pause");
   });
 
+  test("both planners get the same six operations on their own queue", () => {
+    // They are one agent pointed at two queues. If the sets ever drift, the
+    // tools were hand-written again instead of generated.
+    const operations = (role: "ticket-agent" | "task-agent", noun: string) =>
+      toolsFor(role)
+        .map((tool) => tool.name)
+        .filter((name) => name.startsWith(`${noun}_`))
+        .map((name) => name.slice(noun.length + 1))
+        .sort();
+    const six = ["add", "edit", "merge", "remove", "reorder", "split"];
+    expect(operations("ticket-agent", "ticket")).toEqual([
+      ...six,
+      "pause",
+      "replan",
+      "resume",
+    ].sort());
+    expect(operations("task-agent", "task")).toEqual(
+      [...six, "steer", "stop"].sort(),
+    );
+    for (const role of ["ticket-agent", "task-agent"] as const)
+      expect(standingOrders(role)).toContain("queue_show");
+  });
+
   test("every tool belongs to at least one role", () => {
     const covered = new Set(
-      (["ticket-agent", "task-agent", "worker"] as const).flatMap((role) =>
-        toolsFor(role).map((tool) => tool.name),
+      (
+        ["ticket-agent", "task-agent", "worker", "pr-code-review"] as const
+      ).flatMap((role) =>
+        toolsFor(role, berdloopTools, true).map((t) => t.name),
       ),
     );
     for (const tool of berdloopTools) expect(covered.has(tool.name)).toBe(true);
+  });
+
+  test("a beta tool is absent until the beta is on", () => {
+    // An agent that is told about a tool will use it, so a tool that would
+    // refuse must not be described at all.
+    // "### decide" is the tool heading. A plain "decide" also matches the word
+    // in another tool's description, which is not what this is asking.
+    expect(standingOrders("task-agent")).not.toContain("### decide");
+    expect(toolsFor("task-agent").map((tool) => tool.name)).not.toContain(
+      "decide",
+    );
+    expect(
+      toolsFor("task-agent", berdloopTools, true).map((tool) => tool.name),
+    ).toContain("decide");
+  });
+
+  test("the beta tool is offered to the agents that make judgments, not to workers", () => {
+    const named = (role: Parameters<typeof toolsFor>[0]) =>
+      toolsFor(role, berdloopTools, true).map((tool) => tool.name);
+    expect(named("ticket-agent")).toContain("decide");
+    expect(named("task-agent")).toContain("decide");
+    expect(named("pr-code-review")).toContain("decide");
+    // A worker writes code for one task. Its commands are screened for it.
+    expect(named("worker")).not.toContain("decide");
+  });
+
+  test("turning the beta on changes nothing else about the orders", () => {
+    const off = standingOrders("task-agent");
+    const on = standingOrders(
+      "task-agent",
+      toolsFor("task-agent", berdloopTools, true),
+    );
+    expect(on).toContain("### decide");
+    for (const tool of toolsFor("task-agent")) expect(on).toContain(tool.name);
+    expect(off.length).toBeLessThan(on.length);
+  });
+
+  test("the beta tool is described with a command the agent can run", () => {
+    const on = standingOrders(
+      "ticket-agent",
+      toolsFor("ticket-agent", berdloopTools, true),
+    );
+    expect(on).toContain("berdloop-worker decide --questions <questions>");
   });
 
   test("shows how to actually call a tool", () => {
@@ -291,5 +366,49 @@ describe("renderTools", () => {
     expect(shellCall(report)).toBe(
       "berdloop-worker task-report --task <task> --status <status> --detail <detail>",
     );
+  });
+});
+
+describe("per-worker runtime", () => {
+  // Several workers share one machine. Ports and connection strings reach the
+  // agent's own process, not only the worktree's env file, so a command the
+  // agent types by hand still lands on its own port and its own database.
+  const runtime = { PORT: "41060", DATABASE_URL: "postgres://localhost/app_wt3" };
+
+  for (const harness of ["claude-code", "codex"] as const) {
+    test(`${harness} runs with this worker's own ports and database`, () => {
+      const plan = planConversation({
+        harness,
+        role: "worker",
+        cwd: "/work/t1",
+        prompt: "Task",
+        runtime,
+      });
+      expect(plan.env.PORT).toBe("41060");
+      expect(plan.env.DATABASE_URL).toBe("postgres://localhost/app_wt3");
+    });
+  }
+
+  test("a project with no .berd/ setup adds nothing to the environment", () => {
+    const plan = planConversation({
+      harness: "claude-code",
+      role: "worker",
+      cwd: "/work/t1",
+      prompt: "Task",
+    });
+    expect(plan.env).toEqual({});
+  });
+
+  test("a private harness home is kept alongside the worker's ports", () => {
+    const plan = planConversation({
+      harness: "codex",
+      role: "worker",
+      cwd: "/work/t1",
+      prompt: "Task",
+      home: "/private/codex",
+      runtime,
+    });
+    expect(plan.env.CODEX_HOME).toBe("/private/codex");
+    expect(plan.env.PORT).toBe("41060");
   });
 });

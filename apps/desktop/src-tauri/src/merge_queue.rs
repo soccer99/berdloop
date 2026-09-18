@@ -61,7 +61,27 @@ impl Queue {
     }
 
     /// Everyone in line, oldest first. Abandoned places are dropped.
+    fn lock(&self) -> Result<std::fs::File, String> {
+        std::fs::create_dir_all(&self.dir).map_err(|e| e.to_string())?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(self.dir.join("queue.lock"))
+            .map_err(|e| e.to_string())?;
+        file.lock().map_err(|e| e.to_string())?;
+        Ok(file)
+    }
+
     pub fn line(&self) -> Vec<String> {
+        let Ok(_lock) = self.lock() else {
+            return Vec::new();
+        };
+        self.line_locked()
+    }
+
+    fn line_locked(&self) -> Vec<String> {
         let Ok(entries) = self.dir.read_dir() else {
             return Vec::new();
         };
@@ -80,12 +100,30 @@ impl Queue {
             .collect();
         slots.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.2.cmp(&b.2)));
 
-        // Only the holder can be stale. A worker further back is simply
-        // waiting, however long it has been there.
-        if let Some((_, path, _)) = slots.first() {
-            if age_secs(path) > MAX_HOLD_SECS {
-                let _ = std::fs::remove_file(path);
+        // Ownership starts on promotion, independently of time spent waiting.
+        let holder_file = self.dir.join("holder");
+        let previous = std::fs::read_to_string(&holder_file).unwrap_or_default();
+        if let Some((_, path, task)) = slots.first() {
+            if previous == *task
+                && age_secs(path) > MAX_HOLD_SECS
+                && std::fs::remove_file(path).is_ok()
+            {
                 slots.remove(0);
+            }
+        }
+        let next = slots
+            .first()
+            .map(|(_, _, task)| task.as_str())
+            .unwrap_or("");
+        if previous != next {
+            if let Some((_, path, _)) = slots.first() {
+                // Fail closed if promotion cannot be persisted.
+                if filetime_now(path).is_err() {
+                    return Vec::new();
+                }
+            }
+            if std::fs::write(&holder_file, next).is_err() {
+                return Vec::new();
             }
         }
         slots.into_iter().map(|(_, _, task)| task).collect()
@@ -107,8 +145,9 @@ impl Queue {
     /// Asking twice is safe. A worker that retries keeps its original place
     /// rather than going to the back.
     pub fn acquire(&self, task_id: &str) -> Result<Slot, String> {
+        let _lock = self.lock()?;
         let task = file_name(task_id);
-        let line = self.line();
+        let line = self.line_locked();
         if !line.contains(&task) {
             std::fs::create_dir_all(&self.dir).map_err(|e| e.to_string())?;
             let stamp = SystemTime::now()
@@ -118,9 +157,16 @@ impl Queue {
             let path = self.dir.join(format!("{stamp:020}-{task}.slot"));
             // create_new fails rather than overwriting, so two workers racing
             // can never end up sharing one place.
-            std::fs::File::create(&path).map_err(|e| e.to_string())?;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .map_err(|e| e.to_string())?;
         }
-        let line = self.line();
+        let line = self.line_locked();
+        if !line.contains(&task) {
+            return Err("Could not persist merge ownership".into());
+        }
         Ok(self.slot(task_id, &line))
     }
 
@@ -129,6 +175,7 @@ impl Queue {
     /// A worker that leaves while still waiting simply drops out, so an
     /// abandoned task never blocks the ones behind it.
     pub fn release(&self, task_id: &str) -> Option<String> {
+        let _lock = self.lock().ok()?;
         let task = file_name(task_id);
         if let Ok(entries) = self.dir.read_dir() {
             for entry in entries.flatten() {
@@ -144,11 +191,14 @@ impl Queue {
                 }
             }
         }
-        self.line().into_iter().next()
+        self.line_locked().into_iter().next()
     }
 
     /// Say the holder is still alive, so it is not reaped mid-merge.
     pub fn touch(&self, task_id: &str) {
+        let Ok(_lock) = self.lock() else {
+            return;
+        };
         let task = file_name(task_id);
         if let Ok(entries) = self.dir.read_dir() {
             for entry in entries.flatten() {
@@ -315,6 +365,82 @@ mod tests {
 
         // Only the holder can go stale. Waiting a long time is normal.
         assert_eq!(queue.line(), ["holder", "patient"]);
+        assert_eq!(queue.release("holder").as_deref(), Some("patient"));
+        assert!(queue.acquire("patient").unwrap().holder);
+    }
+
+    fn slot_path(queue: &Queue, task: &str) -> PathBuf {
+        queue
+            .dir
+            .read_dir()
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.to_string_lossy().contains(&format!("-{task}.slot")))
+            .unwrap()
+    }
+
+    #[test]
+    fn a_promoted_worker_keeps_its_turn_even_when_every_slot_is_old() {
+        let queue = queue();
+        queue.acquire("dead").unwrap();
+        queue.acquire("patient").unwrap();
+        let old = SystemTime::now() - std::time::Duration::from_secs(MAX_HOLD_SECS * 4);
+        set_modified(&slot_path(&queue, "dead"), old);
+        set_modified(&slot_path(&queue, "patient"), old);
+
+        // The dead holder is reaped; the patient one is promoted with a fresh
+        // clock, so the very next read must not reap it too.
+        assert_eq!(queue.line(), ["patient"]);
+        assert_eq!(queue.line(), ["patient"]);
+        assert!(queue.acquire("patient").unwrap().holder);
+        assert!(age_secs(&slot_path(&queue, "patient")) < MAX_HOLD_SECS);
+    }
+
+    #[test]
+    fn racing_workers_never_share_a_place() {
+        let queue = queue();
+        let dir = queue.dir.clone();
+        let workers: Vec<_> = (0..8)
+            .map(|n| {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    let queue = Queue::new(dir);
+                    for _ in 0..5 {
+                        queue.acquire(&format!("w{n}")).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let line = queue.line();
+        assert_eq!(line.len(), 8, "{line:?}");
+        let mut unique = line.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), 8);
+        // Exactly one holder, and it stays the holder across reads.
+        let holders = line
+            .iter()
+            .filter(|t| queue.acquire(t).unwrap().holder)
+            .count();
+        assert_eq!(holders, 1);
+    }
+
+    #[test]
+    fn a_line_that_cannot_be_locked_grants_nobody_a_turn() {
+        // A file where the directory should be: the lock cannot be created.
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let path =
+            std::env::temp_dir().join(format!("berdloop-queue-file-{n}-{}", std::process::id()));
+        std::fs::write(&path, b"not a directory").unwrap();
+        let queue = Queue::new(path.clone());
+        assert!(queue.acquire("a").is_err());
+        assert!(queue.line().is_empty());
+        assert_eq!(queue.release("a"), None);
+        std::fs::remove_file(path).unwrap();
     }
 
     fn set_modified(path: &Path, when: SystemTime) {

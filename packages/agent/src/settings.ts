@@ -27,13 +27,39 @@ export interface HarnessSettings {
    * per skill, so pretending otherwise in the interface would be a lie.
    */
   userSkills: boolean;
+  /**
+   * A gateway key for the beta features. Either one works. Optional.
+   *
+   * Neither ever leaves the native side. The window asks the host for a
+   * decision; the host holds the key and makes the call.
+   */
+  openrouterKey?: string;
+  vercelKey?: string;
+  /** Whether the beta features may use those keys. Off until both are set. */
+  beta?: boolean;
 }
 
 export const defaultHarnessSettings = (): HarnessSettings => ({
   trust: "full",
   mcpServers: [],
   userSkills: false,
+  openrouterKey: "",
+  vercelKey: "",
+  beta: false,
 });
+
+/**
+ * True when the beta features have a gateway and permission to use it.
+ *
+ * The same rule the native side applies, so the interface can hide a control
+ * the host would refuse anyway.
+ */
+export function betaEnabled(settings: HarnessSettings): boolean {
+  return Boolean(
+    settings.beta &&
+    (settings.openrouterKey?.trim() || settings.vercelKey?.trim()),
+  );
+}
 
 /**
  * Turn the settings into what a launch plan needs.

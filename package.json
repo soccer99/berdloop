@@ -19,7 +19,7 @@
     "build": "bun run --filter \"./apps/*\" build",
     "build:desktop": "bun run --filter @berdloop/desktop desktop:build",
     "typecheck": "bun run --filter \"*\" typecheck",
-    "test": "bun test packages/core packages/agent packages/state",
+    "test": "bun test packages/core packages/agent packages/state apps/desktop/src/conversation-routing.test.ts apps/desktop/src/agent-preferences.test.ts apps/desktop/src/ticket-scheduling.test.ts apps/desktop/src/jev.test.ts apps/desktop/src/loop-engine.test.ts apps/desktop/src/task-storage.test.ts apps/desktop/src/diff.test.ts",
     "check": "bun run typecheck && bun run test && bun run build",
     "format": "prettier --write apps packages package.json tsconfig.json README.md .github",
     "format:check": "prettier --check apps packages package.json tsconfig.json README.md .github"

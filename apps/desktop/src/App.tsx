@@ -3,7 +3,9 @@ import {
   Button,
   Modal,
   MultiSelect,
+  PasswordInput,
   Select,
+  Switch,
   Tabs,
   Textarea,
   TextInput,
@@ -16,6 +18,7 @@ import {
   importIssue,
   migrateTasks,
   starterProjectId,
+  topTicket,
   type AccountSession,
   type ExternalIssue,
   type ExternalProvider,
@@ -25,16 +28,20 @@ import {
   type TicketProvider,
 } from "@berdloop/core";
 import { useBerdloop } from "@berdloop/state";
+import {
+  betaEnabled,
+  defaultHarnessSettings,
+  type HarnessSettings,
+} from "@berdloop/agent";
 import { useTaskWorkspace } from "./task-storage";
-import { useQueueWatcher } from "./queue-watcher";
 import {
   AccessScreen,
   WorkOSRequiredModal,
   canCollaborate,
   type CollaborationTarget,
 } from "./access";
-import { QueueView, topTicket } from "./queue";
-import { useWorkflowRuntime } from "./workflow-runtime";
+import { QueueView } from "./queue";
+import { plannerKey, useWorkflowRuntime } from "./workflow-runtime";
 import { defaultWorkers, useRalphLoop } from "./ralph-loop";
 import { AppShell } from "./layout/AppShell";
 import { WorkspaceHeader } from "./layout/WorkspaceHeader";
@@ -44,10 +51,15 @@ import type { WorkspaceView } from "./layout/types";
 import {
   agentRoles,
   emptyAgentPreferences,
+  resolveRolePreference,
+  patchRolePreference,
   type AgentPreferences,
   type AgentRoleSetting,
   type RolePreference,
 } from "./agent-preferences";
+
+import { HarnessModelSelects } from "./harness-model-selects";
+import { useHarnessCatalog } from "./harness-catalog";
 
 // The WorkOS adapter will provide this after account auth is connected.
 const workosSession: AccountSession | null = null;
@@ -98,6 +110,7 @@ export default function App() {
     CollaborationTarget | "welcome" | null
   >(null);
   const [view, setView] = useState<WorkspaceView>("queue");
+  const harnessOptions = useHarnessCatalog(view === "tools");
   const [navigationOpen, setNavigationOpen] = useState(false);
   const organizations = useBerdloop((state) => state.organizations);
   const addOrganizationRecord = useBerdloop(
@@ -105,6 +118,7 @@ export default function App() {
   );
   const projects = useBerdloop((state) => state.projects);
   const saveProjectRecord = useBerdloop((state) => state.upsertProject);
+  const removeProjectRecord = useBerdloop((state) => state.removeProject);
   const {
     workspace,
     update: updateWorkspace,
@@ -114,7 +128,6 @@ export default function App() {
   const tasks = workspace.tasks;
 
   // The agent system, and the loop that keeps handing it work.
-  const agents = useWorkflowRuntime();
   const loopTicketId = useBerdloop((state) => state.ticketId);
   const setLoopTicketId = useBerdloop((state) => state.setTicketId);
   const [sourceSettingsProjectId, setSourceSettingsProjectId] = useState("");
@@ -125,12 +138,43 @@ export default function App() {
     });
   const [preferencesLoaded, setPreferencesLoaded] = useState(!isTauri());
   const [preferencesError, setPreferencesError] = useState("");
+
+  // Harness settings live beside the app, not in this workspace, because they
+  // are about trusting the machine. The native side is the only copy; this is
+  // a draft of it that saves as it is edited.
+  const [harnessSettings, setHarnessSettingsState] = useState<HarnessSettings>(
+    defaultHarnessSettings,
+  );
+  const [harnessSettingsError, setHarnessSettingsError] = useState("");
+  useEffect(() => {
+    if (!isTauri()) return;
+    let active = true;
+    void invoke<HarnessSettings>("load_harness_settings")
+      .then((saved) => active && setHarnessSettingsState(saved))
+      .catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, []);
+  function setHarnessSettings(change: Partial<HarnessSettings>) {
+    const next = { ...harnessSettings, ...change };
+    // A key that is taken away takes the beta with it, so the switch can never
+    // be left on with nothing behind it.
+    if (!next.openrouterKey?.trim() && !next.vercelKey?.trim() && next.beta)
+      next.beta = false;
+    setHarnessSettingsState(next);
+    setHarnessSettingsError("");
+    if (!isTauri()) return;
+    void invoke("save_harness_settings", { settings: next }).catch((cause) =>
+      setHarnessSettingsError(String(cause)),
+    );
+  }
   const organizationId = useBerdloop((state) => state.organizationId);
   const setOrganizationId = useBerdloop((state) => state.setOrganizationId);
   const projectId = useBerdloop((state) => state.projectId);
   const setProjectId = useBerdloop((state) => state.setProjectId);
+  const agents = useWorkflowRuntime();
   // The agents write the queue files; this keeps the store true to them.
-  useQueueWatcher(projectId);
   const loopProject = projects.find((item) => item.id === projectId);
   // The loop follows the top of the queue unless a ticket was picked, and it
   // moves on by itself once that ticket is complete.
@@ -144,21 +188,61 @@ export default function App() {
   const loop = useRalphLoop({
     workspace,
     update: updateWorkspace,
-    project: loopProject,
-    ticket: loopTicket,
+    projects,
+    projectId,
+    preferredTicketId: loopTicketId,
     slots: loopProject?.workers ?? defaultWorkers,
-    startAgent: async ({ key, plan }) => {
+    harness:
+      resolveRolePreference(
+        agentPreferences,
+        organizationId,
+        projectId,
+        "worker",
+      ).harness ?? "claude-code",
+    reviewHarness: resolveRolePreference(
+      agentPreferences,
+      organizationId,
+      projectId,
+      "pr-code-review",
+    ).harness,
+    startAgent: async ({ key, plan, role, ticket }) => {
       if (isTauri())
         await invoke("save_agent_preferences", {
           preferences: agentPreferences,
         });
+      const owner = projects.find((item) => item.id === ticket.projectId);
+      if (!owner) throw new Error("The agent's project no longer exists.");
       return agents.launch(key, plan, {
-        organizationId,
-        projectId,
-        role: "worker",
+        organizationId: owner.organizationId,
+        projectId: owner.id,
+        ticketId: ticket.id,
+        taskId: role === "worker" ? key : undefined,
+        role,
+      });
+    },
+    startPlanner: async (ticket, owner, prompt) => {
+      if (!owner.path) throw new Error("The project has no folder.");
+      if (isTauri())
+        await invoke("save_agent_preferences", {
+          preferences: agentPreferences,
+        });
+      await agents.start(plannerKey(ticket.id), owner.path, prompt, {
+        organizationId: owner.organizationId,
+        projectId: owner.id,
+        ticketId: ticket.id,
+        role: "task-agent",
       });
     },
   });
+  // Workers alive right now. The processes are the truth, so this counts the
+  // live conversations rather than the loop's own bookkeeping, which frees a
+  // slot as soon as a worker reports and so reads low while it exits.
+  const busyWorkers = Object.values(agents.threads).filter(
+    (thread) =>
+      thread.streaming &&
+      thread.scope.role === "worker" &&
+      (!projectId || thread.scope.projectId === projectId),
+  ).length;
   const [selectedId, setSelectedId] = useState("");
   const [taskOpened, setTaskOpened] = useState(false);
   const [importOpened, setImportOpened] = useState(false);
@@ -178,6 +262,11 @@ export default function App() {
   const [projectInfo, setProjectInfo] = useState<ProjectInfo | null>(null);
   const [projectBusy, setProjectBusy] = useState(false);
   const [projectError, setProjectError] = useState<string | null>(null);
+  /** What `.berd/` setup found when a project was added. Cleared once read. */
+  const [projectSetup, setProjectSetup] = useState<{
+    created: boolean;
+    notes: string[];
+  } | null>(null);
   const [draft, setDraft] = useState<Draft>(emptyDraft);
   const [runtime, setRuntime] = useState("Browser preview");
 
@@ -226,16 +315,28 @@ export default function App() {
     organizations.find((item) => item.id === organizationId) ??
     organizations[0];
   const organizationProjects = projects.filter(
-    (item) => item.organizationId === organization?.id,
+    (item) => item.organizationId === organization?.id && !item.archived,
+  );
+  const archivedProjects = projects.filter(
+    (item) => item.organizationId === organization?.id && item.archived,
   );
   const projectOptions = organizationProjects.map((item) => ({
     value: item.id,
     label: item.name,
   }));
   const project = organizationProjects.find((item) => item.id === projectId);
-  const settingsProject = organizationProjects.find(
+  // Archived projects are off the lists but keep a reachable settings page.
+  const settingsProject = projects.find(
     (item) => item.id === sourceSettingsProjectId,
   );
+  // The name is edited as a draft, because an empty box must not blank the
+  // name every list shows. It is written back when the box loses focus.
+  const [projectNameDraft, setProjectNameDraft] = useState("");
+  const [confirmDeleteProject, setConfirmDeleteProject] = useState("");
+  useEffect(() => {
+    setProjectNameDraft(settingsProject?.name ?? "");
+    setConfirmDeleteProject("");
+  }, [settingsProject?.id, settingsProject?.name]);
   const sourceSettings =
     agentPreferences.ticketSources ?? emptyAgentPreferences.ticketSources;
   const organizationSources = sourceSettings.organizations;
@@ -249,41 +350,34 @@ export default function App() {
       organizationSources[organization?.id ?? ""] ??
       [])
     : (organizationSources[organization?.id ?? ""] ?? []);
-  function rolePreference(role: AgentRoleSetting): RolePreference {
-    return (
-      (sourceSettingsProjectId
-        ? agentPreferences.projects[sourceSettingsProjectId]?.[role]
-        : undefined) ??
-      agentPreferences.organizations[organization?.id ?? ""]?.[role] ?? {
-        model: "",
-        systemPrompt: "",
-      }
+  function rolePreference(role: AgentRoleSetting): Required<RolePreference> {
+    return resolveRolePreference(
+      agentPreferences,
+      settingsProject?.organizationId ?? organization?.id ?? "",
+      sourceSettingsProjectId,
+      role,
     );
   }
+
   function setRolePreference(
     role: AgentRoleSetting,
     patch: Partial<RolePreference>,
   ) {
-    const scopeId = sourceSettingsProjectId || organization?.id;
+    const settingsOrganizationId =
+      settingsProject?.organizationId ?? organization?.id;
+    const scopeId = sourceSettingsProjectId || settingsOrganizationId;
     if (!scopeId) return;
-    setAgentPreferences((current) => {
-      const key = sourceSettingsProjectId ? "projects" : "organizations";
-      const existing = current[key][scopeId]?.[role] ??
-        (sourceSettingsProjectId
-          ? current.organizations[organization?.id ?? ""]?.[role]
-          : undefined) ?? { model: "", systemPrompt: "" };
-      return {
-        ...current,
-        [key]: {
-          ...current[key],
-          [scopeId]: {
-            ...current[key][scopeId],
-            [role]: { ...existing, ...patch },
-          },
-        },
-      };
-    });
+    setAgentPreferences((current) =>
+      patchRolePreference(
+        current,
+        sourceSettingsProjectId ? "projects" : "organizations",
+        scopeId,
+        role,
+        patch,
+      ),
+    );
   }
+
   function setTicketSources(
     scope: "organizations" | "projects",
     id: string,
@@ -310,7 +404,10 @@ export default function App() {
       organizationName.trim().toLocaleLowerCase(),
   );
   const duplicateProject = Boolean(
-    projectInfo && projects.some((item) => item.path === projectInfo.path),
+    projectInfo &&
+    projects.some(
+      (item) => item.path === projectInfo.path && item.id !== linkProjectId,
+    ),
   );
 
   function selectOrganization(id: string) {
@@ -320,6 +417,36 @@ export default function App() {
     setSelectedId("");
     setNavigationOpen(false);
     setView("organization");
+  }
+  function saveProjectName() {
+    const name = projectNameDraft.trim();
+    if (!settingsProject) return;
+    if (!name) {
+      setProjectNameDraft(settingsProject.name);
+      return;
+    }
+    if (name !== settingsProject.name)
+      saveProjectRecord({ ...settingsProject, name });
+  }
+  function deleteProject(id: string) {
+    removeProjectRecord(id);
+    // Tickets go with the project. Left behind, migrateTasks would hand them
+    // to whichever project is left, which is worse than losing them.
+    updateWorkspace((current) => ({
+      ...current,
+      tasks: current.tasks.filter((task) => task.projectId !== id),
+    }));
+    if (projectId === id) setProjectId("");
+    setSourceSettingsProjectId("");
+    setSelectedId("");
+    setView("organization");
+  }
+  function showProjectSettings(id: string) {
+    setProjectId(id);
+    setSourceSettingsProjectId(id);
+    setSelectedId("");
+    setNavigationOpen(false);
+    setView("tools");
   }
   function selectProject(id: string) {
     setNavigationOpen(false);
@@ -351,16 +478,19 @@ export default function App() {
   }
   function saveProject(info: ProjectInfo) {
     if (!organization) return;
-    if (projects.some((item) => item.path === info.path)) {
-      setProjectError("This folder is already a project.");
-      return;
-    }
     const linked = linkProjectId
       ? projects.find((item) => item.id === linkProjectId)
       : null;
+    if (
+      projects.some((item) => item.path === info.path && item.id !== linked?.id)
+    ) {
+      setProjectError("This folder is already a project.");
+      return;
+    }
     const next: Project = {
+      ...linked,
       id: linked?.id ?? crypto.randomUUID(),
-      organizationId: organization.id,
+      organizationId: linked?.organizationId ?? organization.id,
       name: linked?.name ?? info.name,
       description: linked?.description || info.remoteUrl || "",
       path: info.path,
@@ -369,12 +499,25 @@ export default function App() {
       remoteUrl: info.remoteUrl,
       provider: info.provider,
     };
+    const relinked = Boolean(linked);
     saveProjectRecord(next);
+    // Set the project up for parallel workers: a `.berd/` directory holding its
+    // ports, engines and env. It only ever creates that one directory, and it
+    // leaves an existing one exactly as it is, so adding a project can never
+    // change how the project already runs for the person who owns it.
+    if (info.isGit && isTauri())
+      void invoke<{ created: boolean; notes: string[] }>("devenv_setup", {
+        projectId: next.id,
+        path: info.path,
+      })
+        .then((setup) => setProjectSetup(setup.created ? setup : null))
+        .catch((error) => setProjectError(String(error)));
     setProjectId(next.id);
     setSelectedId("");
     setProjectOpened(false);
     resetProjectForm();
-    setView("loops");
+    // Relinking is a settings edit, so it leaves you where you were.
+    if (!relinked) setView("loops");
   }
   async function pickFolder(setter: (path: string) => void) {
     if (!isTauri()) {
@@ -519,8 +662,18 @@ export default function App() {
             navigationOpen={navigationOpen}
             onToggleNavigation={() => setNavigationOpen((open) => !open)}
             loop={loop}
-            loopTicketId={loopTicket?.id ?? ""}
+            loopTicketId={
+              loop.currentTicketId ??
+              loopTicket?.id ??
+              projectTickets.find(
+                (item) =>
+                  item.status === "review" &&
+                  item.pullRequest?.review === "pending",
+              )?.id ??
+              ""
+            }
             loopProject={loopProject}
+            busyWorkers={busyWorkers}
             onWorkersChange={(workers) =>
               loopProject && saveProjectRecord({ ...loopProject, workers })
             }
@@ -552,13 +705,7 @@ export default function App() {
               setNavigationOpen(false);
               setView("tools");
             }}
-            onShowProjectSettings={(id) => {
-              setProjectId(id);
-              setSourceSettingsProjectId(id);
-              setSelectedId("");
-              setNavigationOpen(false);
-              setView("tools");
-            }}
+            onShowProjectSettings={showProjectSettings}
             onNewOrganization={() => setOrganizationOpened(true)}
             onNewProject={() => setProjectOpened(true)}
           />
@@ -684,6 +831,31 @@ export default function App() {
                 </Button>
               </section>
             )}
+            {archivedProjects.length > 0 && (
+              <>
+                <div className="panel-heading">
+                  Archived <span>{archivedProjects.length}</span>
+                </div>
+                <div className="organization-projects">
+                  {archivedProjects.map((item) => (
+                    <button
+                      key={item.id}
+                      className="organization-project archived"
+                      onClick={() => showProjectSettings(item.id)}
+                    >
+                      <IconFolder size={22} />
+                      <h2>{item.name}</h2>
+                      <p>
+                        {item.path || item.description || "No folder linked."}
+                      </p>
+                      <span>
+                        Open settings <span aria-hidden="true">↗</span>
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              </>
+            )}
           </main>
         )}
         {(view === "loops" || view === "queue") && (
@@ -705,7 +877,16 @@ export default function App() {
             }}
             selectedTicketId={selectedId}
             onSelectTicket={setSelectedId}
-            loopTicketId={loopTicket?.id ?? ""}
+            loopTicketId={
+              loop.currentTicketId ??
+              loopTicket?.id ??
+              projectTickets.find(
+                (item) =>
+                  item.status === "review" &&
+                  item.pullRequest?.review === "pending",
+              )?.id ??
+              ""
+            }
             onLoopTicket={setLoopTicketId}
             update={updateWorkspace}
             onNewTicket={() => openTaskDraft()}
@@ -725,134 +906,363 @@ export default function App() {
               setView("tools");
             }}
             ready={tasksReady}
+            beta={betaEnabled(harnessSettings)}
           />
         )}
         {view === "tools" && (
           <main className="tools-view">
-            <div className="page-heading">
-              <div>
+            <div className="settings-page">
+              <div className="settings-heading">
+                <p className="app-eyebrow">
+                  {sourceSettingsProjectId ? "PROJECT" : "ORGANIZATION"}
+                </p>
                 <h1>
                   {sourceSettingsProjectId
-                    ? `${settingsProject?.name ?? "Project"} settings`
-                    : `${organization?.name ?? "Organization"} settings`}
+                    ? (settingsProject?.name ?? "Project")
+                    : (organization?.name ?? "Organization")}
                 </h1>
-                <p>
+                <p className="settings-heading-note">
                   {sourceSettingsProjectId
-                    ? "Project ticket sources and agent defaults override organization settings."
-                    : "Default ticket sources and agent settings for this organization."}
+                    ? "These settings override the organization defaults."
+                    : "Defaults for every project in this organization."}
                 </p>
               </div>
-            </div>
-            <section className="surface ticket-source-settings">
-              <p className="app-eyebrow">TICKET SOURCES</p>
-              <h2>Import buttons</h2>
-              <p>
-                Only selected sources appear above the ticket queue. Credentials
-                are entered during import.
-              </p>
-              <MultiSelect
-                label="Visible sources"
-                data={["Linear", "Jira", "Asana"]}
-                value={visibleSettingsSources}
-                onChange={(value) => {
-                  if (sourceSettingsProjectId)
-                    setTicketSources(
-                      "projects",
-                      sourceSettingsProjectId,
-                      value as ExternalProvider[],
-                    );
-                  else if (organization)
-                    setTicketSources(
-                      "organizations",
-                      organization.id,
-                      value as ExternalProvider[],
-                    );
-                }}
-              />
-              {sourceSettingsProjectId &&
-                projectSources[sourceSettingsProjectId] !== undefined && (
-                  <Button
-                    size="xs"
-                    variant="subtle"
-                    mt="sm"
-                    onClick={() =>
-                      setTicketSources(
-                        "projects",
-                        sourceSettingsProjectId,
-                        null,
-                      )
-                    }
-                  >
-                    Use organization sources
-                  </Button>
-                )}
-            </section>
-            <div className="agent-preferences-grid">
-              {agentRoles.map(({ id, label }) => {
-                const preference = rolePreference(id);
-                return (
-                  <section className="surface agent-preference" key={id}>
-                    <div className="agent-preference-heading">
-                      <h2>{label}</h2>
-                      {sourceSettingsProjectId &&
-                        agentPreferences.projects[sourceSettingsProjectId]?.[
-                          id
-                        ] && (
-                          <Button
-                            size="xs"
-                            variant="subtle"
-                            onClick={() =>
-                              setAgentPreferences((current) => {
-                                const roles = {
-                                  ...current.projects[sourceSettingsProjectId],
-                                };
-                                delete roles[id];
-                                return {
-                                  ...current,
-                                  projects: {
-                                    ...current.projects,
-                                    [sourceSettingsProjectId]: roles,
-                                  },
-                                };
-                              })
-                            }
-                          >
-                            Use organization defaults
-                          </Button>
-                        )}
+
+              {settingsProject && (
+                <section className="settings-group">
+                  <h2>Project</h2>
+                  <div className="settings-row">
+                    <div>
+                      <label htmlFor="project-name">Name</label>
+                      <p>Shown in the sidebar and the project list.</p>
                     </div>
                     <TextInput
-                      label="Default model"
-                      placeholder="Harness default"
-                      value={preference.model}
+                      id="project-name"
+                      size="xs"
+                      className="settings-row-control"
+                      value={projectNameDraft}
                       onChange={(event) =>
-                        setRolePreference(id, {
-                          model: event.currentTarget.value,
+                        setProjectNameDraft(event.currentTarget.value)
+                      }
+                      onBlur={saveProjectName}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") event.currentTarget.blur();
+                      }}
+                    />
+                  </div>
+                  <div className="settings-row">
+                    <div>
+                      <label>Folder</label>
+                      <p className="settings-row-path">
+                        {settingsProject.path ||
+                          "No folder linked. Workers cannot run."}
+                      </p>
+                    </div>
+                    <Button
+                      size="xs"
+                      variant="default"
+                      onClick={() => {
+                        setLinkProjectId(settingsProject.id);
+                        setProjectOpened(true);
+                      }}
+                    >
+                      {settingsProject.path ? "Change..." : "Choose..."}
+                    </Button>
+                  </div>
+                </section>
+              )}
+
+              <section className="settings-group">
+                <h2>Ticket sources</h2>
+                <div className="settings-row">
+                  <div>
+                    <label>Import buttons</label>
+                    <p>
+                      Only selected sources appear above the ticket queue.
+                      Credentials are entered during import.
+                    </p>
+                  </div>
+                  <MultiSelect
+                    size="xs"
+                    className="settings-row-control"
+                    data={["Linear", "Jira", "Asana"]}
+                    value={visibleSettingsSources}
+                    onChange={(value) => {
+                      if (sourceSettingsProjectId)
+                        setTicketSources(
+                          "projects",
+                          sourceSettingsProjectId,
+                          value as ExternalProvider[],
+                        );
+                      else if (organization)
+                        setTicketSources(
+                          "organizations",
+                          organization.id,
+                          value as ExternalProvider[],
+                        );
+                    }}
+                  />
+                </div>
+                {sourceSettingsProjectId &&
+                  projectSources[sourceSettingsProjectId] !== undefined && (
+                    <div className="settings-row">
+                      <div>
+                        <label>Override</label>
+                        <p>This project ignores the organization sources.</p>
+                      </div>
+                      <Button
+                        size="xs"
+                        variant="default"
+                        onClick={() =>
+                          setTicketSources(
+                            "projects",
+                            sourceSettingsProjectId,
+                            null,
+                          )
+                        }
+                      >
+                        Use organization sources
+                      </Button>
+                    </div>
+                  )}
+              </section>
+
+              <section className="settings-group">
+                <h2>Agent defaults</h2>
+                <div className="settings-row">
+                  <div>
+                    <label>Harness and model options</label>
+                    <p>
+                      {harnessOptions.catalog
+                        ? `Updated ${new Date(harnessOptions.catalog.fetchedAt * 1000).toLocaleString()}. Refreshes every 24 hours.`
+                        : "Options are saved on this device."}
+                    </p>
+                  </div>
+                  <Button
+                    size="xs"
+                    variant="default"
+                    loading={harnessOptions.loading}
+                    disabled={!harnessOptions.connected}
+                    onClick={() => void harnessOptions.refresh()}
+                  >
+                    Refresh options
+                  </Button>
+                </div>
+                {harnessOptions.error && (
+                  <p className="task-error" role="alert">
+                    {harnessOptions.error}
+                  </p>
+                )}
+                {agentRoles.map(({ id, label }) => {
+                  const preference = rolePreference(id);
+                  const overridden = Boolean(
+                    sourceSettingsProjectId &&
+                    agentPreferences.projects[sourceSettingsProjectId]?.[id],
+                  );
+                  return (
+                    <div className="settings-row settings-row-stacked" key={id}>
+                      <div className="settings-row-top">
+                        <div>
+                          <label>{label}</label>
+                          <p>
+                            {overridden
+                              ? "Overriding the organization default."
+                              : "Harness, model and extra instructions for this role."}
+                          </p>
+                        </div>
+                      </div>
+                      <HarnessModelSelects
+                        preference={preference}
+                        projectSettings={Boolean(sourceSettingsProjectId)}
+                        override={
+                          agentPreferences.projects[sourceSettingsProjectId]?.[
+                            id
+                          ]
+                        }
+                        catalog={harnessOptions.catalog}
+                        loading={harnessOptions.loading}
+                        connected={harnessOptions.connected}
+                        onChange={(patch) => setRolePreference(id, patch)}
+                      />
+                      <Textarea
+                        size="xs"
+                        autosize
+                        minRows={1}
+                        maxRows={6}
+                        aria-label={`${label} system prompt`}
+                        placeholder="Additional system prompt"
+                        value={preference.systemPrompt}
+                        onChange={(event) =>
+                          setRolePreference(id, {
+                            systemPrompt: event.currentTarget.value,
+                          })
+                        }
+                      />
+                      {overridden && (
+                        <Button
+                          size="compact-xs"
+                          variant="subtle"
+                          onClick={() =>
+                            setAgentPreferences((current) => {
+                              const roles = {
+                                ...current.projects[sourceSettingsProjectId],
+                              };
+                              delete roles[id];
+                              return {
+                                ...current,
+                                projects: {
+                                  ...current.projects,
+                                  [sourceSettingsProjectId]: roles,
+                                },
+                              };
+                            })
+                          }
+                        >
+                          Use organization default
+                        </Button>
+                      )}
+                    </div>
+                  );
+                })}
+              </section>
+
+              {!sourceSettingsProjectId && (
+                <section className="settings-group">
+                  <h2>Beta features</h2>
+                  <p className="settings-group-note">
+                    A decision model screens read-only commands, marks a worker
+                    that is going in circles, checks where an instruction was
+                    aimed, and orders the queues. Add a key for one gateway.
+                    Both work; with both, OpenRouter is used.
+                  </p>
+                  <div className="settings-row">
+                    <div>
+                      <label htmlFor="openrouter-key">OpenRouter key</label>
+                      <p>Kept on this machine. It never reaches the window.</p>
+                    </div>
+                    <PasswordInput
+                      id="openrouter-key"
+                      size="xs"
+                      className="settings-row-control"
+                      placeholder="sk-or-v1-…"
+                      value={harnessSettings.openrouterKey ?? ""}
+                      onChange={(event) =>
+                        setHarnessSettings({
+                          openrouterKey: event.currentTarget.value,
                         })
                       }
                     />
-                    <Textarea
-                      mt="md"
-                      label="Additional system prompt"
-                      autosize
-                      minRows={3}
-                      placeholder="Instructions for every agent in this role"
-                      value={preference.systemPrompt}
+                  </div>
+                  <div className="settings-row">
+                    <div>
+                      <label htmlFor="vercel-key">Vercel AI Gateway key</label>
+                      <p>Kept on this machine. It never reaches the window.</p>
+                    </div>
+                    <PasswordInput
+                      id="vercel-key"
+                      size="xs"
+                      className="settings-row-control"
+                      placeholder="vck_…"
+                      value={harnessSettings.vercelKey ?? ""}
                       onChange={(event) =>
-                        setRolePreference(id, {
-                          systemPrompt: event.currentTarget.value,
+                        setHarnessSettings({
+                          vercelKey: event.currentTarget.value,
                         })
                       }
                     />
-                  </section>
-                );
-              })}
+                  </div>
+                  <div className="settings-row">
+                    <div>
+                      <label htmlFor="beta-on">Use the beta features</label>
+                      <p>
+                        {betaEnabled(harnessSettings)
+                          ? "On. Each decision costs a fraction of a cent."
+                          : "Off. Add a key above to turn it on."}
+                      </p>
+                    </div>
+                    <Switch
+                      id="beta-on"
+                      size="sm"
+                      checked={harnessSettings.beta ?? false}
+                      disabled={
+                        !harnessSettings.openrouterKey?.trim() &&
+                        !harnessSettings.vercelKey?.trim()
+                      }
+                      onChange={(event) =>
+                        setHarnessSettings({
+                          beta: event.currentTarget.checked,
+                        })
+                      }
+                    />
+                  </div>
+                  {harnessSettingsError && (
+                    <p className="settings-error">{harnessSettingsError}</p>
+                  )}
+                </section>
+              )}
+
+              {settingsProject && (
+                <section className="settings-group danger">
+                  <h2>Danger zone</h2>
+                  <div className="settings-row">
+                    <div>
+                      <label>
+                        {settingsProject.archived
+                          ? "Restore project"
+                          : "Archive project"}
+                      </label>
+                      <p>
+                        {settingsProject.archived
+                          ? "Put it back on the project lists."
+                          : "Hide it from the project lists. Tickets are kept."}
+                      </p>
+                    </div>
+                    <Button
+                      size="xs"
+                      variant="default"
+                      onClick={() =>
+                        saveProjectRecord({
+                          ...settingsProject,
+                          archived: !settingsProject.archived,
+                        })
+                      }
+                    >
+                      {settingsProject.archived ? "Restore" : "Archive"}
+                    </Button>
+                  </div>
+                  <div className="settings-row">
+                    <div>
+                      <label>Delete project</label>
+                      <p>Removes the project and its tickets. No undo.</p>
+                    </div>
+                    <Button
+                      size="xs"
+                      variant={
+                        confirmDeleteProject === settingsProject.id
+                          ? "filled"
+                          : "default"
+                      }
+                      color="red"
+                      onClick={() =>
+                        confirmDeleteProject === settingsProject.id
+                          ? deleteProject(settingsProject.id)
+                          : setConfirmDeleteProject(settingsProject.id)
+                      }
+                    >
+                      {confirmDeleteProject === settingsProject.id
+                        ? "Click again"
+                        : "Delete"}
+                    </Button>
+                  </div>
+                </section>
+              )}
+
+              {preferencesError && (
+                <p className="task-error" role="alert">
+                  {preferencesError}
+                </p>
+              )}
             </div>
-            {preferencesError && (
-              <p className="task-error" role="alert">
-                {preferencesError}
-              </p>
-            )}
           </main>
         )}
       </AppShell>
@@ -905,7 +1315,10 @@ export default function App() {
         }}
         title={
           linkProjectId
-            ? `Link folder to ${project?.name ?? "project"}`
+            ? `Link folder to ${
+                projects.find((item) => item.id === linkProjectId)?.name ??
+                "project"
+              }`
             : `Add project to ${organization?.name ?? "organization"}`
         }
         centered
@@ -991,7 +1404,7 @@ export default function App() {
                   onClick={() => saveProject(projectInfo)}
                   disabled={duplicateProject || projectBusy}
                 >
-                  Add project
+                  {linkProjectId ? "Link folder" : "Add project"}
                 </Button>
               </>
             )}
@@ -1043,6 +1456,27 @@ export default function App() {
             {projectError}
           </p>
         )}
+      </Modal>
+      <Modal
+        opened={projectSetup !== null}
+        onClose={() => setProjectSetup(null)}
+        title="Set up to run with several workers"
+      >
+        <p>
+          Berdloop added a <code>.berd/</code> directory to this project. It
+          holds the ports, databases and environment each worker gets, so
+          several can run the app at once. Nothing else in the project was
+          changed, and your own setup still runs exactly as it did.
+        </p>
+        <ul>
+          {(projectSetup?.notes ?? []).map((note) => (
+            <li key={note}>{note}</li>
+          ))}
+        </ul>
+        <p>
+          Read <code>.berd/README.md</code> to change any of it, then commit the
+          directory so every worker gets the same setup.
+        </p>
       </Modal>
       <Modal
         opened={importOpened}

@@ -70,6 +70,7 @@ const DELIVERY_NOTE: Record<NonNullable<ThreadMessage["delivery"]>, string> = {
   pending: "Waits until the agent starts",
   delivered: "Sent to the agent",
   applied: "Acted on",
+  failed: "Not delivered",
 };
 
 export function AgentChat({
@@ -170,7 +171,11 @@ export function AgentChat({
       )}
 
       {requests.map((request) => (
-        <Ask key={request.id} request={request} onAnswer={onAnswer} />
+        <HumanRequestCard
+          key={request.id}
+          request={request}
+          onAnswer={onAnswer}
+        />
       ))}
 
       <div className="agent-chat-log">
@@ -226,7 +231,7 @@ export function AgentChat({
  * An approval gets Allow and Refuse, because a person should not have to type
  * the word "yes" to unblock a worker. A plain question gets the composer.
  */
-function Ask({
+export function HumanRequestCard({
   request,
   onAnswer,
 }: {

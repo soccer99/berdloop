@@ -73,6 +73,9 @@ export function buildTaskBrief(input: BriefInput): string {
     "## What the ticket must achieve",
     clamp(ticket.criteria) || "(none recorded)",
     "",
+    ...(task.prompt?.trim()
+      ? ["## Task instructions", task.prompt.trim(), ""]
+      : []),
     "## What this task must achieve",
     clamp(task.criteria),
     "",
@@ -201,8 +204,5 @@ export function nextTasks(
   ).length;
   const free = slots - busy;
   if (free < 1) return [];
-  return tasks
-    .filter((task) => task.status === "ready")
-    .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
-    .slice(0, free);
+  return tasks.filter((task) => task.status === "ready").slice(0, free);
 }

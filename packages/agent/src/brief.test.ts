@@ -52,6 +52,24 @@ describe("buildTaskBrief", () => {
     expect(brief).toContain("/work/a");
   });
 
+  test("the edited prompt reaches the worker word for word", () => {
+    const edited = agentTask("a", "ready", {
+      prompt: "Use the existing InviteForm. Do not add a new dependency.",
+    });
+    const brief = buildTaskBrief({
+      ticket,
+      task: edited,
+      siblings: [edited],
+      worktree: "/work/a",
+    });
+    expect(brief).toContain("## Task instructions");
+    expect(brief).toContain(
+      "Use the existing InviteForm. Do not add a new dependency.",
+    );
+    // The criteria still travel too: the prompt adds to them, never replaces.
+    expect(brief).toContain("Criteria for a");
+  });
+
   test("names finished siblings but never explains them", () => {
     const done = agentTask("b", "complete");
     const brief = buildTaskBrief({
@@ -182,6 +200,31 @@ describe("nextTasks", () => {
   test("respects the number of free slots", () => {
     expect(nextTasks(workspace, "ticket-1", 1).map((t) => t.id)).toEqual(["a"]);
     expect(nextTasks(workspace, "ticket-1", 0)).toEqual([]);
+  });
+
+  test("the queue order decides, not the age of the task", () => {
+    // A newer task moved above an older one starts first.
+    const reordered = {
+      ...emptyTaskWorkspace(),
+      agentTasks: [
+        agentTask("newer", "ready", { createdAt: "2026-02-01T00:00:00.000Z" }),
+        agentTask("older", "ready", { createdAt: "2026-01-01T00:00:00.000Z" }),
+      ],
+    };
+    expect(nextTasks(reordered, "ticket-1", 1).map((t) => t.id)).toEqual([
+      "newer",
+    ]);
+    // Order never overrides a dependency or an occupied slot.
+    const gated = {
+      ...emptyTaskWorkspace(),
+      agentTasks: [
+        agentTask("first", "queued", { dependencyIds: ["last"] }),
+        agentTask("busy", "running"),
+        agentTask("last", "ready"),
+      ],
+    };
+    expect(nextTasks(gated, "ticket-1", 2).map((t) => t.id)).toEqual(["last"]);
+    expect(nextTasks(gated, "ticket-1", 1)).toEqual([]);
   });
 
   test("work already in flight uses up a slot", () => {

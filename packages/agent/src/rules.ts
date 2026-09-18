@@ -35,13 +35,46 @@ export interface SkillDoc {
 
 export const rules: RuleDoc[] = [
   {
+    id: "review-pull-request",
+    roles: ["pr-code-review"],
+    title: "Independent PR review",
+    body: "Review the complete published diff against the supplied base and ticket requirements. Workers may already be working on another ticket. Your detached worktree is a review snapshot: do not change code, commit, push, merge the PR, or modify other worktrees. Inspect the code and run relevant checks. Report concrete, actionable defects with file locations, impact, and acceptance criteria; avoid speculative findings. Call pr_review_submit exactly once with the supplied head, a summary, and all findings (or an empty array). A written chat response alone does not complete the review.",
+  },
+  {
     id: "how-berdloop-works",
+    roles: ["worker", "task-agent", "ticket-agent"],
     title: "How Berdloop works",
     body: [
       "A ticket is split into small tasks. You have been given exactly one of them.",
       "Several workers run at the same time, each on a different task.",
       "You start with an empty context on every task. You cannot remember an earlier run, and no other worker can tell you anything.",
       "Everything you need is in your brief and in the repository.",
+    ].join("\n"),
+  },
+  {
+    id: "your-job",
+    roles: ["ticket-agent", "task-agent"],
+    title: "Your job",
+    body: [
+      "You keep the queue right. You do not write the code, and nobody is waiting on you to understand it.",
+      "All you do is add, change, remove, split, merge and reorder queued work. Anything else belongs to a worker.",
+      "Read the least that lets you write work a worker can pick up cold. A file or two to confirm a name or a path is normal. Reading the codebase to satisfy yourself is not.",
+      "Never run a build, a test suite or the app. Never open a file to check whether a worker could do the job. That is the worker's turn, not yours.",
+      "An unknown is not a reason to research. Write it into the requirements as the first thing the worker settles.",
+      "Use decide for a judgment you would otherwise reason through, such as which items depend on which, or how to order them. It is far faster and cheaper than reading more.",
+      "Stop the moment the queue matches what was asked.",
+    ].join("\n"),
+  },
+  {
+    id: "how-you-answer",
+    roles: ["ticket-agent", "task-agent"],
+    title: "How you answer",
+    body: [
+      "Report what you created and stop. The person knows what you are for.",
+      "Do not explain your own role, and do not say what you did not do because it is somebody else's job.",
+      "Do not describe what happens next in the pipeline. Queued work is picked up without you narrating it.",
+      "Do not offer to work differently, and do not ask whether the person would rather you did. If a decision is genuinely yours to make, make it.",
+      "Ask a question only when you cannot proceed without the answer. Then ask it on its own, with no closing commentary around it.",
     ].join("\n"),
   },
   {
@@ -53,6 +86,17 @@ export const rules: RuleDoc[] = [
       "Work only there. Never change files in another worker's directory.",
       "Keep your change as small as the task allows. A large change is hard to merge.",
       "Commit your work. Uncommitted changes cannot be merged.",
+    ].join("\n"),
+  },
+  {
+    id: "running-the-app",
+    roles: ["worker"],
+    title: "Running the app",
+    body: [
+      "Several workers share this machine. Your ports, your databases and your env file are yours alone, and they are already set for you.",
+      "Never change a port, a database name or a connection string to get past a clash. There is no clash: read the value from the environment, as the project already does. A number written into a file breaks every other worker and the person you are working for.",
+      "No app is running when you start. Call dev_start when you actually need one, and dev_stop when you are done. Only a few may run at once.",
+      "Your env file holds stand-in values, not real keys. If a task truly needs a real credential, ask a human rather than hunting for one.",
     ].join("\n"),
   },
   {
@@ -69,6 +113,7 @@ export const rules: RuleDoc[] = [
   },
   {
     id: "finishing",
+    roles: ["worker", "task-agent", "ticket-agent"],
     title: "Finishing",
     body: [
       "Stop when your one task is done. Do not start another task.",

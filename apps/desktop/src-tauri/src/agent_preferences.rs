@@ -12,10 +12,12 @@ static SAVE_LOCK: Mutex<()> = Mutex::new(());
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RolePreference {
-    #[serde(default)]
-    pub model: String,
-    #[serde(default)]
-    pub system_prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -43,15 +45,32 @@ impl AgentPreferences {
         organization_id: &str,
         project_id: &str,
         role: &str,
-    ) -> Option<&RolePreference> {
-        self.projects
+    ) -> Option<RolePreference> {
+        let organization = self
+            .organizations
+            .get(organization_id)
+            .and_then(|roles| roles.get(role));
+        let project = self
+            .projects
             .get(project_id)
-            .and_then(|roles| roles.get(role))
-            .or_else(|| {
-                self.organizations
-                    .get(organization_id)
-                    .and_then(|roles| roles.get(role))
-            })
+            .and_then(|roles| roles.get(role));
+        if organization.is_none() && project.is_none() {
+            return None;
+        }
+        let choice = project
+            .filter(|p| p.harness.is_some() || p.model.is_some())
+            .or(organization);
+        Some(RolePreference {
+            harness: Some(
+                choice
+                    .and_then(|p| p.harness.clone())
+                    .unwrap_or_else(|| "claude-code".into()),
+            ),
+            model: choice.and_then(|p| p.model.clone()),
+            system_prompt: project
+                .and_then(|p| p.system_prompt.clone())
+                .or_else(|| organization.and_then(|p| p.system_prompt.clone())),
+        })
     }
 }
 
@@ -107,6 +126,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_preferences_load_without_a_harness() {
+        let choice: RolePreference =
+            serde_json::from_str(r#"{"model":"sonnet","systemPrompt":""}"#).unwrap();
+        assert!(choice.harness.is_none());
+        assert_eq!(choice.model.as_deref(), Some("sonnet"));
+    }
+
+    #[test]
     fn ticket_sources_and_prompts_round_trip() {
         let mut settings = AgentPreferences::default();
         settings
@@ -120,8 +147,9 @@ mod tests {
             .insert(
                 "ticket-agent".into(),
                 RolePreference {
-                    model: "opus".into(),
-                    system_prompt: "Plan small tasks".into(),
+                    harness: Some("codex".into()),
+                    model: Some("opus".into()),
+                    system_prompt: Some("Plan small tasks".into()),
                 },
             );
         let json = serde_json::to_value(&settings).unwrap();
@@ -132,8 +160,70 @@ mod tests {
             restored
                 .resolve("org", "", "ticket-agent")
                 .unwrap()
-                .system_prompt,
-            "Plan small tasks"
+                .harness
+                .as_deref(),
+            Some("codex")
+        );
+        assert_eq!(
+            restored
+                .resolve("org", "", "ticket-agent")
+                .unwrap()
+                .system_prompt
+                .as_deref(),
+            Some("Plan small tasks")
+        );
+    }
+
+    #[test]
+    fn project_inherits_model_choice_independently_of_prompt_and_can_restore_defaults() {
+        let mut settings: AgentPreferences = serde_json::from_value(serde_json::json!({
+            "organizations": { "org": { "worker": { "harness": "codex", "model": "org-model", "systemPrompt": "Org rules" } } },
+            "projects": { "project": { "worker": { "systemPrompt": "Project rules" } } }
+        })).unwrap();
+        let inherited = settings.resolve("org", "project", "worker").unwrap();
+        assert_eq!(inherited.harness.as_deref(), Some("codex"));
+        assert_eq!(inherited.model.as_deref(), Some("org-model"));
+        assert_eq!(inherited.system_prompt.as_deref(), Some("Project rules"));
+        let project = settings
+            .projects
+            .get_mut("project")
+            .unwrap()
+            .get_mut("worker")
+            .unwrap();
+        project.harness = Some("claude-code".into());
+        project.model = Some(String::new());
+        let overridden = settings.resolve("org", "project", "worker").unwrap();
+        assert_eq!(overridden.harness.as_deref(), Some("claude-code"));
+        assert_eq!(overridden.model.as_deref(), Some(""));
+        let project = settings
+            .projects
+            .get_mut("project")
+            .unwrap()
+            .get_mut("worker")
+            .unwrap();
+        project.harness = None;
+        project.model = None;
+        settings
+            .organizations
+            .get_mut("org")
+            .unwrap()
+            .get_mut("worker")
+            .unwrap()
+            .model = Some("new-model".into());
+        let restored: AgentPreferences =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(
+            restored
+                .resolve("org", "project", "worker")
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("new-model")
+        );
+        assert!(
+            serde_json::to_value(&restored).unwrap()["projects"]["project"]["worker"]
+                .get("model")
+                .is_none()
         );
     }
 
@@ -147,8 +237,9 @@ mod tests {
             .insert(
                 "worker".into(),
                 RolePreference {
-                    model: "org-model".into(),
-                    system_prompt: String::new(),
+                    harness: Some("codex".into()),
+                    model: Some("org-model".into()),
+                    system_prompt: Some(String::new()),
                 },
             );
         settings
@@ -158,17 +249,26 @@ mod tests {
             .insert(
                 "worker".into(),
                 RolePreference {
-                    model: "project-model".into(),
-                    system_prompt: String::new(),
+                    harness: Some("codex".into()),
+                    model: Some("project-model".into()),
+                    system_prompt: Some(String::new()),
                 },
             );
         assert_eq!(
-            settings.resolve("org", "project", "worker").unwrap().model,
-            "project-model"
+            settings
+                .resolve("org", "project", "worker")
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("project-model")
         );
         assert_eq!(
-            settings.resolve("org", "other", "worker").unwrap().model,
-            "org-model"
+            settings
+                .resolve("org", "other", "worker")
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("org-model")
         );
     }
 }

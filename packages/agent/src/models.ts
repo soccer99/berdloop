@@ -51,6 +51,7 @@ export const builtInModels: Record<AgentRole, ModelChoice> = {
   "ticket-agent": { harness: "claude-code" },
   "task-agent": { harness: "claude-code" },
   worker: { harness: "claude-code" },
+  "pr-code-review": { harness: "claude-code" },
 };
 
 export interface ModelQuery {

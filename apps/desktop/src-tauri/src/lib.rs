@@ -1,19 +1,26 @@
 mod agent;
 mod agent_preferences;
+pub mod broker;
+pub mod control;
+mod conversations;
+pub mod devenv;
 mod extensions;
 pub mod git;
+mod harness_models;
 mod harness_settings;
 pub mod human;
+pub mod jev;
 pub mod mcp;
 pub mod merge_queue;
+mod pr_review;
 mod projects;
-pub mod queues;
 mod sessions;
+pub mod workspace;
 
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{fs, io::Write, sync::Mutex, time::Duration};
+use std::{fs, sync::Mutex, time::Duration};
 use tauri::Manager;
 
 #[derive(Serialize)]
@@ -62,31 +69,12 @@ fn save_task_workspace(
     lock: tauri::State<'_, WorkspaceLock>,
     workspace: Value,
 ) -> Result<(), String> {
-    if workspace["schemaVersion"] != 1
-        || !workspace["tasks"].is_array()
-        || !workspace["agentTasks"].is_array()
-    {
-        return Err("Invalid task workspace.".to_string());
-    }
-    let bytes =
-        serde_json::to_vec(&workspace).map_err(|_| "Could not encode local tasks.".to_string())?;
-    if bytes.len() > 10 * 1024 * 1024 {
-        return Err("Local task workspace is too large.".to_string());
-    }
-    let _guard = lock
-        .0
-        .lock()
-        .map_err(|_| "Local task store is locked.".to_string())?;
-    let path = workspace_path(&app)?;
-    let parent = path.parent().ok_or("Invalid app data path.")?;
-    fs::create_dir_all(parent).map_err(|_| "Could not create app data directory.".to_string())?;
-    let temporary = path.with_extension("json.tmp");
-    let mut file =
-        fs::File::create(&temporary).map_err(|_| "Could not open local task store.".to_string())?;
-    file.write_all(&bytes)
-        .and_then(|_| file.sync_all())
-        .map_err(|_| "Could not write local tasks.".to_string())?;
-    fs::rename(temporary, path).map_err(|_| "Could not save local tasks.".to_string())
+    let _guard = lock.0.lock().map_err(|e| e.to_string())?;
+    workspace::for_app(&app)?.change(|current| {
+        *current = workspace;
+        Ok(())
+    })?;
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -298,37 +286,47 @@ pub fn run() {
             projects::project_inspect,
             projects::project_init,
             projects::project_clone,
+            devenv::devenv_setup,
+            devenv::devenv_preview,
+            devenv::devenv_servers,
+            devenv::devenv_serve,
             load_task_workspace,
             save_task_workspace,
+            workspace::patch_task_workspace,
+            control::ticket_control,
             agent_preferences::load_agent_preferences,
             agent_preferences::save_agent_preferences,
             fetch_external_issue,
             sessions::sessions_list,
             agent::agent_start,
             agent::agent_stop,
-            agent::agent_steer,
+            agent::agent_conversations,
+            agent::agent_send_message,
             agent::worker_command,
             agent::harness_home,
             extensions::extensions_scan,
+            harness_models::load_harness_catalog,
             harness_settings::load_harness_settings,
             harness_settings::save_harness_settings,
             harness_settings::harness_mcp_config,
+            jev::jev_decide,
+            jev::jev_provider,
             human::human_requests,
             human::human_answer,
-            agent::agent_steer_command,
             git::git_prepare,
             git::git_start_ticket,
             git::git_open_task,
+            git::git_task_changes,
             git::git_sync_from_ticket,
             git::git_land,
             git::git_close_task,
             git::git_ticket_status,
             git::git_publish,
+            pr_review::publish_ticket_pr,
+            pr_review::pr_review_context,
+            pr_review::ticket_pr_sync,
             git::git_task_reports,
-            merge_queue::merge_line,
-            queues::queues_snapshot,
-            queues::queues_watch_paths,
-            queues::queues_set
+            merge_queue::merge_line
         ])
         .run(tauri::generate_context!())
         .expect("Berdloop could not start");
