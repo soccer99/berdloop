@@ -101,7 +101,8 @@ const TICKET_QUEUE: QueueWords = {
   plural: "tickets",
   criteria: "requirements",
   criteriaHint: "What the finished ticket must do.",
-  addUse: "For work that did not come from Jira, Linear or Asana.",
+  addUse:
+    "For work that did not come from Jira, Linear or Asana. An issue that did comes in through ticket_import, which fetches its real text and keeps the link back to the provider.",
 };
 
 const TASK_QUEUE: QueueWords = {
@@ -484,16 +485,16 @@ export const berdloopTools: ToolSpec[] = [
       {
         name: "provider",
         required: true,
-        description: "One of: Linear, Jira, Asana.",
+        description: "Linear, Jira or Asana.",
       },
       {
         name: "reference",
         required: true,
         description:
-          "The issue as the provider names it, for example ENG-42 or an Asana task GID.",
+          "The provider key or ID, for example BRD-128 or an Asana task GID.",
       },
     ],
-    use: "Berdloop holds the connection a person set in settings, so you never need a token. Importing the same issue again updates the ticket it already made rather than queueing the work twice.",
+    use: "It fetches the real ticket body from the provider and keeps the link back to it, so the ticket carries its source, its key and its URL. Importing the same issue again updates the ticket it already made rather than adding a second one. The connection a person set in settings is used, so no token is ever passed.",
   },
   {
     name: "ticket_replan",

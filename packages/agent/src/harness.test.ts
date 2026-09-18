@@ -84,6 +84,19 @@ describe("standingOrders", () => {
       expect(standingOrders(role)).toContain("queue_show");
   });
 
+  test("the ticket agent is told how to import a provider's issue", () => {
+    // The picker hands the agent a provider and a reference and nothing else,
+    // so the brief has to name the command that turns those into a ticket.
+    expect(toolsFor("ticket-agent").map((tool) => tool.name)).toContain(
+      "ticket_import",
+    );
+    const rendered = renderTools(toolsFor("ticket-agent"));
+    expect(rendered).toContain(
+      "berdloop-worker ticket-import --provider <provider> --reference <reference>",
+    );
+    expect(standingOrders("ticket-agent")).toContain("ticket-import");
+  });
+
   test("every tool belongs to at least one role", () => {
     const covered = new Set(
       (
