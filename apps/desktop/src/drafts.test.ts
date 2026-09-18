@@ -81,6 +81,27 @@ function stored(key: string) {
   return storage.getItem(draftStorageKey(key));
 }
 
+/** Runs `body` in a world where reaching for localStorage throws, as a webview
+ * that has been told to refuse storage does. */
+function withStorageRefused(body: () => void) {
+  const original = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+  Object.defineProperty(globalThis, "localStorage", {
+    configurable: true,
+    get() {
+      throw new Error("storage is disabled");
+    },
+  });
+  try {
+    body();
+  } finally {
+    if (original) {
+      Object.defineProperty(globalThis, "localStorage", original);
+    } else {
+      delete (globalThis as { localStorage?: unknown }).localStorage;
+    }
+  }
+}
+
 describe("a draft outliving its editor", () => {
   test("text typed into a composer comes back after unmount and remount", () => {
     const composer = mount("ticket-agent:project-1");
@@ -313,11 +334,14 @@ describe("reading what is stored", () => {
   });
 
   test("no storage at all degrades to no draft rather than throwing", () => {
-    // Neither a webview that refuses storage nor this test runner has one.
-    expect(readDraft("worker:task-1")).toBe("");
-    expect(saveDraft("worker:task-1", "typed")).toBeNull();
-    expect(() => removeDraft("worker:task-1")).not.toThrow();
-    expect(pruneDrafts([])).toEqual([]);
+    // A webview can refuse storage outright. Drafts are a convenience, so
+    // losing them must not take the editor down with them.
+    withStorageRefused(() => {
+      expect(readDraft("worker:task-1")).toBe("");
+      expect(saveDraft("worker:task-1", "typed")).toBeNull();
+      expect(() => removeDraft("worker:task-1")).not.toThrow();
+      expect(pruneDrafts([])).toEqual([]);
+    });
   });
 
   test("resolveDraftValue and nextDraftRecord agree on what counts", () => {
