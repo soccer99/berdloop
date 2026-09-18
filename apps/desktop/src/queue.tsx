@@ -49,6 +49,7 @@ import "./workflow.css";
 import type { Runtime } from "./workflow-runtime";
 import { HumanRequestCard } from "./agent-chat";
 import { orderAgentTasks, orderTickets, routeSteering } from "./jev";
+import { shouldSendOnKey } from "./send-shortcut";
 import { ChangesPanel } from "./changes-panel";
 
 interface QueueProps {
@@ -258,6 +259,25 @@ function Composer({
           maxRows={7}
           value={text}
           onChange={(event) => setText(event.currentTarget.value)}
+          onKeyDown={(event) => {
+            if (
+              !shouldSendOnKey(
+                {
+                  key: event.key,
+                  metaKey: event.metaKey,
+                  ctrlKey: event.ctrlKey,
+                  shiftKey: event.shiftKey,
+                  isComposing: event.nativeEvent.isComposing,
+                },
+                { text, busy },
+              )
+            )
+              return;
+            event.preventDefault();
+            // Through the form, so onSubmit's error handling, busy flag and
+            // clear-on-success run exactly as they do for the send button.
+            event.currentTarget.form?.requestSubmit();
+          }}
         />
         {inlineSend && (
           <ActionIcon
@@ -286,8 +306,8 @@ function Composer({
           ) : (
             <small>
               {connected
-                ? "Instructions stay with this thread."
-                : "Saved locally until agents are connected."}
+                ? "Instructions stay with this thread. Cmd+Enter (Ctrl+Enter) sends."
+                : "Saved locally until agents are connected. Cmd+Enter (Ctrl+Enter) saves."}
             </small>
           )}
           {!inlineSend && sendButton}
