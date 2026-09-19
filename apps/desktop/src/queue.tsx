@@ -6,6 +6,7 @@ import {
   Modal,
   MultiSelect,
   Select,
+  Tabs,
   Textarea,
   TextInput,
 } from "@mantine/core";
@@ -17,6 +18,7 @@ import {
   IconChevronRight,
   IconChevronUp,
   IconClock,
+  IconFileDiff,
   IconGitBranch,
   IconGripVertical,
   IconMessage,
@@ -594,6 +596,10 @@ export function QueueView({
   const [search, setSearch] = useState("");
   const [notice, setNotice] = useState("");
   const [quote, setQuote] = useState<{ id: number; text: string }>();
+  // Both are keyed by task id, so a tab choice and a file count never leak
+  // from the task they were made on to the next one opened.
+  const [taskTabs, setTaskTabs] = useState<Record<string, string>>({});
+  const [changeCounts, setChangeCounts] = useState<Record<string, number>>({});
   const [editTicket, setEditTicket] = useState(false);
   const [taskEditor, setTaskEditor] = useState<AgentTask | "new" | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<{
@@ -1535,66 +1541,117 @@ export function QueueView({
                           </small>
                         )}
                       </div>
-                      {thread?.worktree && (
-                        <ChangesPanel
-                          projectId={ticket.projectId}
-                          ticket={ticket.ticket}
-                          taskId={selected.id}
-                          streaming={thread.streaming}
-                          messageCount={thread.messages.length}
-                          onQuote={(text) =>
-                            setQuote((current) => ({
-                              id: (current?.id ?? 0) + 1,
-                              text,
-                            }))
-                          }
-                        />
-                      )}
-                      <div className="wf-thread-subheading">
-                        <IconMessage size={14} />
-                        Agent thread
-                        {thread?.streaming && (
-                          <Badge size="xs" color="lime" variant="light">
-                            Live
-                          </Badge>
-                        )}
-                      </div>
-                      {(runtime?.requests[selected.id] ?? []).map((request) => (
-                        <HumanRequestCard
-                          key={request.id}
-                          request={request}
-                          onAnswer={(id, approved, text) =>
-                            runtime!.answer(
-                              ticket.projectId,
-                              id,
-                              approved,
-                              text,
-                            )
-                          }
-                        />
-                      ))}
-                      <AgentConversation
-                        messages={threadMessages(
-                          thread?.messages,
-                          savedMessages[selected.id],
-                        )}
-                        streaming={thread?.streaming}
-                        label="Message task agent"
-                        placeholder={
-                          taskActivity(
-                            selected,
-                            thread,
-                            landed.has(selected.id),
-                          ) === "queued"
-                            ? "Add context for the agent that picks up this task…"
-                            : "Give this agent new context or direction…"
+                      <Tabs
+                        // A hidden panel's effects are torn down under the
+                        // default Activity mode, which would stop the changes
+                        // reloading while the thread is on screen.
+                        keepMountedMode="display-none"
+                        value={taskTabs[selected.id] ?? "thread"}
+                        onChange={(value) =>
+                          setTaskTabs((current) => ({
+                            ...current,
+                            [selected.id]: value ?? "thread",
+                          }))
                         }
-                        connected={connected}
-                        quote={quote}
-                        onSend={(text, target) =>
-                          send(selected.id, text, target, selected.id)
-                        }
-                      />
+                      >
+                        <Tabs.List>
+                          <Tabs.Tab
+                            value="thread"
+                            leftSection={<IconMessage size={14} />}
+                            rightSection={
+                              thread?.streaming ? (
+                                <Badge size="xs" color="lime" variant="light">
+                                  Live
+                                </Badge>
+                              ) : undefined
+                            }
+                          >
+                            Agent thread
+                          </Tabs.Tab>
+                          <Tabs.Tab
+                            value="changes"
+                            leftSection={<IconFileDiff size={14} />}
+                            rightSection={
+                              changeCounts[selected.id] ===
+                              undefined ? undefined : (
+                                <Badge size="xs" color="gray" variant="light">
+                                  {changeCounts[selected.id]}
+                                </Badge>
+                              )
+                            }
+                          >
+                            Changes
+                          </Tabs.Tab>
+                        </Tabs.List>
+                        <Tabs.Panel value="thread" pt="sm">
+                          {(runtime?.requests[selected.id] ?? []).map(
+                            (request) => (
+                              <HumanRequestCard
+                                key={request.id}
+                                request={request}
+                                onAnswer={(id, approved, text) =>
+                                  runtime!.answer(
+                                    ticket.projectId,
+                                    id,
+                                    approved,
+                                    text,
+                                  )
+                                }
+                              />
+                            ),
+                          )}
+                          <AgentConversation
+                            messages={threadMessages(
+                              thread?.messages,
+                              savedMessages[selected.id],
+                            )}
+                            streaming={thread?.streaming}
+                            label="Message task agent"
+                            placeholder={
+                              taskActivity(
+                                selected,
+                                thread,
+                                landed.has(selected.id),
+                              ) === "queued"
+                                ? "Add context for the agent that picks up this task…"
+                                : "Give this agent new context or direction…"
+                            }
+                            connected={connected}
+                            quote={quote}
+                            onSend={(text, target) =>
+                              send(selected.id, text, target, selected.id)
+                            }
+                          />
+                        </Tabs.Panel>
+                        <Tabs.Panel value="changes" pt="sm">
+                          {thread?.worktree ? (
+                            <ChangesPanel
+                              projectId={ticket.projectId}
+                              ticket={ticket.ticket}
+                              taskId={selected.id}
+                              streaming={thread.streaming}
+                              messageCount={thread.messages.length}
+                              onCount={(count) =>
+                                setChangeCounts((current) =>
+                                  current[selected.id] === count
+                                    ? current
+                                    : { ...current, [selected.id]: count },
+                                )
+                              }
+                              onQuote={(text) =>
+                                setQuote((current) => ({
+                                  id: (current?.id ?? 0) + 1,
+                                  text,
+                                }))
+                              }
+                            />
+                          ) : (
+                            <small>
+                              No worktree yet, so there is nothing to diff.
+                            </small>
+                          )}
+                        </Tabs.Panel>
+                      </Tabs>
                       <div className="wf-thread-footer">
                         <small>
                           {thread?.worktree ??

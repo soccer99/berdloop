@@ -50,6 +50,7 @@ export function ChangesPanel({
   taskId,
   streaming,
   messageCount,
+  onCount,
   onQuote,
 }: {
   projectId: string;
@@ -58,6 +59,8 @@ export function ChangesPanel({
   taskId: string;
   streaming?: boolean;
   messageCount: number;
+  /** Reports how many files the current base turned up, for the tab label. */
+  onCount?: (count: number) => void;
   onQuote: (text: string) => void;
 }) {
   const [base, setBase] = useState<Base>("ticket");
@@ -85,11 +88,13 @@ export function ChangesPanel({
         if (!live) return;
         setChanges(result);
         setError("");
+        onCount?.(result.files.length);
       })
       .catch((cause) => {
         if (!live) return;
         setChanges(undefined);
         setError(String(cause));
+        onCount?.(0);
       })
       .finally(() => {
         if (live) setLoading(false);
