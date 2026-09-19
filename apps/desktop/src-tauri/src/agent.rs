@@ -214,17 +214,19 @@ fn text_of(value: &serde_json::Value, key: &str) -> Option<String> {
     value.get(key).and_then(|v| v.as_str()).map(str::to_string)
 }
 
-/// The keys worth putting on the line itself, most telling first. A Bash call
-/// says its command, a file tool says its file; anything else falls back to the
-/// whole input, so a tool this list has never heard of still says something.
+/// The keys worth putting on the line itself, most telling first. A call that
+/// describes itself says that, since a sentence reads better than a command; a
+/// Bash call without one says its command, a file tool says its file; anything
+/// else falls back to the whole input, so a tool this list has never heard of
+/// still says something.
 const TOOL_SUMMARY_KEYS: [&str; 8] = [
+    "description",
     "command",
     "file_path",
     "path",
     "pattern",
     "url",
     "query",
-    "description",
     "prompt",
 ];
 
@@ -483,7 +485,12 @@ fn decisions_env(app: &AppHandle) -> HashMap<String, String> {
 /// startup files. A worker that cannot find the command commits its work and
 /// then never merges it, silently.
 #[tauri::command]
-pub fn worker_command() -> Result<String, String> {
+pub async fn worker_command() -> Result<String, String> {
+    crate::offload(worker_helper).await
+}
+
+/// The same path, for a caller already off the main thread.
+pub fn worker_helper() -> Result<String, String> {
     let here = std::env::current_exe()
         .map_err(|e| e.to_string())?
         .parent()
@@ -493,8 +500,38 @@ pub fn worker_command() -> Result<String, String> {
         } else {
             "berdloop-worker"
         });
-    check_worker_binary(&here)?;
+    if let Err(stale) = check_worker_binary(&here) {
+        // Build it rather than sending the developer to a terminal: the helper
+        // is stale because `tauri dev` rebuilt the app alone, and the one
+        // command that fixes it is the same every time.
+        rebuild_worker().map_err(|why| format!("{stale}\n\n{why}"))?;
+        check_worker_binary(&here)?;
+    }
     Ok(here.to_string_lossy().into_owned())
+}
+
+/// Build the helper from this crate, for a development app whose helper has
+/// fallen behind its source. A packaged app has no crate to build and no cargo
+/// to build it with, so it keeps the message that says what to rebuild.
+fn rebuild_worker() -> Result<(), String> {
+    if !cfg!(debug_assertions) {
+        return Err("Rebuild the app to get a matching worker helper.".into());
+    }
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let built = std::process::Command::new("cargo")
+        .args(["build", "--bins", "--manifest-path"])
+        .arg(&manifest)
+        .output()
+        .map_err(|e| format!("Building it here failed too: cargo could not be run ({e})."))?;
+    if built.status.success() {
+        return Ok(());
+    }
+    let why = String::from_utf8_lossy(&built.stderr);
+    let tail: Vec<&str> = why.lines().rev().take(20).collect();
+    Err(format!(
+        "Building it here failed too:\n{}",
+        tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+    ))
 }
 
 /// Refuse to start an agent whose helper is missing, before it can commit work
@@ -605,7 +642,7 @@ pub fn agent_start(
     // Every agent is given the worker helper's path in its orders, so no
     // launch path may skip the checks on it. A worker that cannot reach the
     // merge queue commits its work and then never merges it, quietly.
-    worker_command()?;
+    worker_helper()?;
     check_scope(&app, &scope)?;
     let settings = agent_preferences::read(&app)?;
     if let Some(choice) = settings.resolve(&scope.organization_id, &scope.project_id, &scope.role) {
@@ -1600,8 +1637,9 @@ mod tests {
         );
         let (kind, label) = &out[0];
         assert_eq!(*kind, "tool");
-        // The line itself says the command; the rest is the whole input, below.
-        assert_eq!(label.lines().next().unwrap(), "Bash · git status…");
+        // The line itself says what the call was for; the rest is the whole
+        // input, below.
+        assert_eq!(label.lines().next().unwrap(), "Bash · look");
         assert!(label.contains("\"description\": \"look\""));
         // Classification reads the line, never the arguments under it.
         assert!(!is_edit(tool_head(label)));
@@ -1834,6 +1872,23 @@ mod tests {
         assert!(refused.contains("cargo build --bins"), "{refused}");
 
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The repair the app runs for itself: the same build, from this crate.
+    /// It is the command going wrong that would strand the developer, so it is
+    /// run here, where a wrong manifest path or flag fails the suite.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn a_stale_worker_helper_is_rebuilt_where_it_stands() {
+        rebuild_worker().unwrap();
+        let helper = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/debug")
+            .join(if cfg!(windows) {
+                "berdloop-worker.exe"
+            } else {
+                "berdloop-worker"
+            });
+        assert!(check_worker_binary(&helper).is_ok());
     }
 
     #[test]
