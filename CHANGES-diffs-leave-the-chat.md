@@ -7,15 +7,15 @@ agent thread. The thread keeps the words.
 
 Two candidates were named in the ticket. **Both of them do it**, and the
 second only started to after this branch was cut. Every path that renders
-agent text was walked against `main` at `1eb01d2`, which this branch now
+agent text was walked against `main` at `7346398`, which this branch now
 carries; all five are below.
 
 - **The thread's message text. The first one.** `Log`
-  (`apps/desktop/src/queue.tsx:211`) renders `message.text` verbatim at
-  `queue.tsx:281`, so whatever an agent wrote arrives on screen as it was
+  (`apps/desktop/src/queue.tsx:219`) renders `message.text` verbatim at
+  `queue.tsx:313`, so whatever an agent wrote arrives on screen as it was
   written, fenced diff and all. One `Log`, through `AgentConversation`, is
   every thread in the app: the worker thread, the ticket agent's chat and the
-  planner's. The fix sits on the same path: `queue.tsx:236-246` runs
+  planner's. The fix sits on the same path: `queue.tsx:245-256` runs
   `stripDiffBodies` and `diffFiles` over each message before it is drawn.
 - **The tool line. The second one, and it is new.** The earlier reading of
   this — *"the tool line does not"* — was taken at `7b4fb46`, where a `"tool"`
@@ -29,8 +29,8 @@ carries; all five are below.
   - The stream loop's `"tool"` arm (`agent.rs:738`) no longer only counts the
     call: at `agent.rs:752` it appends a real thread message with role
     `"tool"`.
-  - `Log` (`queue.tsx:271`) and `Bubble` (`agent-chat.tsx:376`) draw that role
-    through `ToolLine` (`agent-chat.tsx:414`), whose `<details>` opens the
+  - `Log` (`queue.tsx:279`) and `Bubble` (`agent-chat.tsx:393`) draw that role
+    through `ToolLine` (`agent-chat.tsx:431`), whose `<details>` opens the
     full input in a `<pre>`.
 
   For an `Edit` call that input is `old_string` and `new_string` — the file's
@@ -40,17 +40,17 @@ carries; all five are below.
   JSON, so its newlines are `\n` escapes on a single line and no `@@` header
   is ever at the start of one. `stripToolBodies`
   (`apps/desktop/src/diff.ts:321`) is what handles it, below.
-- **The task row's one-line preview.** `queue.tsx:1116` shows the thread's
+- **The task row's one-line preview.** `queue.tsx:1164` shows the thread's
   latest message under each task. Since `1eb01d2` that message is very often a
   tool call, and a `<p>` collapses the newline, so the whole JSON input would
-  run along the row. `rowPreview` (`queue.tsx:204`) holds it to the same rule:
+  run along the row. `rowPreview` (`queue.tsx:212`) holds it to the same rule:
   a tool call shows its head line alone, anything else is stripped as the
   thread is.
 - **The Changes tab's own renderer is deliberate and stays.** `ChangesPanel`
   (`apps/desktop/src/changes-panel.tsx:53`) calls `parseDiff` at
   `changes-panel.tsx:173` to draw hunks. That is the one place a diff is meant
   to be read, so it is the destination of this ticket, not a path to strip.
-- **`Bubble`** (`apps/desktop/src/agent-chat.tsx:366`) would print
+- **`Bubble`** (`apps/desktop/src/agent-chat.tsx:383`) would print
   `message.text` verbatim in the same way. `AgentChat` is exported and not yet
   mounted — `queue.tsx:60` imports only `HumanRequestCard` and `ToolLine` from
   that module — but it is stripped alongside the live path so the two
@@ -149,13 +149,15 @@ has the file in it.
 
 ## Checks
 
-Re-run after the merge with `main` and the tool-line work:
+Re-run after the merge with `main` at `7346398` and the tool-line work:
 
 - `bun run typecheck` — clean across all six workspaces.
-- `bun test` — **234 pass, 0 fail**, 591 expect() calls across 21 files. The
-  new suites are in it: `diff.test.ts`, `diff-summary.test.ts`,
-  `changes-focus.test.ts`, `use-task-changes.test.ts`, and `main`'s
-  `send-shortcut.test.ts`.
+- `bun test` — **303 pass, 0 fail**, 745 expect() calls across 26 files. This
+  ticket's suites are in it — `diff.test.ts`, `diff-summary.test.ts`,
+  `changes-focus.test.ts`, `use-task-changes.test.ts` — and so are the ones
+  that came in with `main`: `send-shortcut.test.ts`, `drafts.test.ts`,
+  `new-ticket-draft.test.ts`, `use-draft.test.tsx`, `quote-prefill.test.ts`
+  and `ticket-search-draft.test.tsx`.
 - `bun run build` — the desktop and web production builds, both clean.
 - `bun run format:check` — clean.
 - `cargo fmt --check` — clean.
@@ -211,21 +213,25 @@ under *Where the row lands* above.
 
 ## The merge with `main`
 
-This branch was cut at `7b4fb46`, before three tickets landed, and `main` is
-now in it. The four files that conflicted, and how each was settled:
+This branch was cut at `7b4fb46`, before three tickets landed, and `main` at
+`7346398` is now in it. Four files conflicted, and each was settled by what
+the finished ticket has to do:
 
-- **`queue.tsx`** and **`agent-chat.tsx`**. Both sides kept. `main`
-  (LOCAL-192f8bfc, PR #4) added the Cmd+Enter send wiring and, in `1eb01d2`,
-  the `"tool"` role and its `ToolLine`; this branch reworked the same message
-  list to strip diffs and draw a row per file. A tool call takes the tool
-  line, everything else takes the rows, and the send shortcuts are untouched
-  by either.
+- **`queue.tsx`** and **`agent-chat.tsx`**. `main` added the Cmd+Enter send
+  wiring (LOCAL-192f8bfc), the draft persistence that rewrote the composer
+  (LOCAL-9b1540fd) and, in `1eb01d2`, the `"tool"` role and its `ToolLine`.
+  This branch reworked the same message list to strip diffs and draw a row per
+  file. All of it is kept. Where the two genuinely disagreed was the tool
+  line: an earlier resolution on this ticket exempted a `"tool"` message from
+  stripping, on the reading that its text is only a tool's name and arguments.
+  `1eb01d2` made that untrue — the arguments are the change — so the exemption
+  is gone and the message goes through `stripToolBodies` instead.
 - **`external-link.test.ts`**. Both sides made the same fix to the module
-  mock — keep the rest of `@tauri-apps/api/core` when faking `isTauri`.
-  `main`'s is the later of the two, and is the one kept.
-- **`package.json`**. Both sides added test files to the run. It lists both.
+  mock — keep the rest of `@tauri-apps/api/core` when faking `isTauri`. The
+  formatting `main` landed is the one kept.
+- **`package.json`**. Every side added test files to the run. It lists them
+  all.
 
-LOCAL-9b1540fd's `quote-prefill.ts` is **not** in `main` at `1eb01d2`, so the
-quote-to-composer step still goes through the local `quote` state in
-`queue.tsx`. When that ticket lands, the step should move onto
-`quote-prefill`, and the walkthrough's last box re-checked once it does.
+`quote-prefill.ts` came in with LOCAL-9b1540fd, so the quote-to-composer step
+now goes through it rather than the local `quote` state this branch had. The
+walkthrough's last box is owed a re-check on that path.

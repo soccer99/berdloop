@@ -7,6 +7,7 @@ import {
 } from "@tabler/icons-react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { useDraft } from "./drafts";
 
 /** A conversation the user's own CLI wrote to disk. We only ever read these. */
 interface SessionSummary {
@@ -57,8 +58,10 @@ export function SessionsView() {
   const [harness, setHarness] = useState<"Claude Code" | "Codex">(
     "Claude Code",
   );
-  const [cwd, setCwd] = useState("");
-  const [prompt, setPrompt] = useState("");
+  // The directory and the prompt are work a person typed, so they outlive
+  // leaving this view and coming back.
+  const [cwd, setCwd] = useDraft("agent-session:working-directory");
+  const [prompt, setPrompt] = useDraft("agent-session:prompt");
   const [runId, setRunId] = useState<string | null>(null);
   const [output, setOutput] = useState<string[]>([]);
   const tail = useRef<HTMLDivElement>(null);

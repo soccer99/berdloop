@@ -9,10 +9,12 @@ const opened: string[] = [];
 let tauri = false;
 
 /**
- * `mock.module` replaces the module for the whole test process, not just
- * this file, and the order test files run in differs between macOS and
- * Linux. Keep every other export, or whichever file happens to load
- * `invoke` after this one fails to find it.
+ * `mock.module` replaces the module for the whole run, not just this file, so
+ * the stand-in has to carry the rest of `core` with it. Most of the app imports
+ * `invoke` from here, and a namespace without it cannot be linked: leaving it
+ * out failed whichever unrelated files bun happened to load after this one.
+ * `tauri` is false by the time they do, which is what the real `isTauri` says
+ * outside a Tauri window anyway.
  */
 const core = await import("@tauri-apps/api/core");
 mock.module("@tauri-apps/api/core", () => ({
