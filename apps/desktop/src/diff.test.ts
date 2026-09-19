@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { parseDiff, quoteLine, stripDiffBodies } from "./diff";
+import { diffFiles, parseDiff, quoteLine, stripDiffBodies } from "./diff";
 
 describe("parseDiff", () => {
   test("numbers the lines of every hunk", () => {
@@ -227,5 +227,117 @@ describe("stripDiffBodies", () => {
         ].join("\n"),
       ),
     ).toBe("- and then I ran the tests\n- they pass");
+  });
+});
+
+describe("diffFiles", () => {
+  test("names nothing when the message holds no diff", () => {
+    expect(diffFiles("I read the file and it looked fine.")).toEqual([]);
+  });
+
+  test("names every file of a git diff, in the order written", () => {
+    const message = [
+      "Done. Here is what changed:",
+      "",
+      "```diff",
+      "diff --git a/apps/desktop/src/queue.tsx b/apps/desktop/src/queue.tsx",
+      "index 1111111..2222222 100644",
+      "--- a/apps/desktop/src/queue.tsx",
+      "+++ b/apps/desktop/src/queue.tsx",
+      "@@ -1,2 +1,2 @@",
+      "-old",
+      "+new",
+      "diff --git a/apps/desktop/src/diff.ts b/apps/desktop/src/diff.ts",
+      "--- a/apps/desktop/src/diff.ts",
+      "+++ b/apps/desktop/src/diff.ts",
+      "@@ -1,1 +1,2 @@",
+      " keep",
+      "+added",
+      "```",
+    ].join("\n");
+    expect(diffFiles(message)).toEqual([
+      { path: "apps/desktop/src/queue.tsx", status: "M" },
+      { path: "apps/desktop/src/diff.ts", status: "M" },
+    ]);
+  });
+
+  test("reads added, deleted and renamed from the headers", () => {
+    const message = [
+      "diff --git a/src/new.ts b/src/new.ts",
+      "new file mode 100644",
+      "--- /dev/null",
+      "+++ b/src/new.ts",
+      "@@ -0,0 +1 @@",
+      "+hello",
+      "diff --git a/src/gone.ts b/src/gone.ts",
+      "deleted file mode 100644",
+      "--- a/src/gone.ts",
+      "+++ /dev/null",
+      "@@ -1 +0,0 @@",
+      "-bye",
+      "diff --git a/src/was.ts b/src/now.ts",
+      "similarity index 98%",
+      "rename from src/was.ts",
+      "rename to src/now.ts",
+    ].join("\n");
+    expect(diffFiles(message)).toEqual([
+      { path: "src/new.ts", status: "A" },
+      { path: "src/gone.ts", status: "D" },
+      { path: "src/now.ts", status: "R" },
+    ]);
+  });
+
+  test("reads a bare --- / +++ pair with no git header above it", () => {
+    const message = [
+      "--- a/src/foo.ts\t2024-01-01",
+      "+++ b/src/foo.ts\t2024-01-02",
+      "@@ -1 +1 @@",
+      "-a",
+      "+b",
+    ].join("\n");
+    expect(diffFiles(message)).toEqual([{ path: "src/foo.ts", status: "M" }]);
+  });
+
+  test("a removed line reading like a header is not one", () => {
+    const message = [
+      "diff --git a/README.md b/README.md",
+      "--- a/README.md",
+      "+++ b/README.md",
+      "@@ -1,3 +1,2 @@",
+      "--- a/old/rule.md",
+      "+kept",
+    ].join("\n");
+    expect(diffFiles(message)).toEqual([{ path: "README.md", status: "M" }]);
+  });
+
+  test("a file quoted twice in one message is one row", () => {
+    const message = [
+      "First pass:",
+      "",
+      "@@ -1 +1 @@",
+      "-a",
+      "+b",
+      "",
+      "Then I fixed it:",
+      "",
+      "diff --git a/src/foo.ts b/src/foo.ts",
+      "--- a/src/foo.ts",
+      "+++ b/src/foo.ts",
+      "@@ -1 +1 @@",
+      "-b",
+      "+c",
+      "",
+      "diff --git a/src/foo.ts b/src/foo.ts",
+      "--- a/src/foo.ts",
+      "+++ b/src/foo.ts",
+      "@@ -2 +2 @@",
+      "-d",
+      "+e",
+    ].join("\n");
+    expect(diffFiles(message)).toEqual([{ path: "src/foo.ts", status: "M" }]);
+  });
+
+  test("a bullet list that looks like prose names no file", () => {
+    expect(diffFiles("- one\n- two\n--- a rule\n")).toEqual([]);
   });
 });

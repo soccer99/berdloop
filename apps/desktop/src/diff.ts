@@ -66,20 +66,20 @@ const DIFF_META =
 const HUNK_BODY = /^[-+\\ ]/;
 
 /**
- * A message's text with every diff in it taken out.
+ * A message split into the prose it keeps and the diffs taken out of it.
  *
- * Diffs belong in the Changes tab, so a hunk an agent pasted into its own
- * prose never reaches the thread. Only diff content goes: a line is read as
- * diff only when it sits under a `@@` header, a `diff --git` line or a
- * `---`/`+++` pair, or inside a fence that holds a diff. That is what leaves
- * a `- like this` bullet, a `--- ` rule and a `+1` alone.
+ * Only diff content is taken: a line is read as diff only when it sits under
+ * a `@@` header, a `diff --git` line or a `---`/`+++` pair, or inside a fence
+ * that holds a diff. That is what leaves a `- like this` bullet, a `--- ` rule
+ * and a `+1` alone.
  *
- * Text with no diff in it is returned exactly as it came.
+ * The thread's text and its file rows are both read from here, so the rows
+ * name exactly the files whose hunks went, and never one whose did not.
  */
-export function stripDiffBodies(text: string): string {
+function scanDiffs(text: string): { kept: string[]; diffs: string[][] } {
   const lines = text.split("\n");
   const kept: string[] = [];
-  let dropped = false;
+  const diffs: string[][] = [];
   let at = 0;
   while (at < lines.length) {
     const fence = FENCE.exec(lines[at]!);
@@ -88,27 +88,118 @@ export function stripDiffBodies(text: string): string {
       const body = lines.slice(at + 1, end);
       // A labelled fence is taken at its word; an unlabelled one is read.
       if (DIFF_FENCE.test(fence[2]!) || (!fence[2] && holdsDiff(body)))
-        dropped = true;
+        diffs.push(body);
       else kept.push(...lines.slice(at, Math.min(end + 1, lines.length)));
       at = end + 1;
       continue;
     }
     const end = diffRunEnd(lines, at);
     if (end > at) {
-      dropped = true;
+      diffs.push(lines.slice(at, end));
       at = end;
       continue;
     }
     kept.push(lines[at]!);
     at += 1;
   }
-  if (!dropped) return text;
+  return { kept, diffs };
+}
+
+/**
+ * A message's text with every diff in it taken out.
+ *
+ * Diffs belong in the Changes tab, so a hunk an agent pasted into its own
+ * prose never reaches the thread. What was taken out is named instead by
+ * `diffFiles`, one row per file.
+ *
+ * Text with no diff in it is returned exactly as it came.
+ */
+export function stripDiffBodies(text: string): string {
+  const { kept, diffs } = scanDiffs(text);
+  if (!diffs.length) return text;
   // Removing a diff from the middle of a message leaves the blank lines that
   // sat either side of it. Close the gap, so nothing shows where it was.
   return kept
     .join("\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
+}
+
+/** A file a message's own diff said it had changed. */
+export interface TouchedFile {
+  path: string;
+  /** The git status the diff's own headers spell out: A, M, D or R. */
+  status: "A" | "M" | "D" | "R";
+}
+
+/** `diff --git a/old b/new`. Paths holding a space are beyond telling apart. */
+const GIT_PAIR = /^diff --git a\/(.+) b\/(.+)$/;
+const OLD_HEADER = /^--- (.+)$/;
+const NEW_HEADER = /^\+\+\+ (.+)$/;
+const RENAME_TO = "rename to ";
+const NOTHING = "/dev/null";
+
+/**
+ * The files a message's diffs named, in the order they were written.
+ *
+ * These are the rows the thread shows where the hunks used to be. The status
+ * is only what the agent's own diff claimed; the line counts come from the
+ * Changes the repository reports, never from here.
+ *
+ * A file quoted twice in one message is one row, kept at its first place.
+ */
+export function diffFiles(text: string): TouchedFile[] {
+  const seen = new Set<string>();
+  return scanDiffs(text)
+    .diffs.flatMap(filesInDiff)
+    .filter((file) => !seen.has(file.path) && !!seen.add(file.path));
+}
+
+/** The path a `---` or `+++` header names, without its prefix or timestamp. */
+function headerPath(raw: string): string {
+  const path = raw.split("\t")[0]!.trimEnd();
+  return path === NOTHING ? path : path.replace(/^[ab]\//, "");
+}
+
+function filesInDiff(lines: string[]): TouchedFile[] {
+  const files: TouchedFile[] = [];
+  let open: TouchedFile | undefined;
+  for (let at = 0; at < lines.length; at += 1) {
+    const line = lines[at]!;
+    const git = GIT_PAIR.exec(line);
+    if (git) {
+      open = { path: git[2]!, status: git[1] === git[2] ? "M" : "R" };
+      files.push(open);
+      continue;
+    }
+    if (open) {
+      if (line.startsWith("new file mode")) open.status = "A";
+      else if (line.startsWith("deleted file mode")) open.status = "D";
+      else if (line.startsWith(RENAME_TO)) {
+        open.path = line.slice(RENAME_TO.length);
+        open.status = "R";
+      }
+    }
+    // Only a `---` with a `+++` under it counts, so a removed line that reads
+    // `--- something` inside a hunk is never mistaken for a file header.
+    const old = OLD_HEADER.exec(line);
+    const next = old && NEW_HEADER.exec(lines[at + 1] ?? "");
+    if (!old || !next) continue;
+    at += 1;
+    const from = headerPath(old[1]!);
+    const to = headerPath(next[1]!);
+    if (open) {
+      // `diff --git` already named both sides; the pair only says which way.
+      if (from === NOTHING) open.status = "A";
+      else if (to === NOTHING) open.status = "D";
+      open = undefined;
+      continue;
+    }
+    if (to !== NOTHING)
+      files.push({ path: to, status: from === NOTHING ? "A" : "M" });
+    else if (from !== NOTHING) files.push({ path: from, status: "D" });
+  }
+  return files;
 }
 
 /** The line holding the closing fence, or the end of the text if it is missing. */

@@ -59,7 +59,9 @@ import { HumanRequestCard } from "./agent-chat";
 import { orderAgentTasks, orderTickets, routeSteering } from "./jev";
 import { ChangesPanel } from "./changes-panel";
 import { useTaskChanges } from "./use-task-changes";
-import { stripDiffBodies } from "./diff";
+import { diffFiles, stripDiffBodies } from "./diff";
+import { ThreadFiles } from "./thread-files";
+import type { Changes } from "./changes-panel";
 import { openExternally } from "./external-link";
 
 interface QueueProps {
@@ -191,9 +193,14 @@ function Empty({
 function Log({
   messages,
   streaming,
+  changes,
+  onOpenChanges,
 }: {
   messages: ThreadMessage[];
   streaming?: boolean;
+  /** The task's changes, for the line counts on the file rows. */
+  changes?: Changes;
+  onOpenChanges?: (path: string) => void;
 }) {
   const scroll = useRef<HTMLDivElement>(null);
   const follow = useRef(true);
@@ -202,11 +209,16 @@ function Log({
       scroll.current.scrollTop = scroll.current.scrollHeight;
   }, [messages, streaming]);
   // A diff is read in the Changes tab, never here, so whatever an agent pasted
-  // into its own text is taken out before the thread draws it. A message that
-  // was nothing but a diff has nothing left to say and is not drawn at all.
+  // into its own text is taken out before the thread draws it and the files it
+  // named become one row each. A message that was nothing but a diff keeps its
+  // rows; one with neither words nor files left is not drawn at all.
   const shown = messages
-    .map((message) => ({ ...message, text: stripDiffBodies(message.text) }))
-    .filter((message) => message.text);
+    .map((message) => ({
+      ...message,
+      text: stripDiffBodies(message.text),
+      files: diffFiles(message.text),
+    }))
+    .filter((message) => message.text || message.files.length);
   return (
     <div
       className="wf-log"
@@ -259,7 +271,12 @@ function Log({
               </span>
             )}
           </div>
-          <p>{message.text}</p>
+          {message.text && <p>{message.text}</p>}
+          <ThreadFiles
+            files={message.files}
+            changes={changes}
+            onOpen={onOpenChanges}
+          />
         </article>
       ))}
       {streaming && (
@@ -402,6 +419,8 @@ function AgentConversation({
   targets,
   inlineSend,
   quote,
+  changes,
+  onOpenChanges,
 }: {
   messages: ThreadMessage[];
   streaming?: boolean;
@@ -413,10 +432,18 @@ function AgentConversation({
   inlineSend?: boolean;
   /** Text to put at the top of the draft. A new id applies it again. */
   quote?: { id: number; text: string };
+  /** The task's changes, for the line counts on the file rows. */
+  changes?: Changes;
+  onOpenChanges?: (path: string) => void;
 }) {
   return (
     <>
-      <Log messages={messages} streaming={streaming} />
+      <Log
+        messages={messages}
+        streaming={streaming}
+        changes={changes}
+        onOpenChanges={onOpenChanges}
+      />
       <Composer
         label={label}
         placeholder={placeholder}
@@ -1629,6 +1656,13 @@ export function QueueView({
                             }
                             connected={connected}
                             quote={quote}
+                            changes={changes.data}
+                            onOpenChanges={() =>
+                              setTaskTabs((current) => ({
+                                ...current,
+                                [selected.id]: "changes",
+                              }))
+                            }
                             onSend={(text, target) =>
                               send(selected.id, text, target, selected.id)
                             }

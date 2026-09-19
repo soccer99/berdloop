@@ -19,7 +19,9 @@ import {
   type AgentThreadView,
   type ThreadMessage,
 } from "./workflow-ui";
-import { stripDiffBodies } from "./diff";
+import { diffFiles, stripDiffBodies } from "./diff";
+import { ThreadFiles } from "./thread-files";
+import type { Changes } from "./changes-panel";
 
 /**
  * One agent conversation.
@@ -64,6 +66,8 @@ export interface AgentChatProps {
   onSend: (text: string) => void | Promise<void>;
   onStop?: () => void;
   placeholder?: string;
+  /** The task's changes, for the line counts on the file rows. */
+  changes?: Changes;
 }
 
 const DELIVERY_NOTE: Record<NonNullable<ThreadMessage["delivery"]>, string> = {
@@ -84,6 +88,7 @@ export function AgentChat({
   onSend,
   onStop,
   placeholder,
+  changes,
 }: AgentChatProps) {
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
@@ -192,7 +197,7 @@ export function AgentChat({
           </p>
         )}
         {messages.map((entry) => (
-          <Bubble key={entry.id} message={entry} />
+          <Bubble key={entry.id} message={entry} changes={changes} />
         ))}
         {streaming && !messages.length && <Loader size="xs" />}
         <div ref={tail} />
@@ -304,17 +309,31 @@ export function HumanRequestCard({
   );
 }
 
-function Bubble({ message }: { message: ThreadMessage }) {
+function Bubble({
+  message,
+  changes,
+}: {
+  message: ThreadMessage;
+  changes?: Changes;
+}) {
   // Diffs are read in the Changes tab. This chat shows what was said about a
-  // change, so a hunk pasted into the text goes before the bubble is drawn.
+  // change, so a hunk pasted into the text goes before the bubble is drawn,
+  // and the files it named become one row each in its place.
   const text = stripDiffBodies(message.text);
-  if (!text) return null;
+  const files = diffFiles(message.text);
+  if (!text && !files.length) return null;
   if (message.role === "system") {
-    return <p className="agent-chat-system">{text}</p>;
+    return (
+      <>
+        {text && <p className="agent-chat-system">{text}</p>}
+        <ThreadFiles files={files} changes={changes} />
+      </>
+    );
   }
   return (
     <div className={`agent-chat-message ${message.role}`}>
-      <p>{text}</p>
+      {text && <p>{text}</p>}
+      <ThreadFiles files={files} changes={changes} />
       {message.delivery && message.role === "user" && (
         <small className={message.delivery === "pending" ? "warn" : "muted"}>
           {DELIVERY_NOTE[message.delivery]}

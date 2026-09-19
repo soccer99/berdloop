@@ -38,8 +38,24 @@ or inside a fence labelled `diff`/`patch` or holding a hunk. That is what
 leaves a `- like this` bullet, a `---` rule, a `+1` and a `sh` fence alone. A
 message that was nothing but a diff is not drawn at all.
 
+## The row that stands in its place
+
+`diffFiles` in `apps/desktop/src/diff.ts` names the files each removed diff
+was about, reading the same regions `stripDiffBodies` takes out, so the rows
+name exactly the files whose hunks went. `ThreadFiles` in
+`apps/desktop/src/thread-files.tsx` draws one line per file — the verb, the
+left-truncated path with the whole path on hover, and the counts — and several
+files touched in one message are several rows, in the order the agent wrote
+them.
+
+The counts are read from the `Changes` the repository reports, the same value
+the Changes tab draws, never from the numbers an agent quoted. A file the
+changes command does not report, because it is untracked, ignored or was put
+back before the fetch, still gets its row, marked `no diff to show` and left
+unclickable rather than opening an empty tab. Every other row opens the
+Changes tab.
+
 ## Order
 
 This touches `queue.tsx` alongside LOCAL-9b1540fd and LOCAL-192f8bfc, and
-lands after them. The summary row that replaces a diff with one line
-(`edited path +24 -7`) is a later task; nothing here adds it.
+lands after them.
