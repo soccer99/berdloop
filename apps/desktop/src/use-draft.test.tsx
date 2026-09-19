@@ -18,7 +18,9 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { act } from "react";
 import { createRoot } from "react-dom/client";
 import {
+  packText,
   readDraftRecord,
+  unpackText,
   useDraft,
   type DraftOptions,
   type UseDraftResult,
@@ -236,6 +238,37 @@ describe("a rendered useDraft", () => {
     editor.type(seed);
 
     expect(stored("task-editor:task-3")).toBeNull();
+  });
+
+  test("clearing a packed seeded field stays cleared across a remount", () => {
+    // TaskEditor's Assigned agent: empty means the next available worker, so
+    // clearing it is an edit and not an untouched box. Packed, it is stored.
+    const options = { seed: packText("alice") };
+    const editor = mount("task-editor:task-3:assignee", options);
+    expect(unpackText(editor.value)).toBe("alice");
+
+    editor.type(packText(""));
+    expect(unpackText(editor.value)).toBe("");
+
+    // Closing the modal flips its key, so the editor really is torn down.
+    editor.unmount();
+
+    expect(
+      unpackText(mount("task-editor:task-3:assignee", options).value),
+    ).toBe("");
+  });
+
+  test("a packed seeded field nobody touched stores nothing", () => {
+    const options = { seed: packText("alice") };
+    const editor = mount("task-editor:task-3:assignee", options);
+
+    expect(stored("task-editor:task-3:assignee")).toBeNull();
+
+    // And editing it back to the saved value clears the entry again.
+    editor.type(packText("bo"));
+    expect(stored("task-editor:task-3:assignee")).not.toBeNull();
+    editor.type(packText("alice"));
+    expect(stored("task-editor:task-3:assignee")).toBeNull();
   });
 
   test("an updater sees the live text, and emptying removes the entry", () => {
