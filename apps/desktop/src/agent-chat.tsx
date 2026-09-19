@@ -19,8 +19,8 @@ import {
   type AgentThreadView,
   type ThreadMessage,
 } from "./workflow-ui";
-import { diffFiles, stripDiffBodies, stripToolBodies } from "./diff";
 import { ThreadFiles } from "./thread-files";
+import { threadRows, type ThreadRow } from "./thread-rows";
 import type { Changes } from "./changes-panel";
 import { useDraft } from "./drafts";
 import { shouldSendOnKey } from "./send-shortcut";
@@ -215,7 +215,7 @@ export function AgentChat({
               "Nothing said yet. Ask for a change, or steer the work."}
           </p>
         )}
-        {messages.map((entry) => (
+        {threadRows(messages).map((entry) => (
           <Bubble key={entry.id} message={entry} changes={changes} />
         ))}
         {streaming && !messages.length && <Loader size="xs" />}
@@ -384,21 +384,24 @@ function Bubble({
   message,
   changes,
 }: {
-  message: ThreadMessage;
+  message: ThreadRow;
   changes?: Changes;
 }) {
-  // A tool call is not something anybody said. It gets one line, never prose,
-  // and the input that opens under it has its change bodies taken out first:
-  // an Edit's before and after is a diff by another name.
-  if (message.role === "tool") {
-    return <ToolLine name={stripToolBodies(message.text)} />;
-  }
   // Diffs are read in the Changes tab. This chat shows what was said about a
-  // change, so a hunk pasted into the text goes before the bubble is drawn,
-  // and the files it named become one row each in its place.
-  const text = stripDiffBodies(message.text);
-  const files = diffFiles(message.text);
-  if (!text && !files.length) return null;
+  // change, and one row for each file the agent wrote; `threadRows` has
+  // already taken the hunks out, taken the change bodies out of a tool's
+  // input, and worked out which rows belong here.
+  const { text, files } = message;
+  if (message.role === "tool") {
+    // A tool call is not something anybody said. One that wrote a file is
+    // that file's row; every other gets one line, so a run of twenty of them
+    // still reads as one stretch of work.
+    return files.length ? (
+      <ThreadFiles files={files} changes={changes} />
+    ) : (
+      <ToolLine name={text} />
+    );
+  }
   if (message.role === "system") {
     return (
       <>

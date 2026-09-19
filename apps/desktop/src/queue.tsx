@@ -71,8 +71,9 @@ import { shouldSendOnKey } from "./send-shortcut";
 import { ChangesPanel } from "./changes-panel";
 import { useTaskChanges } from "./use-task-changes";
 import { focusFile, focusFor, type FocusRequest } from "./changes-focus";
-import { diffFiles, stripDiffBodies, stripToolBodies } from "./diff";
+import { stripDiffBodies, stripToolBodies } from "./diff";
 import { ThreadFiles } from "./thread-files";
+import { threadRows } from "./thread-rows";
 import type { Changes } from "./changes-panel";
 import { openExternally } from "./external-link";
 
@@ -236,23 +237,14 @@ function Log({
   }, [messages, streaming]);
   // A diff is read in the Changes tab, never here, so whatever an agent pasted
   // into its own text is taken out before the thread draws it and the files it
-  // named become one row each. A message that was nothing but a diff keeps its
-  // rows; one with neither words nor files left is not drawn at all.
+  // named become one row each. A message left with neither words nor files is
+  // not drawn at all.
   //
-  // A tool call is the other door a change comes through: its input holds an
-  // Edit's before and after, or a patch inside a Bash command. It is drawn as
-  // a tool line rather than prose, so it keeps its whole text bar the bodies.
-  const shown = messages
-    .map((message) =>
-      message.role === "tool"
-        ? { ...message, text: stripToolBodies(message.text), files: [] }
-        : {
-            ...message,
-            text: stripDiffBodies(message.text),
-            files: diffFiles(message.text),
-          },
-    )
-    .filter((message) => message.text || message.files.length);
+  // A tool call is the other door a change comes through, and the usual one:
+  // a harness sends prose in an agent message and a file change as a tool
+  // call. One that wrote a file becomes that file's row; every other keeps
+  // its line, bar the change bodies in its input.
+  const shown = threadRows(messages);
   return (
     <div
       className="wf-log"
@@ -274,10 +266,21 @@ function Log({
         </p>
       )}
       {shown.map((message) =>
-        // A tool call is not something anybody said. It gets one line, so a
-        // run of twenty of them still reads as one stretch of work.
+        // A tool call is not something anybody said, so it gets no name and
+        // no time above it. One that wrote a file is that file's row; every
+        // other gets one line, so a run of twenty still reads as one stretch
+        // of work.
         message.role === "tool" ? (
-          <ToolLine key={message.id} name={message.text} />
+          message.files.length ? (
+            <ThreadFiles
+              key={message.id}
+              files={message.files}
+              changes={changes}
+              onOpen={onOpenChanges}
+            />
+          ) : (
+            <ToolLine key={message.id} name={message.text} />
+          )
         ) : (
           <article
             className={`wf-message wf-message-${message.role}`}
