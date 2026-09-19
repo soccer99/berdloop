@@ -11,6 +11,22 @@ export interface RolePreference {
   systemPrompt?: string;
 }
 
+// What a person tells Berdloop about one ticket provider. The access token is
+// deliberately absent: it lives in a file only its owner can read, and the
+// host writes `connected` back here once a token has been saved.
+export interface IntegrationSettings {
+  jiraSite?: string;
+  jiraEmail?: string;
+  asanaWorkspace?: string;
+  connected: boolean;
+}
+
+export type ProviderConnections = Partial<
+  Record<ExternalProvider, IntegrationSettings>
+>;
+
+export type IntegrationScope = "organizations" | "projects";
+
 export interface AgentPreferences {
   organizations: Record<
     string,
@@ -21,12 +37,17 @@ export interface AgentPreferences {
     organizations: Record<string, ExternalProvider[]>;
     projects: Record<string, ExternalProvider[]>;
   };
+  integrations: {
+    organizations: Record<string, ProviderConnections>;
+    projects: Record<string, ProviderConnections>;
+  };
 }
 
 export const emptyAgentPreferences: AgentPreferences = {
   organizations: {},
   projects: {},
   ticketSources: { organizations: {}, projects: {} },
+  integrations: { organizations: {}, projects: {} },
 };
 
 export const agentRoles: { id: AgentRoleSetting; label: string }[] = [
@@ -73,5 +94,64 @@ export function patchRolePreference(
   return {
     ...preferences,
     [scope]: { ...preferences[scope], [scopeId]: roles },
+  };
+}
+
+// One field at a time: the project's value where it filled one in, and the
+// organization's everywhere else. The same merge resolveRolePreference does
+// for a prompt, and the one the settings window promises when it tells a
+// person a blank field falls back to the organization. Saving a project token
+// writes a project entry holding nothing but `connected`, so taking that entry
+// whole would drop a Jira site or an Asana workspace typed once at org scope.
+export function resolveIntegration(
+  preferences: AgentPreferences,
+  organizationId: string,
+  projectId: string,
+  provider: ExternalProvider,
+): IntegrationSettings | undefined {
+  const integrations =
+    preferences.integrations ?? emptyAgentPreferences.integrations;
+  const organization = integrations.organizations[organizationId]?.[provider];
+  const project = integrations.projects[projectId]?.[provider];
+  if (!organization && !project) return undefined;
+  const field = (read: (of?: IntegrationSettings) => string | undefined) => {
+    const own = read(project);
+    return own?.trim() ? own : read(organization);
+  };
+  return {
+    jiraSite: field((of) => of?.jiraSite),
+    jiraEmail: field((of) => of?.jiraEmail),
+    asanaWorkspace: field((of) => of?.asanaWorkspace),
+    // Whether a token was saved is not a field a person leaves blank: the
+    // scope that owns the token owns the answer.
+    connected: (project ?? organization)?.connected ?? false,
+  };
+}
+
+// Change one provider's connection at one scope, leaving every other scope,
+// provider and preference as it was.
+export function patchIntegration(
+  preferences: AgentPreferences,
+  scope: IntegrationScope,
+  scopeId: string,
+  provider: ExternalProvider,
+  patch: Partial<IntegrationSettings>,
+): AgentPreferences {
+  const integrations =
+    preferences.integrations ?? emptyAgentPreferences.integrations;
+  const scoped = integrations[scope];
+  const existing = scoped[scopeId]?.[provider] ?? { connected: false };
+  return {
+    ...preferences,
+    integrations: {
+      ...integrations,
+      [scope]: {
+        ...scoped,
+        [scopeId]: {
+          ...scoped[scopeId],
+          [provider]: { ...existing, ...patch },
+        },
+      },
+    },
   };
 }

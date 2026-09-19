@@ -1,43 +1,10 @@
 //! Ticket publication and independent review lifecycle.
+use crate::forge::{self, Forge, Pull};
 use crate::{git, workspace};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{path::Path, process::Command};
-
-/// The forge command line tool. Tests hand in a fake, so no real PR is ever
-/// made by a test; the app uses `gh` from PATH, or `BERDLOOP_GH` if set.
-pub struct Forge {
-    program: String,
-    env: Vec<(String, String)>,
-}
-
-impl Default for Forge {
-    fn default() -> Self {
-        Self {
-            program: std::env::var("BERDLOOP_GH").unwrap_or_else(|_| "gh".into()),
-            env: Vec::new(),
-        }
-    }
-}
-
-impl Forge {
-    fn run(&self, dir: &Path, args: &[&str]) -> Result<String, String> {
-        let output = Command::new(&self.program)
-            .args(args)
-            .envs(self.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-            .current_dir(dir)
-            .output()
-            .map_err(|error| format!("Could not run {}: {error}. Install the GitHub CLI and sign in with `gh auth login`.", self.program))?;
-        if !output.status.success() {
-            return Err(format!(
-                "{}: {}",
-                self.program,
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
-    }
-}
+use std::{path::Path, process::Command, sync::Mutex, time::Duration};
+use tauri::{Emitter, Manager};
 
 fn command(dir: &Path, program: &str, args: &[&str]) -> Result<String, String> {
     let output = Command::new(program)
@@ -77,7 +44,16 @@ pub struct ReviewContext {
 }
 
 #[tauri::command]
-pub fn publish_ticket_pr(
+pub async fn publish_ticket_pr(
+    app: tauri::AppHandle,
+    project_id: String,
+    ticket_id: String,
+    source: String,
+) -> Result<ReviewContext, String> {
+    crate::offload(move || publish_ticket_pr_blocking(app, project_id, ticket_id, source)).await
+}
+
+fn publish_ticket_pr_blocking(
     app: tauri::AppHandle,
     project_id: String,
     ticket_id: String,
@@ -89,7 +65,7 @@ pub fn publish_ticket_pr(
         &project_id,
         &ticket_id,
         &source,
-        &Forge::default(),
+        forge::for_repo(Path::new(&source))?.as_ref(),
     )
 }
 
@@ -103,7 +79,7 @@ pub fn publish(
     project_id: &str,
     ticket_id: &str,
     source: &str,
-    forge: &Forge,
+    forge: &dyn Forge,
 ) -> Result<ReviewContext, String> {
     let current = store.load()?;
     let ticket = current["tasks"]
@@ -156,32 +132,23 @@ pub fn publish(
             &format!("{published}:refs/heads/{published}"),
         ],
     )?;
-    let body_path = staging.root.join(format!("{}-pr-body.md", safe(&key)));
-    std::fs::write(&body_path, &criteria).map_err(|e| e.to_string())?;
-    let url = if let Some(url) = previous.and_then(|p| p["url"].as_str()) {
-        url.to_owned()
-    } else {
-        match forge.run(
-            source_path,
-            &["pr", "view", &published, "--json", "url", "--jq", ".url"],
-        ) {
-            Ok(url) if !url.is_empty() => url,
-            _ => forge.run(
-                source_path,
-                &[
-                    "pr",
-                    "create",
-                    "--head",
-                    &published,
-                    "--base",
-                    &prepared.base_branch,
-                    "--title",
-                    &format!("{}: {}", key, title),
-                    "--body-file",
-                    &body_path.to_string_lossy(),
-                ],
-            )?,
-        }
+    // A pull request this ticket already has is reused. Otherwise the host is
+    // asked whether the branch has one, because a person may have opened it.
+    let url = match previous.and_then(|p| p["url"].as_str()) {
+        Some(url) => url.to_owned(),
+        None => match forge.find(&published)? {
+            Some(pull) => pull.url,
+            None => {
+                forge
+                    .create(
+                        &published,
+                        &prepared.base_branch,
+                        &format!("{key}: {title}"),
+                        &criteria,
+                    )?
+                    .url
+            }
+        },
     };
     // The published commit changed, so any earlier approval no longer applies.
     let pull = json!({"url":url,"head":head,"baseBranch":prepared.base_branch,"review":"pending","merged":false});
@@ -225,7 +192,16 @@ pub struct PullState {
 /// itself says the branch is clean and every check passed. A manual policy
 /// leaves the PR alone and reports when a person merged it.
 #[tauri::command]
-pub fn ticket_pr_sync(
+pub async fn ticket_pr_sync(
+    app: tauri::AppHandle,
+    project_id: String,
+    ticket_id: String,
+    source: String,
+) -> Result<PullState, String> {
+    crate::offload(move || ticket_pr_sync_blocking(app, project_id, ticket_id, source)).await
+}
+
+fn ticket_pr_sync_blocking(
     app: tauri::AppHandle,
     project_id: String,
     ticket_id: String,
@@ -235,8 +211,7 @@ pub fn ticket_pr_sync(
         &workspace::for_app(&app)?,
         &project_id,
         &ticket_id,
-        Path::new(&source),
-        &Forge::default(),
+        forge::for_repo(Path::new(&source))?.as_ref(),
     )
 }
 
@@ -244,8 +219,7 @@ pub fn pr_sync(
     store: &workspace::Store,
     project_id: &str,
     ticket_id: &str,
-    source: &Path,
-    forge: &Forge,
+    forge: &dyn Forge,
 ) -> Result<PullState, String> {
     let current = store.load()?;
     let ticket = current["tasks"]
@@ -258,18 +232,8 @@ pub fn pr_sync(
     let url = pull["url"].as_str().ok_or("PR has no URL")?.to_owned();
     let head = pull["head"].as_str().ok_or("PR has no head")?.to_owned();
     let policy = ticket["mergePolicy"].as_str().unwrap_or("manual");
-    let raw = forge.run(
-        source,
-        &[
-            "pr",
-            "view",
-            &url,
-            "--json",
-            "state,headRefOid,mergeStateStatus,statusCheckRollup",
-        ],
-    )?;
-    let view: Value =
-        serde_json::from_str(&raw).map_err(|e| format!("gh returned invalid JSON: {e}"))?;
+    let pull_ref = Pull::from_url(&url)?;
+    let view = forge.view(&pull_ref)?;
     let mut state = pull_state(
         &view,
         &head,
@@ -277,11 +241,16 @@ pub fn pr_sync(
         policy,
     );
     if state == "ready-to-merge" {
-        forge.run(
-            source,
-            &["pr", "merge", &url, "--merge", "--match-head-commit", &head],
-        )?;
+        forge.merge(&pull_ref, &head)?;
         state = "merged".into();
+    }
+    // A broken build is treated as a reviewer would be: it says what is wrong,
+    // and the ticket goes back to the workers with that as its next work.
+    if state == "checks-failed" {
+        let findings = ci_findings(&view, &head);
+        if !findings.is_empty() {
+            store.change(|w| queue_fix_tasks(w, project_id, ticket_id, &findings))?;
+        }
     }
     store.change(|w| {
         let item = w["tasks"]
@@ -310,6 +279,66 @@ pub fn pr_sync(
     Ok(PullState { state, url })
 }
 
+/// One entry per check, keeping only the newest run of each.
+///
+/// A commit can carry more than one run of the same job: a rerun, or a `push`
+/// and a `pull_request` trigger firing together. The forge reports every one
+/// of them, so a stale failure sits in the rollup beside the green rerun that
+/// replaced it. Reading them all would call the pull request broken for as
+/// long as that stale entry lives.
+pub fn latest_checks(view: &Value) -> Vec<Value> {
+    let mut newest: std::collections::BTreeMap<String, ((String, i64), Value)> = Default::default();
+    for check in view["statusCheckRollup"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+    {
+        let key = format!(
+            "{}/{}",
+            check["workflowName"].as_str().unwrap_or(""),
+            check_name(&check)
+        );
+        // These stamps are ISO 8601 in UTC, so the newest is also the largest
+        // string. A rerun still running has no end, but a later start.
+        let at = ["completedAt", "startedAt", "createdAt"]
+            .iter()
+            .filter_map(|field| check[*field].as_str())
+            .max()
+            .unwrap_or("")
+            .to_owned();
+        // Two runs of one job really do finish in the same second, and then
+        // the timestamps cannot separate them. Every host numbers a newer run
+        // higher, so that number is the tie-break.
+        let rank = (at, check["order"].as_i64().unwrap_or_default());
+        match newest.get(&key) {
+            Some((seen, _)) if *seen >= rank => {}
+            _ => {
+                newest.insert(key, (rank, check));
+            }
+        }
+    }
+    newest.into_values().map(|(_, check)| check).collect()
+}
+
+fn check_name(check: &Value) -> &str {
+    check["name"]
+        .as_str()
+        .or(check["context"].as_str())
+        .unwrap_or("check")
+}
+
+fn verdict(check: &Value) -> String {
+    check["conclusion"]
+        .as_str()
+        .or(check["state"].as_str())
+        .unwrap_or("")
+        .to_uppercase()
+}
+
+fn check_failed(check: &Value) -> bool {
+    !["SUCCESS", "SKIPPED", "NEUTRAL"].contains(&verdict(check).as_str())
+}
+
 /// Decide what the PR needs from what the forge reports. Pure, so it is tested
 /// without a forge.
 pub fn pull_state(view: &Value, head: &str, review: &str, policy: &str) -> String {
@@ -321,34 +350,24 @@ pub fn pull_state(view: &Value, head: &str, review: &str, policy: &str) -> Strin
     if view["headRefOid"].as_str().is_some_and(|sha| sha != head) {
         return "head-moved".into();
     }
-    if review != "approved" {
-        return "open".into();
-    }
-    if policy != "automatic" {
-        return "waiting-for-human".into();
-    }
-    let checks = view["statusCheckRollup"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    let verdict = |check: &Value| {
-        check["conclusion"]
-            .as_str()
-            .or(check["state"].as_str())
-            .unwrap_or("")
-            .to_uppercase()
-    };
+    // The build is read before the review is. A failing build is work whoever
+    // reviews it, and waiting for a verdict that may never come left every
+    // broken pull request sitting still.
+    let checks = latest_checks(view);
     if checks.iter().any(|c| {
         verdict(c).is_empty()
             || ["PENDING", "IN_PROGRESS", "QUEUED", "EXPECTED"].contains(&verdict(c).as_str())
     }) {
         return "checks-pending".into();
     }
-    if checks
-        .iter()
-        .any(|c| !["SUCCESS", "SKIPPED", "NEUTRAL"].contains(&verdict(c).as_str()))
-    {
+    if checks.iter().any(check_failed) {
         return "checks-failed".into();
+    }
+    if review != "approved" {
+        return "open".into();
+    }
+    if policy != "automatic" {
+        return "waiting-for-human".into();
     }
     // The forge applies its own branch protection. Anything but CLEAN means a
     // rule it enforces is not met, and forcing past it is never our call.
@@ -356,6 +375,52 @@ pub fn pull_state(view: &Value, head: &str, review: &str, policy: &str) -> Strin
         return "blocked".into();
     }
     "ready-to-merge".into()
+}
+
+/// One fix task for each failing job.
+///
+/// The log is not read here. The worker is given the job's own address and
+/// reads exactly as much of the failure as it needs; copying a truncated log
+/// into the task would only take that choice away.
+pub fn ci_findings(view: &Value, head: &str) -> Vec<Value> {
+    latest_checks(view)
+        .iter()
+        .filter(|check| check_failed(check))
+        .map(|check| {
+            let name = check_name(check);
+            let workflow = check["workflowName"].as_str().unwrap_or("");
+            let url = check["detailsUrl"]
+                .as_str()
+                .or(check["targetUrl"].as_str())
+                .unwrap_or("");
+            // No command line tool is named. The job's own page holds the log,
+            // and a worker may have neither `gh` nor `glab` installed.
+            let where_from = if url.is_empty() {
+                "Find the failing job on the pull request.".to_string()
+            } else {
+                format!("The job and its log are at: {url}")
+            };
+            let criteria = [
+                if workflow.is_empty() {
+                    format!("The CI job \"{name}\" failed on commit {head}.")
+                } else {
+                    format!("The CI job \"{name}\" of workflow \"{workflow}\" failed on commit {head}.")
+                },
+                where_from,
+                "Fix the cause in the repository. Never change the CI settings to hide the failure."
+                    .into(),
+                format!("Done when \"{name}\" passes for this ticket's branch."),
+            ]
+            .join("\n");
+            json!({
+                "title": format!("Fix failing CI job: {name}"),
+                "criteria": criteria,
+                // Polling reports the same broken job over and over. This is
+                // what keeps it from becoming a new task every time.
+                "ciKey": format!("{head}:{name}"),
+            })
+        })
+        .collect()
 }
 
 fn review_context(
@@ -390,7 +455,15 @@ fn review_context(
 }
 
 #[tauri::command]
-pub fn pr_review_context(
+pub async fn pr_review_context(
+    app: tauri::AppHandle,
+    project_id: String,
+    ticket_id: String,
+) -> Result<ReviewContext, String> {
+    crate::offload(move || pr_review_context_blocking(app, project_id, ticket_id)).await
+}
+
+fn pr_review_context_blocking(
     app: tauri::AppHandle,
     project_id: String,
     ticket_id: String,
@@ -496,26 +569,169 @@ fn apply_review(
     });
     ticket["pullRequest"]["summary"] = json!(summary.trim());
     ticket["updatedAt"] = json!(workspace::now());
-    if !findings.is_empty() {
-        ticket["status"] = json!("running");
+    if findings.is_empty() {
+        return Ok(());
     }
-    if !findings.is_empty() {
-        let tickets = w["tasks"].as_array_mut().ok_or("Invalid tickets")?;
-        let position = tickets
-            .iter()
-            .position(|item| item["id"] == ticket_id)
-            .ok_or("Ticket disappeared")?;
-        let prioritized = tickets.remove(position);
-        tickets.insert(0, prioritized);
+    queue_fix_tasks(w, &scope.project_id, ticket_id, findings)
+}
+
+/// Put fix tasks at the front of a ticket's queue and send it back to work.
+///
+/// Both the reviewer and a failing build arrive here, because the answer to
+/// each is the same: work this ticket before any other. A finding that
+/// carries a `ciKey` is queued once only. The build is polled again and
+/// again, and the same broken job must not become a new task every time.
+pub fn queue_fix_tasks(
+    w: &mut Value,
+    project_id: &str,
+    ticket_id: &str,
+    findings: &[Value],
+) -> Result<(), String> {
+    let queued: std::collections::HashSet<String> = w["agentTasks"]
+        .as_array()
+        .ok_or("Invalid tasks")?
+        .iter()
+        .filter(|task| task["parentTaskId"] == ticket_id)
+        .filter_map(|task| task["ciKey"].as_str().map(str::to_owned))
+        .collect();
+    let fresh: Vec<&Value> = findings
+        .iter()
+        .filter(|finding| {
+            finding["ciKey"]
+                .as_str()
+                .is_none_or(|key| !queued.contains(key))
+        })
+        .collect();
+    if fresh.is_empty() {
+        return Ok(());
     }
+
     let now = workspace::now();
+    let tickets = w["tasks"].as_array_mut().ok_or("Invalid tickets")?;
+    let position = tickets
+        .iter()
+        .position(|item| item["id"] == ticket_id && item["projectId"] == project_id)
+        .ok_or("Ticket disappeared")?;
+    // The ticket has work again, so it leaves review and goes to the front.
+    tickets[position]["status"] = json!("running");
+    tickets[position]["stage"] = json!("Engineer");
+    tickets[position]["updatedAt"] = json!(now);
+    let prioritized = tickets.remove(position);
+    tickets.insert(0, prioritized);
+
     let tasks = w["agentTasks"].as_array_mut().ok_or("Invalid tasks")?;
-    for finding in findings.iter().rev() {
-        tasks.insert(0,json!({"id":uuid::Uuid::new_v4().to_string(),"parentTaskId":ticket_id,
+    for finding in fresh.iter().rev() {
+        let mut task = json!({"id":uuid::Uuid::new_v4().to_string(),"parentTaskId":ticket_id,
                 "title":finding["title"],"criteria":finding["criteria"],"prompt":finding["criteria"],
-                "dependencyIds":[],"status":"ready","reviewFix":true,"createdAt":now,"updatedAt":now}));
+                "dependencyIds":[],"status":"ready","reviewFix":true,"createdAt":now,"updatedAt":now});
+        if let Some(key) = finding["ciKey"].as_str() {
+            task["ciKey"] = json!(key);
+        }
+        tasks.insert(0, task);
     }
     Ok(())
+}
+
+/// A project the watcher may run the forge tool in.
+///
+/// Projects live in the window, not here, so the window hands them over. A
+/// project it has not named is simply not watched.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchedProject {
+    pub id: String,
+    pub path: String,
+}
+
+#[derive(Default)]
+pub struct Watched(pub Mutex<Vec<WatchedProject>>);
+
+#[tauri::command]
+pub fn watch_projects(watched: tauri::State<'_, Watched>, projects: Vec<WatchedProject>) {
+    *watched.0.lock().unwrap() = projects;
+}
+
+/// How often every open pull request is compared with the forge.
+const WATCH_SECS: u64 = 30;
+
+/// Follow every open pull request, in every project, for as long as the app
+/// runs.
+///
+/// The Ralph loop does this for one project only, and only while a person has
+/// it running. A build finishes on its own schedule, so waiting for the loop
+/// left failing pull requests sitting untouched. This asks the forge instead,
+/// and `pr_sync` turns each answer into the same records the loop reads: fix
+/// tasks for a broken build, a completed ticket for a merge.
+///
+/// Starting review agents is still the window's job. Only the records are
+/// kept here.
+///
+/// ponytail: every open pull request is asked about on every pass. Keep a
+/// per-ticket backoff if the forge ever rate limits.
+pub fn watch(app: tauri::AppHandle) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(WATCH_SECS));
+        if let Err(error) = watch_pass(&app) {
+            eprintln!("could not follow pull requests: {error}");
+        }
+    });
+}
+
+fn watch_pass(app: &tauri::AppHandle) -> Result<(), String> {
+    let projects = app.state::<Watched>().0.lock().unwrap().clone();
+    if projects.is_empty() {
+        return Ok(());
+    }
+    let store = workspace::for_app(app)?;
+    let before = store.load()?;
+    // One connection per project, not per pull request: reading the remote and
+    // the saved sign-in costs two git calls, and neither changes within a pass.
+    let mut forges: std::collections::HashMap<String, Result<Box<dyn Forge>, String>> =
+        Default::default();
+    for (project_id, ticket_id) in open_pulls(&before) {
+        let Some(project) = projects.iter().find(|item| item.id == project_id) else {
+            continue;
+        };
+        let forge = forges
+            .entry(project_id.clone())
+            .or_insert_with(|| forge::for_repo(Path::new(&project.path)));
+        // One pull request the host cannot answer for must not stop the rest.
+        let outcome = match forge {
+            Ok(forge) => pr_sync(&store, &project_id, &ticket_id, forge.as_ref()),
+            Err(error) => Err(error.clone()),
+        };
+        if let Err(error) = outcome {
+            eprintln!("{ticket_id}: {error}");
+        }
+    }
+    if store.load()? != before {
+        // The window keeps its own copy and only reads records back when it
+        // writes. Without this it would show yesterday's board.
+        app.emit("workspace-changed", ())
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Every ticket with a pull request that is not finished with.
+fn open_pulls(w: &Value) -> Vec<(String, String)> {
+    w["tasks"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter(|ticket| {
+            ticket.get("pullRequest").is_some()
+                && ticket["pullRequest"]["merged"] != json!(true)
+                && ticket["status"] != "complete"
+        })
+        .filter_map(|ticket| {
+            Some((
+                ticket["projectId"].as_str()?.to_owned(),
+                ticket["id"].as_str()?.to_owned(),
+            ))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -537,6 +753,66 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A host that answers from a file and writes down what it was asked.
+    ///
+    /// Both live on disk rather than in the struct, so a fresh one still sees
+    /// what an earlier call did, exactly as a real host would.
+    struct Fake {
+        log: std::path::PathBuf,
+        view: std::path::PathBuf,
+        reachable: bool,
+    }
+
+    impl Fake {
+        fn say(&self, line: &str) -> Result<(), String> {
+            if !self.reachable {
+                return Err("Could not reach example.test".into());
+            }
+            use std::io::Write;
+            writeln!(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.log)
+                    .unwrap(),
+                "{line}"
+            )
+            .unwrap();
+            Ok(())
+        }
+    }
+
+    impl Forge for Fake {
+        fn find(&self, branch: &str) -> Result<Option<Pull>, String> {
+            self.say(&format!("find {branch}"))?;
+            Ok(None)
+        }
+
+        fn create(&self, head: &str, base: &str, title: &str, _body: &str) -> Result<Pull, String> {
+            self.say(&format!("create {head} into {base}: {title}"))?;
+            Ok(Pull {
+                url: "https://example.test/pr/1".into(),
+                number: 1,
+            })
+        }
+
+        fn view(&self, pull: &Pull) -> Result<Value, String> {
+            self.say(&format!("view {}", pull.number))?;
+            serde_json::from_str(&std::fs::read_to_string(&self.view).unwrap_or_default())
+                .map_err(|error| error.to_string())
+        }
+
+        fn merge(&self, pull: &Pull, head: &str) -> Result<(), String> {
+            self.say(&format!("merge {} at {head}", pull.number))?;
+            std::fs::write(&self.view, r#"{"state":"MERGED"}"#).unwrap();
+            Ok(())
+        }
+
+        fn describe(&self) -> String {
+            "the test host".into()
+        }
     }
 
     /// A user's checkout with a bare "GitHub" behind it, a fake `gh` that logs
@@ -569,14 +845,6 @@ mod tests {
                 &["git", "remote", "add", "origin", remote.to_str().unwrap()],
             );
             sh(&source, &["git", "push", "--quiet", "origin", "main"]);
-            let fake = root.join("gh");
-            std::fs::write(
-                &fake,
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$BERDLOOP_GH_LOG\"\ncase \"$1 $2\" in\n  \"pr view\") cat \"$BERDLOOP_GH_VIEW\" ;;\n  \"pr create\") echo https://example.test/pr/1 ;;\n  \"pr merge\") echo '{\"state\":\"MERGED\"}' > \"$BERDLOOP_GH_VIEW\" ;;\nesac\n",
-            )
-            .unwrap();
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
             std::fs::write(root.join("view.json"), "").unwrap();
             let store = workspace::Store(root.join("tasks.json"));
             let staging = git::Staging::new(root.join("staging"));
@@ -589,24 +857,17 @@ mod tests {
             }
         }
 
-        fn forge(&self) -> Forge {
-            Forge {
-                program: self.root.join("gh").to_string_lossy().into_owned(),
-                env: vec![
-                    (
-                        "BERDLOOP_GH_LOG".into(),
-                        self.root.join("gh.log").to_string_lossy().into_owned(),
-                    ),
-                    (
-                        "BERDLOOP_GH_VIEW".into(),
-                        self.root.join("view.json").to_string_lossy().into_owned(),
-                    ),
-                ],
+        fn forge(&self) -> Fake {
+            Fake {
+                log: self.root.join("calls.log"),
+                view: self.root.join("view.json"),
+                reachable: true,
             }
         }
 
-        fn gh_log(&self) -> String {
-            std::fs::read_to_string(self.root.join("gh.log")).unwrap_or_default()
+        /// What the host was asked to do, in order.
+        fn calls(&self) -> String {
+            std::fs::read_to_string(self.root.join("calls.log")).unwrap_or_default()
         }
 
         fn view(&self, json: &str) {
@@ -675,7 +936,7 @@ mod tests {
             "main"
         );
         assert!(sh(&bench.source, &["git", "status", "--porcelain"]).is_empty());
-        // Publishing again reuses the PR: gh pr create ran exactly once.
+        // Publishing again reuses the PR: it was created exactly once.
         let again = publish(
             &bench.store,
             &bench.staging,
@@ -686,17 +947,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(again.url, first.url);
-        assert_eq!(bench.gh_log().matches("pr create").count(), 1);
+        assert_eq!(bench.calls().matches("create ").count(), 1);
 
         // Not approved yet: nothing merges whatever the forge says.
         bench.view(&format!(r#"{{"state":"OPEN","headRefOid":"{}","mergeStateStatus":"CLEAN","statusCheckRollup":[]}}"#, first.head));
         assert_eq!(
-            pr_sync(&bench.store, "p", "t1", &bench.source, &bench.forge())
+            pr_sync(&bench.store, "p", "t1", &bench.forge())
                 .unwrap()
                 .state,
             "open"
         );
-        assert!(!bench.gh_log().contains("pr merge"));
+        assert!(!bench.calls().contains("merge "));
 
         // Approve the exact head.
         let scope = Scope {
@@ -712,14 +973,14 @@ mod tests {
         // A pending check holds the merge; a failed one refuses it.
         bench.view(&format!(r#"{{"state":"OPEN","headRefOid":"{}","mergeStateStatus":"CLEAN","statusCheckRollup":[{{"conclusion":"","status":"IN_PROGRESS"}}]}}"#, first.head));
         assert_eq!(
-            pr_sync(&bench.store, "p", "t1", &bench.source, &bench.forge())
+            pr_sync(&bench.store, "p", "t1", &bench.forge())
                 .unwrap()
                 .state,
             "checks-pending"
         );
         bench.view(&format!(r#"{{"state":"OPEN","headRefOid":"{}","mergeStateStatus":"CLEAN","statusCheckRollup":[{{"conclusion":"FAILURE"}}]}}"#, first.head));
         assert_eq!(
-            pr_sync(&bench.store, "p", "t1", &bench.source, &bench.forge())
+            pr_sync(&bench.store, "p", "t1", &bench.forge())
                 .unwrap()
                 .state,
             "checks-failed"
@@ -727,7 +988,7 @@ mod tests {
         // Branch protection on the forge is respected, never forced.
         bench.view(&format!(r#"{{"state":"OPEN","headRefOid":"{}","mergeStateStatus":"BLOCKED","statusCheckRollup":[{{"conclusion":"SUCCESS"}}]}}"#, first.head));
         assert_eq!(
-            pr_sync(&bench.store, "p", "t1", &bench.source, &bench.forge())
+            pr_sync(&bench.store, "p", "t1", &bench.forge())
                 .unwrap()
                 .state,
             "blocked"
@@ -735,14 +996,14 @@ mod tests {
         // A commit pushed behind our back invalidates the approval.
         bench.view(r#"{"state":"OPEN","headRefOid":"someone-else","mergeStateStatus":"CLEAN","statusCheckRollup":[{"conclusion":"SUCCESS"}]}"#);
         assert_eq!(
-            pr_sync(&bench.store, "p", "t1", &bench.source, &bench.forge())
+            pr_sync(&bench.store, "p", "t1", &bench.forge())
                 .unwrap()
                 .state,
             "head-moved"
         );
         assert_eq!(bench.ticket()["pullRequest"]["review"], "pending");
         assert_eq!(bench.ticket()["pullRequest"]["head"], "someone-else");
-        assert!(!bench.gh_log().contains("pr merge"));
+        assert!(!bench.calls().contains("merge "));
 
         // Back on the reviewed head, approved, green and clean: it merges, and
         // only with the head pinned.
@@ -756,18 +1017,17 @@ mod tests {
             .unwrap();
         bench.view(&format!(r#"{{"state":"OPEN","headRefOid":"{}","mergeStateStatus":"CLEAN","statusCheckRollup":[{{"conclusion":"SUCCESS"}},{{"state":"SUCCESS"}}]}}"#, first.head));
         assert_eq!(
-            pr_sync(&bench.store, "p", "t1", &bench.source, &bench.forge())
+            pr_sync(&bench.store, "p", "t1", &bench.forge())
                 .unwrap()
                 .state,
             "merged"
         );
         assert!(
-            bench.gh_log().contains(&format!(
-                "pr merge https://example.test/pr/1 --merge --match-head-commit {}",
-                first.head
-            )),
+            bench
+                .calls()
+                .contains(&format!("merge 1 at {}", first.head)),
             "{}",
-            bench.gh_log()
+            bench.calls()
         );
         let done = bench.ticket();
         assert_eq!(done["status"], "complete");
@@ -798,16 +1058,16 @@ mod tests {
         submit_to(&bench.store, &scope, &published.head, "Fine", "[]").unwrap();
         bench.view(&format!(r#"{{"state":"OPEN","headRefOid":"{}","mergeStateStatus":"CLEAN","statusCheckRollup":[{{"conclusion":"SUCCESS"}}]}}"#, published.head));
         assert_eq!(
-            pr_sync(&bench.store, "p", "t1", &bench.source, &bench.forge())
+            pr_sync(&bench.store, "p", "t1", &bench.forge())
                 .unwrap()
                 .state,
             "waiting-for-human"
         );
-        assert!(!bench.gh_log().contains("pr merge"));
+        assert!(!bench.calls().contains("merge "));
         assert_eq!(bench.ticket()["status"], "review");
         bench.view(r#"{"state":"MERGED"}"#);
         assert_eq!(
-            pr_sync(&bench.store, "p", "t1", &bench.source, &bench.forge())
+            pr_sync(&bench.store, "p", "t1", &bench.forge())
                 .unwrap()
                 .state,
             "merged"
@@ -820,9 +1080,10 @@ mod tests {
     fn a_forge_that_cannot_be_reached_is_an_error_not_a_merge() {
         let bench = Bench::new();
         finished_ticket(&bench, "automatic");
-        let missing = Forge {
-            program: bench.root.join("missing-gh").to_string_lossy().into_owned(),
-            env: vec![],
+        let missing = Fake {
+            log: bench.root.join("calls.log"),
+            view: bench.root.join("view.json"),
+            reachable: false,
         };
         let refused = publish(
             &bench.store,
@@ -832,10 +1093,102 @@ mod tests {
             bench.source.to_str().unwrap(),
             &missing,
         );
-        assert!(refused.unwrap_err().contains("Could not run"));
+        assert!(refused.unwrap_err().contains("Could not reach"));
         // The ticket is untouched and can be retried.
         assert_eq!(bench.ticket()["status"], "running");
         assert!(bench.ticket().get("pullRequest").is_none());
+    }
+
+    /// The watcher asks the forge about pull requests it can still change.
+    #[test]
+    fn only_unfinished_pull_requests_are_followed() {
+        let w = json!({"tasks":[
+            {"id":"no-pr","projectId":"p","status":"running"},
+            {"id":"open","projectId":"p","status":"review","pullRequest":{"merged":false}},
+            {"id":"failing","projectId":"p","status":"running","pullRequest":{"merged":false}},
+            {"id":"merged","projectId":"p","status":"complete","pullRequest":{"merged":true}}
+        ]});
+        assert_eq!(
+            open_pulls(&w),
+            vec![
+                ("p".to_string(), "open".to_string()),
+                ("p".to_string(), "failing".to_string())
+            ]
+        );
+    }
+
+    /// The real shape of PR #3: two runs of the same workflow on one commit,
+    /// the older one red. Reading both would keep the PR broken for good.
+    #[test]
+    fn a_rerun_replaces_the_run_it_repeated() {
+        let head = "abc";
+        // Straight from PR #3: the repaired "frontend" finished in the very
+        // same second as the one it replaced, so only the id tells them apart.
+        let rollup = r#"[
+          {"name":"frontend","conclusion":"SUCCESS","startedAt":"2026-09-18T21:34:33Z","completedAt":"2026-09-18T21:34:48Z","order":105769425547,"detailsUrl":"https://x/actions/runs/2/job/22"},
+          {"name":"frontend","conclusion":"FAILURE","startedAt":"2026-09-18T21:34:32Z","completedAt":"2026-09-18T21:34:48Z","order":105769422249,"detailsUrl":"https://x/actions/runs/1/job/11"},
+          {"name":"desktop","conclusion":"FAILURE","startedAt":"2026-09-18T21:34:37Z","completedAt":"2026-09-18T21:34:58Z","order":105769421868,"detailsUrl":"https://x/actions/runs/1/job/33"}
+        ]"#;
+        let view: Value = serde_json::from_str(&format!(
+            r#"{{"state":"OPEN","headRefOid":"{head}","mergeStateStatus":"CLEAN","statusCheckRollup":{rollup}}}"#
+        ))
+        .unwrap();
+        assert_eq!(latest_checks(&view).len(), 2);
+        // Still failed, but only because of "desktop". "frontend" was repaired.
+        assert_eq!(
+            pull_state(&view, head, "approved", "automatic"),
+            "checks-failed"
+        );
+        let findings = ci_findings(&view, head);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0]["ciKey"], json!("abc:desktop"));
+        let criteria = findings[0]["criteria"].as_str().unwrap();
+        // The worker is pointed at the job, not at a tool it may not have.
+        assert!(
+            criteria.contains("https://x/actions/runs/1/job/33"),
+            "{criteria}"
+        );
+        assert!(!criteria.contains("gh "), "{criteria}");
+    }
+
+    /// A build is watched before anyone reviews it, and reports the same
+    /// broken job every poll. Each poll must not add another task.
+    #[test]
+    fn a_failing_build_queues_its_fix_once_without_waiting_for_a_review() {
+        let head = "abc";
+        let view: Value = serde_json::from_str(&format!(
+            r#"{{"state":"OPEN","headRefOid":"{head}","mergeStateStatus":"CLEAN","statusCheckRollup":[{{"name":"desktop","workflowName":"Verify","conclusion":"FAILURE","completedAt":"2026-09-18T21:34:58Z","detailsUrl":"https://x/actions/runs/1/job/33"}}]}}"#
+        ))
+        .unwrap();
+        // The review has not been submitted, and the old code stopped here.
+        assert_eq!(
+            pull_state(&view, head, "pending", "manual"),
+            "checks-failed"
+        );
+
+        let mut w = json!({"schemaVersion":1,
+            "tasks":[{"id":"other","projectId":"p"},
+                     {"id":"t","projectId":"p","status":"review","stage":"Review"}],
+            "agentTasks":[{"id":"done","parentTaskId":"t","status":"complete"}]});
+        let findings = ci_findings(&view, head);
+        queue_fix_tasks(&mut w, "p", "t", &findings).unwrap();
+        queue_fix_tasks(&mut w, "p", "t", &findings).unwrap();
+
+        assert_eq!(
+            w["tasks"][0]["id"],
+            json!("t"),
+            "the ticket jumps the queue"
+        );
+        assert_eq!(w["tasks"][0]["status"], json!("running"));
+        assert_eq!(w["tasks"][0]["stage"], json!("Engineer"));
+        let fixes: Vec<_> = w["agentTasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|task| task["reviewFix"] == json!(true))
+            .collect();
+        assert_eq!(fixes.len(), 1, "polling must not queue the same job twice");
+        assert_eq!(fixes[0]["status"], json!("ready"));
     }
 
     #[test]

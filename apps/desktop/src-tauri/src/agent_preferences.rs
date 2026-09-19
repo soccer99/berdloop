@@ -29,6 +29,8 @@ pub struct AgentPreferences {
     pub projects: HashMap<String, HashMap<String, RolePreference>>,
     #[serde(default)]
     pub ticket_sources: TicketSources,
+    #[serde(default)]
+    pub integrations: Integrations,
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -37,6 +39,30 @@ pub struct TicketSources {
     pub organizations: HashMap<String, Vec<String>>,
     #[serde(default)]
     pub projects: HashMap<String, Vec<String>>,
+}
+
+/// What a person told Berdloop about one ticket provider. The access token is
+/// not here: it lives in `integration_secrets`, in a file only its owner can
+/// read. `connected` is the status the host writes once a token was saved.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Integration {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jira_site: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jira_email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asana_workspace: Option<String>,
+    #[serde(default)]
+    pub connected: bool,
+}
+
+#[derive(Clone, Default, Deserialize, Serialize)]
+pub struct Integrations {
+    #[serde(default)]
+    pub organizations: HashMap<String, HashMap<String, Integration>>,
+    #[serde(default)]
+    pub projects: HashMap<String, HashMap<String, Integration>>,
 }
 
 impl AgentPreferences {
@@ -70,6 +96,50 @@ impl AgentPreferences {
             system_prompt: project
                 .and_then(|p| p.system_prompt.clone())
                 .or_else(|| organization.and_then(|p| p.system_prompt.clone())),
+        })
+    }
+
+    /// One field at a time: the project's value where it filled one in, and
+    /// the organization's everywhere else. The same merge `resolve` does for
+    /// a model and a prompt, and the one the settings window promises when it
+    /// tells a person a blank field falls back to the organization. Saving a
+    /// project token writes a project entry holding nothing but `connected`,
+    /// so taking that entry whole would drop the Jira site and the Asana
+    /// workspace a person only ever typed once.
+    pub fn resolve_integration(
+        &self,
+        organization_id: &str,
+        project_id: &str,
+        provider: &str,
+    ) -> Option<Integration> {
+        let organization = self
+            .integrations
+            .organizations
+            .get(organization_id)
+            .and_then(|providers| providers.get(provider));
+        let project = self
+            .integrations
+            .projects
+            .get(project_id)
+            .and_then(|providers| providers.get(provider));
+        if organization.is_none() && project.is_none() {
+            return None;
+        }
+        let field = |read: fn(&Integration) -> &Option<String>| {
+            project
+                .map(read)
+                .cloned()
+                .flatten()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| organization.map(read).cloned().flatten())
+        };
+        Some(Integration {
+            jira_site: field(|connection| &connection.jira_site),
+            jira_email: field(|connection| &connection.jira_email),
+            asana_workspace: field(|connection| &connection.asana_workspace),
+            // Whether a token was saved is not a field a person leaves blank:
+            // the scope that owns the token owns the answer.
+            connected: project.or(organization).is_some_and(|c| c.connected),
         })
     }
 }
@@ -269,6 +339,171 @@ mod tests {
                 .model
                 .as_deref(),
             Some("org-model")
+        );
+    }
+
+    fn connection(site: &str) -> Integration {
+        Integration {
+            jira_site: Some(site.into()),
+            jira_email: Some("person@example.com".into()),
+            asana_workspace: None,
+            connected: true,
+        }
+    }
+
+    #[test]
+    fn a_project_integration_overrides_the_organization_one() {
+        let mut settings = AgentPreferences::default();
+        settings
+            .integrations
+            .organizations
+            .entry("org".into())
+            .or_default()
+            .insert("Jira".into(), connection("https://org.atlassian.net"));
+        settings
+            .integrations
+            .projects
+            .entry("project".into())
+            .or_default()
+            .insert("Jira".into(), connection("https://project.atlassian.net"));
+        assert_eq!(
+            settings
+                .resolve_integration("org", "project", "Jira")
+                .unwrap()
+                .jira_site
+                .unwrap(),
+            "https://project.atlassian.net"
+        );
+        assert_eq!(
+            settings
+                .resolve_integration("org", "other", "Jira")
+                .unwrap()
+                .jira_site
+                .unwrap(),
+            "https://org.atlassian.net"
+        );
+        assert!(settings
+            .resolve_integration("org", "project", "Linear")
+            .is_none());
+    }
+
+    /// Saving a token at project scope writes `{connected: true}` and nothing
+    /// else, which is exactly what `integration_secrets::mark_connected` does.
+    /// Taking that entry whole used to hide the Jira site and the Asana
+    /// workspace held by the organization, so the picker refused a project
+    /// whose settings said it was connected.
+    #[test]
+    fn a_project_entry_holding_only_a_token_keeps_the_organizations_fields() {
+        let mut settings = AgentPreferences::default();
+        let organization = settings
+            .integrations
+            .organizations
+            .entry("org".into())
+            .or_default();
+        organization.insert("Jira".into(), connection("https://org.atlassian.net"));
+        organization.insert(
+            "Asana".into(),
+            Integration {
+                asana_workspace: Some("1234".into()),
+                connected: true,
+                ..Integration::default()
+            },
+        );
+        for provider in ["Jira", "Asana"] {
+            settings
+                .integrations
+                .projects
+                .entry("project".into())
+                .or_default()
+                .entry(provider.into())
+                .or_default()
+                .connected = true;
+        }
+        let jira = settings
+            .resolve_integration("org", "project", "Jira")
+            .unwrap();
+        assert_eq!(jira.jira_site.as_deref(), Some("https://org.atlassian.net"));
+        assert_eq!(jira.jira_email.as_deref(), Some("person@example.com"));
+        assert!(jira.connected);
+        let asana = settings
+            .resolve_integration("org", "project", "Asana")
+            .unwrap();
+        assert_eq!(asana.asana_workspace.as_deref(), Some("1234"));
+    }
+
+    /// The settings window tells a person that anything left blank falls back
+    /// to the organization, so a field cleared to nothing is not an override.
+    #[test]
+    fn a_blank_project_field_falls_back_and_a_filled_one_does_not() {
+        let mut settings = AgentPreferences::default();
+        settings
+            .integrations
+            .organizations
+            .entry("org".into())
+            .or_default()
+            .insert("Jira".into(), connection("https://org.atlassian.net"));
+        settings
+            .integrations
+            .projects
+            .entry("project".into())
+            .or_default()
+            .insert(
+                "Jira".into(),
+                Integration {
+                    jira_site: Some("   ".into()),
+                    jira_email: Some("project@example.com".into()),
+                    asana_workspace: None,
+                    connected: true,
+                },
+            );
+        let jira = settings
+            .resolve_integration("org", "project", "Jira")
+            .unwrap();
+        assert_eq!(jira.jira_site.as_deref(), Some("https://org.atlassian.net"));
+        assert_eq!(jira.jira_email.as_deref(), Some("project@example.com"));
+    }
+
+    #[test]
+    fn preferences_written_before_integrations_existed_still_load() {
+        let json = r#"{
+            "organizations": {},
+            "projects": {},
+            "ticketSources": { "organizations": {}, "projects": {} }
+        }"#;
+        let restored: AgentPreferences = serde_json::from_str(json).unwrap();
+        assert!(restored.integrations.organizations.is_empty());
+        assert!(restored
+            .resolve_integration("org", "project", "Jira")
+            .is_none());
+    }
+
+    #[test]
+    fn an_integration_round_trips_without_carrying_a_token() {
+        let mut settings = AgentPreferences::default();
+        settings
+            .integrations
+            .organizations
+            .entry("org".into())
+            .or_default()
+            .insert(
+                "Asana".into(),
+                Integration {
+                    asana_workspace: Some("1234".into()),
+                    connected: true,
+                    ..Integration::default()
+                },
+            );
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains("\"asanaWorkspace\":\"1234\""));
+        assert!(!json.contains("token"));
+        let restored: AgentPreferences = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            restored.resolve_integration("org", "", "Asana").unwrap(),
+            Integration {
+                asana_workspace: Some("1234".into()),
+                connected: true,
+                ..Integration::default()
+            }
         );
     }
 }

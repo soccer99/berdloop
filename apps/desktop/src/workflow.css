@@ -351,7 +351,11 @@
 .wf-status-blocked {
   color: #e4a295;
 }
+/* Finished, but the work has not left the worker's worktree yet. */
 .wf-status-done {
+  color: #d1b988;
+}
+.wf-status-merged {
   color: #80b697;
 }
 .wf-ticket-row:has(.wf-status-coding),
@@ -401,27 +405,57 @@
   color: #ced9c5;
   border-color: #a2cd77;
 }
-.wf-order {
+/* Drag the grip, or tap the arrow above or below it to bump one place. */
+.wf-move {
   display: flex;
   flex-direction: column;
-  justify-content: center;
-  gap: 3px;
-  padding: 8px;
+  align-self: center;
+  margin: 8px;
+  border: 1px solid #3d4d35;
+  border-radius: 8px;
+  background: #1d281c;
+  overflow: hidden;
+  flex: none;
 }
-.wf-order button {
-  width: 25px;
-  height: 25px;
+.wf-move:hover {
+  border-color: #5f7352;
+  background: #212e20;
+}
+.wf-move-step,
+.wf-move-grip {
   display: grid;
   place-items: center;
-  border: 1px solid #76866b;
-  background: #232f20;
-  border-radius: 4px;
-  color: #b5ce9e;
+  width: 26px;
+  height: 22px;
+  border: 0;
+  background: none;
+  color: #8aa17b;
+  padding: 0;
+}
+.wf-move-step {
   cursor: pointer;
 }
-.wf-order button:disabled {
-  opacity: 0.3;
+.wf-move-step:hover:not(:disabled) {
+  background: #2c3d28;
+  color: #d3e4c3;
+}
+.wf-move-step:disabled {
+  opacity: 0.25;
   cursor: default;
+}
+.wf-move-grip {
+  border-top: 1px solid #33422d;
+  border-bottom: 1px solid #33422d;
+  color: #6f8463;
+  cursor: grab;
+}
+.wf-move-grip:hover {
+  background: #2c3d28;
+  color: #d3e4c3;
+}
+.wf-move-grip:active {
+  cursor: grabbing;
+  background: #35492f;
 }
 .wf-steps {
   display: grid;
@@ -529,29 +563,67 @@
 .wf-row-top {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  margin-bottom: 10px;
+  gap: 9px;
+  min-width: 0;
 }
-.wf-row-top > span:first-child {
+.wf-row-mark {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 18px;
   color: #849b6f;
   font:
     10px ui-monospace,
     monospace;
 }
+.wf-row-top .wf-status {
+  margin-left: auto;
+  flex: none;
+}
 .wf-task-open strong {
-  display: block;
+  flex: 1;
+  min-width: 0;
   font-size: 13px;
   font-weight: 500;
   line-height: 1.5;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 .wf-task-open small {
-  display: block;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
   margin-top: 7px;
+  padding-left: 27px;
   color: #8aa17a;
   font-size: 12px;
 }
+.wf-row-stats {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.wf-row-stats > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 7px 1px 5px;
+  border: 1px solid #3d4d35;
+  border-radius: 20px;
+  background: #1d281c;
+  color: #9db78a;
+  font:
+    11px ui-monospace,
+    monospace;
+}
+.wf-row-clock {
+  color: #bcd3a8;
+}
+
 .wf-task-open p {
+  padding-left: 27px;
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
@@ -615,19 +687,6 @@
 }
 .wf-task-page .wf-prompt p {
   max-height: 130px;
-}
-.wf-drag-handle {
-  display: grid;
-  place-items: center;
-  width: 22px;
-  color: #8aa17b;
-  cursor: grab;
-}
-.wf-drag-handle:active {
-  cursor: grabbing;
-}
-.wf-order {
-  align-items: center;
 }
 .wf-thread-heading {
   padding: 22px;
@@ -744,6 +803,11 @@
 .wf-merge-row > span:first-child {
   color: #8a9e7a;
   font: 10px monospace;
+}
+.wf-merge-when {
+  color: #8a9e7a;
+  font: 10px monospace;
+  white-space: nowrap;
 }
 .wf-notice {
   display: flex;

@@ -1,13 +1,15 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Local application window. Native folder picker, and watching the queue files under the app data directory. No shell access, and no other filesystem access.",
+  "description": "Local application window. Native folder picker, watching the queue files under the app data directory, and opening http and https links in the person's own browser. No shell access, and no other filesystem access.",
   "windows": ["main"],
   "permissions": [
     "core:default",
     "dialog:allow-open",
     "fs:allow-watch",
     "fs:allow-unwatch",
-    "fs:scope-appdata-recursive"
+    "fs:scope-appdata-recursive",
+    "opener:allow-open-url",
+    "opener:allow-default-urls"
   ]
 }

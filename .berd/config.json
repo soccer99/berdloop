@@ -8,12 +8,12 @@
     {
       "name": "web",
       "var": "PORT",
-      "default": 3000,
+      "default": 1420,
       "offset": 0
     }
   ],
   "dev": {
-    "command": "bun run dev"
+    "command": "bun run dev:desktop:web"
   },
   "resources": [],
   "compose": null,

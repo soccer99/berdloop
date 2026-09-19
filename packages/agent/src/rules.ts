@@ -66,6 +66,17 @@ export const rules: RuleDoc[] = [
     ].join("\n"),
   },
   {
+    id: "one-message-one-ticket",
+    roles: ["ticket-agent"],
+    title: "One message is one ticket",
+    body: [
+      "One message is one ticket. Two asks sent in two messages are two tickets, even when they touch the same code.",
+      "Combine only when the person says to combine.",
+      "A shared file is a sequencing problem, not a reason to merge two tickets. Note the overlap in each ticket's requirements and let them land in sequence.",
+      "One message holding several genuinely separate asks may be split into several tickets. This is a floor on granularity, not a ceiling.",
+    ].join("\n"),
+  },
+  {
     id: "how-you-answer",
     roles: ["ticket-agent", "task-agent"],
     title: "How you answer",
@@ -85,6 +96,7 @@ export const rules: RuleDoc[] = [
       "You have your own directory and your own git branch. No other worker can see inside it.",
       "Work only there. Never change files in another worker's directory.",
       "Keep your change as small as the task allows. A large change is hard to merge.",
+      "Change only what your task asks for. A bug, an untidy file or a missing test that you notice is not yours: name it in your task_report detail and leave the code as it is.",
       "Commit your work. Uncommitted changes cannot be merged.",
     ].join("\n"),
   },
@@ -104,11 +116,12 @@ export const rules: RuleDoc[] = [
     roles: ["worker"],
     title: "Merging your work",
     body: [
-      "Your branch is scratch space. The ticket branch is what counts.",
-      "Only one worker merges at a time, so you must ask for a place in the merge queue and wait your turn.",
-      "On your turn: bring the ticket branch into your worktree, fix anything that clashes, commit, then move the ticket branch onto your work.",
-      "You fix conflicts in your own directory, where nobody else is working. The ticket branch is never left broken.",
-      "Give your place up as soon as you are done. Other workers are waiting.",
+      "Your branch is scratch space. Work that has not landed on the ticket branch does not exist.",
+      "Merging is not the last nicety of a finished task. It is how a task finishes. Passing tests in your own worktree prove nothing yet, because nobody else can see them.",
+      "Only one worker merges at a time, so you ask for a place in the merge queue and wait your turn.",
+      "You fix conflicts in your own directory, where nobody else is working, so the ticket branch is never left broken.",
+      "task_report --status complete is refused until your work has landed. If you find yourself arguing with that refusal, you have not merged yet.",
+      "Give your place up as soon as you are done, whether you landed or gave up. The workers behind you cannot move until you do.",
     ].join("\n"),
   },
   {
@@ -125,16 +138,33 @@ export const rules: RuleDoc[] = [
 
 export const skills: SkillDoc[] = [
   {
+    id: "merge-your-work",
+    roles: ["worker"],
+    when: "your task's work is committed and its checks pass",
+    steps: [
+      "You are not done. Nothing has left your worktree yet. Merge now, in this order, without stopping to report first.",
+      "Call merge_request. It answers with your position.",
+      "If your position is not 0, call merge_wait and let it return. Do not touch the ticket branch before it does.",
+      "Call merge_sync. It brings the ticket branch into your worktree and lists whatever conflicts.",
+      "If anything conflicts, resolve it before going on. There is a procedure for that below.",
+      "Call merge_land. If it refuses because the ticket moved, run merge_sync again and land again.",
+      "Call merge_release, so the next worker can move.",
+      "Only now call task_report. It is refused if you skipped any of this, which is the point.",
+    ],
+  },
+  {
     id: "fix-merge-conflicts",
     roles: ["worker"],
     when: "merge_sync reports conflicted files",
     steps: [
-      "Read every conflicted file. The markers show your change and the ticket's change.",
-      "Keep both intentions. The other change came from a worker solving a different part of the same ticket, so it is not wrong.",
-      "Delete every conflict marker. Search for them again before you continue.",
-      "Run the project's build or tests to prove the merged file still works.",
+      "Call merge_conflicts first. It shows both sides of every conflicted file and when each was written, which is what you need before you open anything.",
+      "Read both sides in full. Neither is a mistake: each came from a worker solving a different part of this same ticket.",
+      "Decide by what the ticket must achieve, which is in your brief. The question is never which diff is tidier.",
+      "Use the dates. A later change usually already knew about the earlier one, so where the two genuinely disagree it carries the more current intention. Where they merely touch the same lines, keep both.",
+      "Delete every conflict marker. Search the file for them again before you continue.",
+      "Run the project's build or tests to prove the resolved file still works.",
       "Commit the resolution, then call merge_land.",
-      "If the two changes genuinely cannot both stand, stop and report the task as blocked. Do not silently drop the other worker's work.",
+      "If the two intentions genuinely cannot both stand, stop and report the task as blocked, naming which two. Never silently drop the other worker's work.",
     ],
   },
   {

@@ -75,6 +75,7 @@ fn usage() -> String {
         "  merge-request   Ask for a place in the merge queue. --task required.",
         "  merge-wait      Wait until it is your turn. --task required.",
         "  merge-sync      Bring the ticket branch into your worktree. --task required.",
+        "  merge-conflicts Show both sides of each conflicted file. --task required.",
         "  merge-land      Move the ticket branch onto your work. --task required.",
         "  merge-release   Give up your place. --task required.",
         "  ask-human       Ask a person a question and wait. --task and --question required.",
@@ -94,6 +95,8 @@ fn usage() -> String {
         "    ticket-add ticket-edit ticket-remove ticket-split ticket-merge ticket-reorder",
         "    task-add   task-edit   task-remove   task-split   task-merge   task-reorder",
         "  ticket-pause ticket-resume ticket-replan",
+        "  ticket-import   Put a provider's issue on the queue. --provider and",
+        "                  --reference. The connection comes from settings.",
         "  task-steer task-stop",
         "  pr-review-submit",
         "",
@@ -263,6 +266,9 @@ fn run() -> Result<String, String> {
             let _alive = Heartbeat::start(staging.queue_dir(&ticket), task.clone());
             staging.commit_task(&task, &format!("Work on {task}"))?;
             let result = staging.sync_from_ticket(&ticket, &task)?;
+            // The queue is the ticket's merge record, so it says a worker is
+            // resolving conflicts while that is what is happening.
+            queue.conflicted(&task, !result.merged);
             if result.merged {
                 return Ok("Clean. Everything is committed. Run merge-land.".to_string());
             }
@@ -271,6 +277,41 @@ fn run() -> Result<String, String> {
                 result.conflicts.len(),
                 result.conflicts.join("\n")
             ))
+        }
+
+        "merge-conflicts" => {
+            let sides = staging.conflict_sides(&task)?;
+            if sides.is_empty() {
+                return Ok(
+                    "Nothing is conflicted. If you have just committed, run merge-land."
+                        .to_string(),
+                );
+            }
+            let mut said = vec![format!(
+                "{} file(s) conflict. Both sides are work on this same ticket.",
+                sides.len()
+            )];
+            for side in &sides {
+                said.push(String::new());
+                said.push(format!("{}", side.file));
+                said.push(format!("  yours:  {}", side.mine));
+                said.push(format!("  theirs: {}", side.theirs));
+            }
+            said.push(String::new());
+            said.push(
+                [
+                    "Resolve each file by keeping what the ticket needs, not by picking a side:",
+                    "- Read both sides in full before you change anything. Neither is a mistake; each solved a different part of this ticket.",
+                    "- Judge against the ticket's own requirements, which are in your brief. The question is what the finished ticket must do, not which diff is tidier.",
+                    "- Use the dates above. The later change usually knows about the earlier one, so where they truly disagree it is the more current intention. Where they only touch the same lines, keep both.",
+                    "- Delete every conflict marker, then search the file for them again.",
+                    "- Run the project's build or tests to prove the resolved file works.",
+                    "- Commit, then run merge-land.",
+                    "- If both intentions genuinely cannot stand together, stop and report the task as blocked saying which two they are. Never silently drop the other worker's work.",
+                ]
+                .join("\n"),
+            );
+            Ok(said.join("\n"))
         }
 
         "merge-land" => {
@@ -283,8 +324,8 @@ fn run() -> Result<String, String> {
             require_turn(&queue, &task)?;
             let result = staging.land(&ticket, &task)?;
             if result.merged {
-                queue.release(&task);
-                return Ok("Landed on the ticket branch. Your place is released.".to_string());
+                queue.release_merged(&task);
+                return Ok("Landed on the ticket branch. Your place is marked merged.".to_string());
             }
             if !result.conflicts.is_empty() {
                 return Err(format!(
@@ -296,7 +337,13 @@ fn run() -> Result<String, String> {
         }
 
         "merge-release" => {
-            let next = queue.release(&task);
+            // A worker that landed keeps its place in the line as a record. One
+            // that gave up drops out, so the line never claims a merge.
+            let next = if staging.task_landed(&ticket, &task).unwrap_or(false) {
+                queue.release_merged(&task)
+            } else {
+                queue.release(&task)
+            };
             Ok(match next {
                 Some(other) => format!("Released. {other} may merge now."),
                 None => "Released. Nobody is waiting.".to_string(),
@@ -440,7 +487,11 @@ fn run() -> Result<String, String> {
                 return Err("The task branch has not landed on the ticket branch. Run merge-land before reporting complete.".to_string());
             }
             // A worker that stops without merging must not keep its place.
-            queue.release(&task);
+            if staging.task_landed(&ticket, &task).unwrap_or(false) {
+                queue.release_merged(&task);
+            } else {
+                queue.release(&task);
+            }
             staging.append_report(
                 &ticket,
                 &task,

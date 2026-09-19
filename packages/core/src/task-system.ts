@@ -10,6 +10,8 @@ export interface ExternalIssue {
   title: string;
   description: string;
   status: string;
+  /** When the provider last changed it. Absent when the provider is silent. */
+  updatedAt?: string;
 }
 
 export type AgentTaskStatus =
@@ -26,8 +28,13 @@ export interface AgentTask {
   status: AgentTaskStatus;
   dependencyIds: string[];
   assigneeId?: string;
-  /** A fix requested by the independent PR reviewer; scheduled ahead of new work. */
+  /** A fix requested by the independent PR reviewer, or by a failing build;
+   * scheduled ahead of new work. */
   reviewFix?: boolean;
+  /** `<commit>:<job name>` for a fix a failing build asked for. Polling
+   * reports the same broken job every time; this is what stops it being
+   * queued twice. */
+  ciKey?: string;
   createdAt: string;
   updatedAt: string;
 }

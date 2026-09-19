@@ -8,13 +8,28 @@
 //! The line lives on disk, not in memory, because the workers that use it are
 //! separate processes. It also has to outlive the window being closed.
 //!
-//! One file per waiting worker:
+//! One file per merge attempt:
 //!
 //! ```text
-//! <staging root>/merge-queue/<nanoseconds>-<task id>.slot
+//! <staging root>/merge-queue/<ticket>/<nanoseconds>-<task id>.<ending>
 //! ```
 //!
-//! Sorting the names gives first in, first out. The oldest holds the lock.
+//! Only `.slot` waits for a turn. Sorting the names gives first in, first
+//! out, and the oldest `.slot` holds the lock.
+//!
+//! Nothing here is ever deleted. An attempt that landed, gave up or died is
+//! renamed, not removed, so the directory is the ticket's whole merge history
+//! and can be read back weeks later:
+//!
+//! | ending       | what happened                                   |
+//! |--------------|-------------------------------------------------|
+//! | `.slot`      | still in the line, or merging right now          |
+//! | `.merged`    | landed on the ticket branch                      |
+//! | `.left`      | gave up its turn without landing                 |
+//! | `.abandoned` | held the turn until it was assumed dead          |
+//!
+//! The holder writes a word inside its own `.slot` file to say what it is
+//! doing, which is how a conflict resolution shows up as more than a gap.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -35,6 +50,30 @@ pub struct Slot {
     /// How many workers are in the line, this one included.
     pub waiting: usize,
 }
+
+/// One merge attempt, finished or not.
+///
+/// Every attempt stays here rather than vanishing, whatever became of it: the
+/// directory is the record of what happened to this ticket, and a merge that
+/// was abandoned says as much as one that landed. Only `.slot` files decide
+/// whose turn it is, so a kept entry can never hold up the workers behind it.
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Entry {
+    pub task_id: String,
+    /// `waiting`, `merging`, `conflict`, `merged`, `left` or `abandoned`.
+    pub status: &'static str,
+    /// When this attempt joined the line. Milliseconds since the epoch.
+    pub at: u64,
+}
+
+/// Endings a place is renamed to when it leaves the line. Kept, never counted.
+const MERGED: &str = "merged";
+const LEFT: &str = "left";
+const ABANDONED: &str = "abandoned";
+
+/// What the holder writes in its slot file while it resolves conflicts.
+const CONFLICT: &str = "conflict";
 
 fn file_name(task_id: &str) -> String {
     task_id
@@ -106,7 +145,7 @@ impl Queue {
         if let Some((_, path, task)) = slots.first() {
             if previous == *task
                 && age_secs(path) > MAX_HOLD_SECS
-                && std::fs::remove_file(path).is_ok()
+                && std::fs::rename(path, path.with_extension(ABANDONED)).is_ok()
             {
                 slots.remove(0);
             }
@@ -142,6 +181,54 @@ impl Queue {
 
     /// Join the line, or report the place already held.
     ///
+    /// Everyone this ticket's merge queue has seen, oldest first.
+    ///
+    /// The app shows this. Workers only ever ask about `line`, which is the
+    /// part that decides turns.
+    pub fn entries(&self) -> Vec<Entry> {
+        let Ok(_lock) = self.lock() else {
+            return Vec::new();
+        };
+        let waiting = self.line_locked();
+        let holder = waiting.first().cloned().unwrap_or_default();
+        let Ok(read) = self.dir.read_dir() else {
+            return Vec::new();
+        };
+        let mut all: Vec<(String, Entry)> = read
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                let (name, ending) = path.file_name()?.to_str()?.rsplit_once('.')?;
+                let (stamp, task) = name.split_once('-')?;
+                let status = match ending {
+                    MERGED => "merged",
+                    LEFT => "left",
+                    ABANDONED => "abandoned",
+                    "slot" if state(&path) == CONFLICT => "conflict",
+                    "slot" if task == holder => "merging",
+                    "slot" => "waiting",
+                    // queue.lock, holder, and anything else that is not a place.
+                    _ => return None,
+                };
+                Some((
+                    stamp.to_string(),
+                    Entry {
+                        task_id: task.to_string(),
+                        status,
+                        at: joined_at(stamp),
+                    },
+                ))
+            })
+            .collect();
+        all.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.task_id.cmp(&b.1.task_id)));
+        all.into_iter().map(|(_, entry)| entry).collect()
+    }
+
+    /// Give up the place, having landed. The place is kept, marked merged.
+    pub fn release_merged(&self, task_id: &str) -> Option<String> {
+        self.leave(task_id, true)
+    }
+
     /// Asking twice is safe. A worker that retries keeps its original place
     /// rather than going to the back.
     pub fn acquire(&self, task_id: &str) -> Result<Slot, String> {
@@ -149,6 +236,9 @@ impl Queue {
         let task = file_name(task_id);
         let line = self.line_locked();
         if !line.contains(&task) {
+            // A reopened task joins again and keeps every earlier attempt
+            // beside the new one, newest last. Two rows for one task is the
+            // truth: it merged twice.
             std::fs::create_dir_all(&self.dir).map_err(|e| e.to_string())?;
             let stamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -175,6 +265,13 @@ impl Queue {
     /// A worker that leaves while still waiting simply drops out, so an
     /// abandoned task never blocks the ones behind it.
     pub fn release(&self, task_id: &str) -> Option<String> {
+        self.leave(task_id, false)
+    }
+
+    /// Take a task out of the running, keeping the place either way. A worker
+    /// that gave up is as much a part of the ticket's history as one that
+    /// landed, so it is renamed, never removed.
+    fn leave(&self, task_id: &str, merged: bool) -> Option<String> {
         let _lock = self.lock().ok()?;
         let task = file_name(task_id);
         if let Ok(entries) = self.dir.read_dir() {
@@ -186,12 +283,39 @@ impl Queue {
                     .and_then(|n| n.strip_suffix(".slot"))
                     .and_then(|n| n.split_once('-').map(|(_, t)| t == task))
                     .unwrap_or(false);
-                if matches {
-                    let _ = std::fs::remove_file(&path);
+                if !matches {
+                    continue;
                 }
+                let ending = if merged { MERGED } else { LEFT };
+                let _ = std::fs::rename(&path, path.with_extension(ending));
             }
         }
         self.line_locked().into_iter().next()
+    }
+
+    /// Record what the holder is doing inside its turn.
+    ///
+    /// A conflict resolution can take longer than the merge itself. Without
+    /// this the record shows only a gap between joining and landing, so the
+    /// one part a person most wants to read back is the part not written down.
+    fn mark(&self, task_id: &str, doing: &str) {
+        let Ok(_lock) = self.lock() else {
+            return;
+        };
+        let task = file_name(task_id);
+        if let Ok(entries) = self.dir.read_dir() {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.to_string_lossy().ends_with(&format!("-{task}.slot")) {
+                    let _ = write_state(&path, doing);
+                }
+            }
+        }
+    }
+
+    /// Say whether the holder is resolving conflicts right now.
+    pub fn conflicted(&self, task_id: &str, yes: bool) {
+        self.mark(task_id, if yes { CONFLICT } else { "" });
     }
 
     /// Say the holder is still alive, so it is not reaped mid-merge.
@@ -220,12 +344,36 @@ fn age_secs(path: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-/// Rewrite the file's contents to move its modification time forward.
+/// Move the file's modification time forward without losing what it says.
 fn filetime_now(path: &Path) -> std::io::Result<()> {
+    write_state(path, &state(path))
+}
+
+/// What the holder last said it was doing. Empty until it says anything.
+fn state(path: &Path) -> String {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+/// Rewrite the whole file, which also moves its modification time forward.
+fn write_state(path: &Path, doing: &str) -> std::io::Result<()> {
     use std::io::Write;
-    let mut file = std::fs::OpenOptions::new().write(true).open(path)?;
-    file.write_all(b"alive")?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)?;
+    file.write_all(if doing.is_empty() { "alive" } else { doing }.as_bytes())?;
     file.sync_all()
+}
+
+/// When a place joined the line, from the nanoseconds in its name.
+fn joined_at(stamp: &str) -> u64 {
+    stamp
+        .parse::<u128>()
+        .map(|nanos| (nanos / 1_000_000) as u64)
+        .unwrap_or(0)
 }
 
 /// Who is waiting to merge on this ticket, oldest first.
@@ -233,13 +381,21 @@ fn filetime_now(path: &Path) -> std::io::Result<()> {
 /// The app only reads the line. Joining and leaving it belongs to the
 /// workers, through the `berdloop-worker` command.
 #[tauri::command]
-pub fn merge_line(
+pub async fn merge_line(
     app: tauri::AppHandle,
     project_id: String,
     ticket: String,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<Entry>, String> {
+    crate::offload(move || merge_line_blocking(app, project_id, ticket)).await
+}
+
+fn merge_line_blocking(
+    app: tauri::AppHandle,
+    project_id: String,
+    ticket: String,
+) -> Result<Vec<Entry>, String> {
     let staging = crate::git::staging_for(&app, &project_id)?;
-    Ok(Queue::new(staging.queue_dir(&ticket)).line())
+    Ok(Queue::new(staging.queue_dir(&ticket)).entries())
 }
 
 #[cfg(test)]
@@ -269,6 +425,25 @@ mod tests {
         assert_eq!(second.waiting, 2);
     }
 
+    /// Task ids are UUIDs, which are full of the separator the file names use.
+    /// The record is what the window shows, so it must survive a real one.
+    #[test]
+    fn a_uuid_task_keeps_its_record_when_it_leaves() {
+        let queue = queue();
+        let task = "ec2cf859-7a79-4ed3-814b-a78834adcac5";
+        queue.acquire(task).unwrap();
+        queue.release_merged(task);
+        assert_eq!(
+            queue
+                .entries()
+                .into_iter()
+                .map(|e| (e.task_id, e.status))
+                .collect::<Vec<_>>(),
+            [(task.to_string(), "merged")]
+        );
+        assert!(queue.line().is_empty());
+    }
+
     #[test]
     fn asking_twice_keeps_the_original_place() {
         let queue = queue();
@@ -285,6 +460,122 @@ mod tests {
         queue.acquire("b").unwrap();
         assert_eq!(queue.release("a"), Some("b".to_string()));
         assert!(queue.acquire("b").unwrap().holder);
+    }
+
+    /// Every attempt stays on the record, whatever became of it. This is what
+    /// a person reads back weeks later, so nothing may go missing from it.
+    #[test]
+    fn every_attempt_stays_on_the_record() {
+        let queue = queue();
+        for task in ["a", "b", "c"] {
+            queue.acquire(task).unwrap();
+        }
+        let shown = |q: &Queue| {
+            q.entries()
+                .into_iter()
+                .map(|e| (e.task_id, e.status))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            shown(&queue),
+            [
+                ("a".into(), "merging"),
+                ("b".into(), "waiting"),
+                ("c".into(), "waiting"),
+            ]
+        );
+
+        // "a" lands. It keeps its place, and "b" is promoted behind it.
+        assert_eq!(queue.release_merged("a"), Some("b".to_string()));
+        assert_eq!(queue.line(), ["b", "c"], "a no longer waits for a turn");
+        assert_eq!(
+            shown(&queue),
+            [
+                ("a".into(), "merged"),
+                ("b".into(), "merging"),
+                ("c".into(), "waiting"),
+            ]
+        );
+
+        // "b" gives up without landing. It is kept, and marked as what it was.
+        assert_eq!(queue.release("b"), Some("c".to_string()));
+        assert_eq!(
+            shown(&queue),
+            [
+                ("a".into(), "merged"),
+                ("b".into(), "left"),
+                ("c".into(), "merging"),
+            ]
+        );
+
+        // "c" resolves conflicts before it lands. The record says so while it
+        // is happening, rather than showing a gap.
+        queue.conflicted("c", true);
+        assert_eq!(
+            shown(&queue),
+            [
+                ("a".into(), "merged"),
+                ("b".into(), "left"),
+                ("c".into(), "conflict"),
+            ]
+        );
+
+        // A reopened task merges a second time. Both attempts are listed, in
+        // the order they ran: two rows for one task is the truth.
+        assert!(!queue.acquire("a").unwrap().holder);
+        assert_eq!(
+            shown(&queue),
+            [
+                ("a".into(), "merged"),
+                ("b".into(), "left"),
+                ("c".into(), "conflict"),
+                ("a".into(), "waiting"),
+            ]
+        );
+    }
+
+    /// The record outlives the app. A ticket reviewed weeks later reads the
+    /// same directory, with the times each attempt joined the line.
+    #[test]
+    fn the_record_survives_and_is_dated() {
+        let queue = queue();
+        queue.acquire("a").unwrap();
+        queue.release_merged("a");
+        queue.acquire("b").unwrap();
+        queue.release("b");
+
+        let reopened = Queue::new(queue.dir.clone());
+        let entries = reopened.entries();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|e| (e.task_id.as_str(), e.status))
+                .collect::<Vec<_>>(),
+            [("a", "merged"), ("b", "left")],
+            "nothing waits for a turn, and nothing is gone"
+        );
+        assert!(reopened.line().is_empty());
+        assert!(entries[0].at > 0 && entries[1].at >= entries[0].at);
+    }
+
+    /// A holder assumed dead stops blocking the line, but is still recorded.
+    #[test]
+    fn a_reaped_holder_is_kept_as_abandoned() {
+        let queue = queue();
+        queue.acquire("dead").unwrap();
+        queue.acquire("next").unwrap();
+        let old = SystemTime::now() - std::time::Duration::from_secs(MAX_HOLD_SECS + 60);
+        set_modified(&slot_path(&queue, "dead"), old);
+
+        assert_eq!(queue.line(), ["next"]);
+        assert_eq!(
+            queue
+                .entries()
+                .into_iter()
+                .map(|e| (e.task_id, e.status))
+                .collect::<Vec<_>>(),
+            [("dead".into(), "abandoned"), ("next".into(), "merging")]
+        );
     }
 
     #[test]

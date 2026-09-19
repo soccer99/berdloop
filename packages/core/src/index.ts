@@ -62,7 +62,10 @@ export type AgentActivity =
   | "fixing-conflicts"
   | "paused"
   | "blocked"
-  | "done";
+  /** The work is finished but has not reached the ticket branch yet. */
+  | "done"
+  /** Landed on the ticket branch. The only state that means the work counts. */
+  | "merged";
 export * from "./task-system";
 export * from "./task-repository";
 export interface StageAssignment {

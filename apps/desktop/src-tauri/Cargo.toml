@@ -29,6 +29,9 @@ tauri = { version = "=2.11.5", features = [] }
 tauri-plugin-dialog = "=2.7.3"
 # The queue files change under the app, so the window watches them.
 tauri-plugin-fs = { version = "=2.5.2", features = ["watch"] }
+# A link to a pull request or a ticket belongs in the person's own browser,
+# not in the app window, where it would have no address bar and no back button.
+tauri-plugin-opener = "=2.5.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }

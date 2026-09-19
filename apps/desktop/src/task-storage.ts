@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { useBerdloop } from "@berdloop/state";
 import {
   emptyTaskWorkspace,
@@ -224,6 +225,34 @@ export function useTaskWorkspace(session: AccountSession | null = null) {
       active = false;
     };
   }, [session]);
+
+  // The pull request watcher writes records from outside this window: fix
+  // tasks for a broken build, a ticket completed by a merge. Nothing here
+  // asked for them, so the window has to be told to read them back.
+  useEffect(() => {
+    if (!isTauri()) return;
+    let active = true;
+    const stop = listen("workspace-changed", () => {
+      // A write of our own is already on its way and answers with the merged
+      // truth. Reading now would only show a copy that write is about to beat.
+      if (pendingWrites.current) return;
+      const version = generation.current;
+      void localTaskStore
+        .load()
+        .then((loaded) => {
+          if (!active || !loaded) return;
+          if (version !== generation.current || pendingWrites.current) return;
+          current.current = loaded;
+          setWorkspace(loaded);
+          publish(loaded);
+        })
+        .catch(() => undefined);
+    });
+    return () => {
+      active = false;
+      void stop.then((off) => off());
+    };
+  }, []);
 
   const update = useCallback(
     (change: (previous: TaskWorkspace) => TaskWorkspace) => {

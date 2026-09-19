@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import {
   emptyAgentPreferences,
+  patchIntegration,
+  resolveIntegration,
   resolveRolePreference,
   patchRolePreference,
   type AgentPreferences,
@@ -126,4 +128,148 @@ test("PR reviewer has independent harness, model and system prompt", () => {
   expect(
     resolveRolePreference(preferences, "org", "project", "worker").model,
   ).toBe("");
+});
+
+function preferences(): AgentPreferences {
+  return {
+    ...emptyAgentPreferences,
+    integrations: { organizations: {}, projects: {} },
+  };
+}
+
+describe("integration settings", () => {
+  test("nothing is connected before a person says so", () => {
+    expect(
+      resolveIntegration(preferences(), "org", "project", "Jira"),
+    ).toBeUndefined();
+  });
+
+  test("the project's fields win one by one, and blank ones fall back", () => {
+    let settings = patchIntegration(
+      preferences(),
+      "organizations",
+      "org",
+      "Jira",
+      {
+        jiraSite: "https://org.atlassian.net",
+        jiraEmail: "org@example.com",
+        connected: true,
+      },
+    );
+    settings = patchIntegration(settings, "projects", "project", "Jira", {
+      jiraSite: "https://project.atlassian.net",
+      jiraEmail: "  ",
+      connected: true,
+    });
+    const jira = resolveIntegration(settings, "org", "project", "Jira");
+    expect(jira?.jiraSite).toBe("https://project.atlassian.net");
+    expect(jira?.jiraEmail).toBe("org@example.com");
+  });
+
+  // Saving a token at project scope writes `{connected: true}` and nothing
+  // else, so a whole-entry fallback hid the site and workspace held by the
+  // organization and the picker refused a project settings called connected.
+  test("a project entry holding only a token keeps the organization's fields", () => {
+    let settings = patchIntegration(
+      preferences(),
+      "organizations",
+      "org",
+      "Jira",
+      {
+        jiraSite: "https://org.atlassian.net",
+        jiraEmail: "org@example.com",
+        connected: true,
+      },
+    );
+    settings = patchIntegration(settings, "organizations", "org", "Asana", {
+      asanaWorkspace: "1234",
+      connected: true,
+    });
+    for (const provider of ["Jira", "Asana"] as const)
+      settings = patchIntegration(settings, "projects", "project", provider, {
+        connected: true,
+      });
+    const jira = resolveIntegration(settings, "org", "project", "Jira");
+    expect(jira?.jiraSite).toBe("https://org.atlassian.net");
+    expect(jira?.jiraEmail).toBe("org@example.com");
+    expect(jira?.connected).toBe(true);
+    expect(
+      resolveIntegration(settings, "org", "project", "Asana")?.asanaWorkspace,
+    ).toBe("1234");
+  });
+
+  test("a project without its own connection falls back to the organization", () => {
+    const settings = patchIntegration(
+      preferences(),
+      "organizations",
+      "org",
+      "Jira",
+      { jiraSite: "https://org.atlassian.net", connected: true },
+    );
+    expect(
+      resolveIntegration(settings, "org", "project", "Jira")?.jiraSite,
+    ).toBe("https://org.atlassian.net");
+  });
+
+  test("an unrelated provider still resolves from the organization", () => {
+    let settings = patchIntegration(
+      preferences(),
+      "organizations",
+      "org",
+      "Linear",
+      {
+        connected: true,
+      },
+    );
+    settings = patchIntegration(settings, "organizations", "org", "Asana", {
+      asanaWorkspace: "1234",
+      connected: true,
+    });
+    settings = patchIntegration(settings, "projects", "project", "Linear", {
+      connected: false,
+    });
+    expect(
+      resolveIntegration(settings, "org", "project", "Linear")?.connected,
+    ).toBe(false);
+    expect(
+      resolveIntegration(settings, "org", "project", "Asana")?.asanaWorkspace,
+    ).toBe("1234");
+  });
+
+  test("a patch leaves every other scope and provider alone", () => {
+    let settings = patchIntegration(
+      preferences(),
+      "organizations",
+      "org",
+      "Jira",
+      {
+        jiraSite: "https://org.atlassian.net",
+        jiraEmail: "org@example.com",
+        connected: true,
+      },
+    );
+    settings = patchIntegration(settings, "organizations", "org", "Jira", {
+      connected: false,
+    });
+    settings = patchIntegration(settings, "organizations", "other", "Jira", {
+      connected: true,
+    });
+    const jira = resolveIntegration(settings, "org", "", "Jira");
+    expect(jira?.jiraEmail).toBe("org@example.com");
+    expect(jira?.connected).toBe(false);
+    expect(resolveIntegration(settings, "other", "", "Jira")?.connected).toBe(
+      true,
+    );
+  });
+
+  test("no token is ever kept in the preferences", () => {
+    const settings = patchIntegration(
+      preferences(),
+      "organizations",
+      "org",
+      "Jira",
+      { jiraSite: "https://org.atlassian.net", connected: true },
+    );
+    expect(JSON.stringify(settings)).not.toContain("token");
+  });
 });

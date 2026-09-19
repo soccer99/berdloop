@@ -1,6 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import {
+  Badge,
   Button,
+  Loader,
   Modal,
   MultiSelect,
   PasswordInput,
@@ -15,7 +17,6 @@ import { IconFolder, IconPlus, IconUsers } from "@tabler/icons-react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import {
-  importIssue,
   migrateTasks,
   starterProjectId,
   topTicket,
@@ -51,12 +52,23 @@ import type { WorkspaceView } from "./layout/types";
 import {
   agentRoles,
   emptyAgentPreferences,
+  patchIntegration,
   resolveRolePreference,
   patchRolePreference,
   type AgentPreferences,
   type AgentRoleSetting,
+  type IntegrationScope,
+  type IntegrationSettings,
   type RolePreference,
 } from "./agent-preferences";
+import {
+  settingsFix,
+  recentFirst,
+  searchDebounceMs,
+  searchSequence,
+  ticketAgentPrompt,
+  updatedLabel,
+} from "./ticket-picker";
 
 import { HarnessModelSelects } from "./harness-model-selects";
 import { useHarnessCatalog } from "./harness-catalog";
@@ -75,14 +87,6 @@ const workosSession: AccountSession | null = null;
 interface DraftTarget {
   projectId: string;
   source: TicketProvider;
-}
-/** What `fetch_external_issue` is handed. Built at the call, never stored. */
-interface ImportDraft {
-  provider: ExternalProvider;
-  reference: string;
-  token: string;
-  jiraSite: string;
-  jiraEmail: string;
 }
 interface ProjectInfo {
   path: string;
@@ -133,6 +137,381 @@ function RoleSystemPrompt({
   );
 }
 
+const ticketProviders: ExternalProvider[] = ["Linear", "Jira", "Asana"];
+
+interface ConnectionField {
+  name: string;
+  label: string;
+  placeholder: string;
+  read: (settings: IntegrationSettings | undefined) => string;
+  write: (value: string) => Partial<IntegrationSettings>;
+}
+
+// What a provider needs besides its token. The token is deliberately missing:
+// it never travels through the preferences, and it is never read back.
+const connectionFields: Record<ExternalProvider, ConnectionField[]> = {
+  Linear: [],
+  Jira: [
+    {
+      name: "site",
+      label: "Jira Cloud site",
+      placeholder: "https://your-team.atlassian.net",
+      read: (settings) => settings?.jiraSite ?? "",
+      write: (value) => ({ jiraSite: value }),
+    },
+    {
+      name: "email",
+      label: "Atlassian account email",
+      placeholder: "you@your-team.com",
+      read: (settings) => settings?.jiraEmail ?? "",
+      write: (value) => ({ jiraEmail: value }),
+    },
+  ],
+  Asana: [
+    {
+      name: "workspace",
+      label: "Asana workspace GID",
+      placeholder: "1200123456789",
+      read: (settings) => settings?.asanaWorkspace ?? "",
+      write: (value) => ({ asanaWorkspace: value }),
+    },
+  ],
+};
+
+const tokenLabels: Record<ExternalProvider, string> = {
+  Linear: "Linear API token",
+  Jira: "Atlassian API token",
+  Asana: "Asana API token",
+};
+
+// One provider's connection at one scope. Everything except the token is a
+// preference; the token goes straight to the host, which only ever tells us
+// whether one is there.
+function ProviderConnection({
+  provider,
+  scope,
+  scopeId,
+  settings,
+  inherited,
+  inheritedFrom,
+  onPatch,
+  onConnected,
+  onUseOrganization,
+}: {
+  provider: ExternalProvider;
+  scope: IntegrationScope;
+  scopeId: string;
+  settings: IntegrationSettings | undefined;
+  inherited: IntegrationSettings | undefined;
+  inheritedFrom: string;
+  onPatch: (patch: Partial<IntegrationSettings>) => void;
+  onConnected: (connected: boolean) => void;
+  onUseOrganization: (() => Promise<void>) | null;
+}) {
+  const [token, setToken] = useState("");
+  const [editing, setEditing] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const connected = settings?.connected ?? false;
+
+  async function run(work: () => Promise<void>) {
+    setBusy(true);
+    try {
+      await work();
+      setError("");
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function saveToken() {
+    return run(async () => {
+      if (!isTauri())
+        throw new Error("Saving a token needs the Berdloop desktop app.");
+      await invoke("save_integration_secret", {
+        scope,
+        scopeId,
+        provider,
+        token,
+      });
+      onConnected(true);
+      setToken("");
+      setEditing(false);
+    });
+  }
+
+  function disconnect() {
+    return run(async () => {
+      if (!isTauri())
+        throw new Error("Clearing a token needs the Berdloop desktop app.");
+      await invoke("clear_integration_secret", { scope, scopeId, provider });
+      onConnected(false);
+      setToken("");
+      setEditing(false);
+    });
+  }
+
+  return (
+    <div className="provider-connection">
+      <div className="provider-connection-heading">
+        <h3>{provider}</h3>
+        <Badge variant="light" color={connected ? "lime" : "gray"}>
+          {connected ? "Connected" : "Not connected"}
+        </Badge>
+      </div>
+      {!connected && inherited?.connected && (
+        <p className="provider-connection-note">
+          Using the token from {inheritedFrom}.
+        </p>
+      )}
+      {connectionFields[provider].map((field) => {
+        const value = field.read(settings);
+        const inheritedValue = field.read(inherited);
+        return (
+          <TextInput
+            key={field.name}
+            mt="sm"
+            label={field.label}
+            placeholder={inheritedValue || field.placeholder}
+            description={
+              !value && inheritedValue
+                ? `Inherited from ${inheritedFrom}`
+                : undefined
+            }
+            value={value}
+            onChange={(event) =>
+              onPatch(field.write(event.currentTarget.value))
+            }
+          />
+        );
+      })}
+      {editing ? (
+        <>
+          <TextInput
+            mt="sm"
+            type="password"
+            autoComplete="off"
+            label={tokenLabels[provider]}
+            description="Kept in a file only your account can read, and never shown again."
+            value={token}
+            onChange={(event) => setToken(event.currentTarget.value)}
+          />
+          <div className="provider-connection-actions">
+            <Button
+              size="xs"
+              loading={busy}
+              disabled={!token.trim()}
+              onClick={() => void saveToken()}
+            >
+              Save token
+            </Button>
+            <Button
+              size="xs"
+              variant="subtle"
+              onClick={() => {
+                setEditing(false);
+                setToken("");
+              }}
+            >
+              Cancel
+            </Button>
+          </div>
+        </>
+      ) : (
+        <div className="provider-connection-actions">
+          <Button size="xs" variant="subtle" onClick={() => setEditing(true)}>
+            {connected ? "Replace token" : "Add token"}
+          </Button>
+          {connected && (
+            <Button
+              size="xs"
+              variant="subtle"
+              color="red"
+              loading={busy}
+              onClick={() => void disconnect()}
+            >
+              Disconnect
+            </Button>
+          )}
+          {onUseOrganization && (
+            <Button
+              size="xs"
+              variant="subtle"
+              loading={busy}
+              onClick={() => void run(onUseOrganization)}
+            >
+              Use organization connection
+            </Button>
+          )}
+        </div>
+      )}
+      {error && (
+        <p className="task-error" role="alert">
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}
+
+// Choosing a ticket to import. The host holds the connection, so the picker
+// only ever names a provider and a scope: it asks for the provider's own
+// recent list the moment it opens, so there is something to choose from
+// before anybody types, and a search replaces that list only while it is
+// still the newest one asked for.
+function TicketPicker({
+  provider,
+  organizationId,
+  projectId,
+  busy,
+  onPickIssue,
+  onOpenSettings,
+}: {
+  provider: ExternalProvider;
+  organizationId: string;
+  projectId: string;
+  busy: boolean;
+  onPickIssue: (issue: ExternalIssue) => void;
+  onOpenSettings: () => void;
+}) {
+  const [query, setQuery] = useState("");
+  const [issues, setIssues] = useState<ExternalIssue[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [active, setActive] = useState(0);
+  const sequence = useRef(searchSequence());
+  const rows = useRef<(HTMLButtonElement | null)[]>([]);
+  const search = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    const term = query.trim();
+    const ticket = sequence.current.start();
+    setLoading(true);
+    // Opening the picker asks at once; waiting would only show an empty
+    // panel. Typing rests first, so a typed word is one search and not one
+    // per letter. Either way the answer is shown only if its ticket is still
+    // the newest, so a slow earlier search cannot overwrite a newer one.
+    const timer = setTimeout(
+      () => {
+        void invoke<ExternalIssue[]>("search_external_issues", {
+          provider,
+          organizationId,
+          projectId,
+          query: term,
+        })
+          .then((found) => {
+            if (!sequence.current.accept(ticket)) return;
+            setIssues(recentFirst(found));
+            setError("");
+            setActive(0);
+            setLoading(false);
+          })
+          .catch((cause) => {
+            if (!sequence.current.accept(ticket)) return;
+            setIssues([]);
+            setError(String(cause));
+            setLoading(false);
+          });
+      },
+      term ? searchDebounceMs : 0,
+    );
+    return () => clearTimeout(timer);
+  }, [provider, organizationId, projectId, query]);
+
+  function move(step: number) {
+    if (issues.length === 0) return;
+    const next = Math.min(Math.max(active + step, 0), issues.length - 1);
+    setActive(next);
+    rows.current[next]?.focus();
+  }
+
+  function onKeyDown(event: KeyboardEvent<HTMLDivElement>) {
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      move(event.key === "ArrowDown" ? 1 : -1);
+      return;
+    }
+    // A row is a real button and answers Enter by itself; this is Enter from
+    // the search field, which takes whichever row the arrows landed on.
+    if (event.key === "Enter" && event.target === search.current) {
+      event.preventDefault();
+      const picked = issues[active];
+      if (picked) onPickIssue(picked);
+    }
+  }
+
+  const fixInSettings = settingsFix(error);
+  return (
+    <div className="ticket-picker" onKeyDown={onKeyDown}>
+      <TextInput
+        ref={search}
+        data-autofocus
+        mt="md"
+        label={`Search ${provider}`}
+        placeholder="A key, a title, or a word from the ticket"
+        value={query}
+        onChange={(event) => setQuery(event.currentTarget.value)}
+      />
+      {loading ? (
+        <p className="ticket-picker-note">
+          <Loader size="xs" /> Asking {provider}…
+        </p>
+      ) : fixInSettings ? (
+        <div className="ticket-picker-note">
+          <p>{fixInSettings}</p>
+          <Button size="xs" variant="subtle" onClick={onOpenSettings}>
+            Open settings
+          </Button>
+        </div>
+      ) : error ? (
+        <p role="alert" className="task-error">
+          {error}
+        </p>
+      ) : issues.length === 0 ? (
+        <p className="ticket-picker-note">No tickets matched</p>
+      ) : (
+        <div
+          className="ticket-picker-list"
+          role="group"
+          aria-label={`${provider} tickets`}
+        >
+          {issues.map((issue, index) => {
+            const updated = updatedLabel(issue);
+            return (
+              <button
+                key={issue.id}
+                type="button"
+                ref={(element) => {
+                  rows.current[index] = element;
+                }}
+                className={`ticket-pick${index === active ? " active" : ""}`}
+                aria-label={`${issue.key}, ${issue.title}`}
+                aria-current={index === active}
+                disabled={busy}
+                onFocus={() => setActive(index)}
+                onClick={() => onPickIssue(issue)}
+              >
+                <code>{issue.key}</code>
+                <strong>{issue.title}</strong>
+                {issue.status && (
+                  <Badge variant="light" color="gray" size="sm">
+                    {issue.status}
+                  </Badge>
+                )}
+                <small>
+                  {updated ? `Updated ${updated}` : "Never updated"}
+                </small>
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function App() {
   const [accessMode, setAccessMode] = useLocalStorage<"local" | null>({
     key: "berdloop.preview.access-mode.v1",
@@ -162,6 +541,8 @@ export default function App() {
   // The agent system, and the loop that keeps handing it work.
   const loopTicketId = useBerdloop((state) => state.ticketId);
   const setLoopTicketId = useBerdloop((state) => state.setTicketId);
+  // Read once, at mount: whether the previous window was handing out work.
+  const [loopWasRunning] = useState(() => useBerdloop.getState().loopRunning);
   const [sourceSettingsProjectId, setSourceSettingsProjectId] = useState("");
   const [agentPreferences, setAgentPreferences] =
     useLocalStorage<AgentPreferences>({
@@ -217,6 +598,20 @@ export default function App() {
     projectTickets.find(
       (item) => item.id === loopTicketId && item.status !== "complete",
     ) ?? topTicket(projectTickets);
+  // Harness and model are one choice, so they are resolved together and the
+  // model travels with the harness that names it.
+  const workerPreference = resolveRolePreference(
+    agentPreferences,
+    organizationId,
+    projectId,
+    "worker",
+  );
+  const reviewPreference = resolveRolePreference(
+    agentPreferences,
+    organizationId,
+    projectId,
+    "pr-code-review",
+  );
   const loop = useRalphLoop({
     workspace,
     update: updateWorkspace,
@@ -224,19 +619,10 @@ export default function App() {
     projectId,
     preferredTicketId: loopTicketId,
     slots: loopProject?.workers ?? defaultWorkers,
-    harness:
-      resolveRolePreference(
-        agentPreferences,
-        organizationId,
-        projectId,
-        "worker",
-      ).harness ?? "claude-code",
-    reviewHarness: resolveRolePreference(
-      agentPreferences,
-      organizationId,
-      projectId,
-      "pr-code-review",
-    ).harness,
+    harness: workerPreference.harness ?? "claude-code",
+    model: workerPreference.model,
+    reviewHarness: reviewPreference.harness,
+    reviewModel: reviewPreference.model,
     startAgent: async ({ key, plan, role, ticket }) => {
       if (isTauri())
         await invoke("save_agent_preferences", {
@@ -266,6 +652,29 @@ export default function App() {
       });
     },
   });
+  // The loop lives in this window, so a hot reload, a rebuild or a crash stops
+  // it handing out work. None of that was a decision to stop, so it is started
+  // again once the records and the project folder are back. Its own recovery
+  // pass then reconciles whatever finished while the window was gone.
+  const loopRestarted = useRef(false);
+  useEffect(() => {
+    if (loopRestarted.current || !tasksReady || !loopWasRunning) return;
+    if (!projects.find((item) => item.id === projectId)?.path) return;
+    loopRestarted.current = true;
+    loop.start();
+  }, [tasksReady, loopWasRunning, projects, projectId, loop]);
+
+  // Projects live in this window, so the backend cannot watch a pull request
+  // until it has been told where the project is.
+  useEffect(() => {
+    if (!isTauri()) return;
+    void invoke("watch_projects", {
+      projects: projects
+        .filter((item) => item.path)
+        .map((item) => ({ id: item.id, path: item.path })),
+    }).catch(() => undefined);
+  }, [projects]);
+
   // Workers alive right now. The processes are the truth, so this counts the
   // live conversations rather than the loop's own bookkeeping, which frees a
   // slot as soon as a worker reports and so reads low while it exits.
@@ -280,20 +689,12 @@ export default function App() {
   const [importOpened, setImportOpened] = useState(false);
   const [importProvider, setImportProvider] =
     useState<ExternalProvider>("Linear");
-  // A provider credential. Never a draft: it is held in memory for this one
-  // import and deliberately never written to storage.
-  const [importToken, setImportToken] = useState("");
-  const [importReference, setImportReference, clearImportReference] = useDraft(
-    `import-ticket:${importProvider}:reference`,
-  );
-  const [importJiraSite, setImportJiraSite, clearImportJiraSite] = useDraft(
-    "import-ticket:jira-site",
-  );
-  const [importJiraEmail, setImportJiraEmail, clearImportJiraEmail] = useDraft(
-    "import-ticket:jira-email",
-  );
-  const [importBusy, setImportBusy] = useState(false);
-  const [importError, setImportError] = useState<string | null>(null);
+  // What a picked ticket left in the ticket agent's chat box. The id rises
+  // with every pick, so picking the same ticket twice writes it again.
+  const [ticketAgentPrefill, setTicketAgentPrefill] = useState<{
+    id: number;
+    text: string;
+  }>();
   const [organizationOpened, setOrganizationOpened] = useState(false);
   const [projectOpened, setProjectOpened] = useState(false);
   const [linkProjectId, setLinkProjectId] = useState<string | null>(null);
@@ -423,6 +824,11 @@ export default function App() {
     projectId && projectSources[projectId] !== undefined
       ? projectSources[projectId]
       : (organizationSources[organization?.id ?? ""] ?? []);
+  // What the picker may switch between: whatever this project turned on,
+  // and every provider when nobody has chosen yet.
+  const pickerProviders = enabledTicketSources.length
+    ? enabledTicketSources
+    : ticketProviders;
   const visibleSettingsSources = sourceSettingsProjectId
     ? (projectSources[sourceSettingsProjectId] ??
       organizationSources[organization?.id ?? ""] ??
@@ -475,6 +881,60 @@ export default function App() {
       if (sources === null) delete next[id];
       else next[id] = sources;
       return { ...current, ticketSources: { ...settings, [scope]: next } };
+    });
+  }
+  const integrationSettings =
+    agentPreferences.integrations ?? emptyAgentPreferences.integrations;
+  // Connections are edited at whichever scope the settings screen is showing.
+  const connectionScope: IntegrationScope = sourceSettingsProjectId
+    ? "projects"
+    : "organizations";
+  const connectionScopeId = sourceSettingsProjectId || (organization?.id ?? "");
+  function connectionAt(
+    scope: IntegrationScope,
+    scopeId: string,
+    provider: ExternalProvider,
+  ): IntegrationSettings | undefined {
+    return integrationSettings[scope][scopeId]?.[provider];
+  }
+  function setConnection(
+    provider: ExternalProvider,
+    patch: Partial<IntegrationSettings>,
+  ) {
+    if (!connectionScopeId) return;
+    setAgentPreferences((current) =>
+      patchIntegration(
+        current,
+        connectionScope,
+        connectionScopeId,
+        provider,
+        patch,
+      ),
+    );
+  }
+  // Drop a project's own connection so the organization's applies again. Its
+  // token goes with it, or the host would keep a secret nothing points at.
+  async function useOrganizationConnection(provider: ExternalProvider) {
+    const scopeId = sourceSettingsProjectId;
+    if (!scopeId) return;
+    if (connectionAt("projects", scopeId, provider)?.connected && isTauri())
+      await invoke("clear_integration_secret", {
+        scope: "projects",
+        scopeId,
+        provider,
+      });
+    setAgentPreferences((current) => {
+      const integrations =
+        current.integrations ?? emptyAgentPreferences.integrations;
+      const providers = { ...integrations.projects[scopeId] };
+      delete providers[provider];
+      return {
+        ...current,
+        integrations: {
+          ...integrations,
+          projects: { ...integrations.projects, [scopeId]: providers },
+        },
+      };
     });
   }
   const organizationProjectIds = new Set(
@@ -722,39 +1182,19 @@ export default function App() {
     setTaskOpened(false);
     setView("loops");
   }
-  async function importTask() {
-    if (!project || !isTauri()) return;
-    setImportBusy(true);
-    setImportError(null);
-    try {
-      const input: ImportDraft = {
-        provider: importProvider,
-        reference: importReference,
-        token: importToken,
-        jiraSite: importJiraSite,
-        jiraEmail: importJiraEmail,
-      };
-      const issue = await invoke<ExternalIssue>("fetch_external_issue", {
-        input,
-      });
-      let importedId = "";
-      updateWorkspace((current) => {
-        const imported = importIssue(current, issue, project.id);
-        importedId = imported.task.id;
-        return imported.workspace;
-      });
-      setSelectedId(importedId);
-      setImportToken("");
-      clearImportReference();
-      clearImportJiraSite();
-      clearImportJiraEmail();
-      setImportOpened(false);
-      setView("loops");
-    } catch (cause) {
-      setImportError(String(cause));
-    } finally {
-      setImportBusy(false);
-    }
+  // What the picker hands back. Picking creates nothing: it writes an
+  // opening message into the ticket agent's chat box and takes the person
+  // there, and the agent fetches the real body and makes the ticket once
+  // they send it. The queue's ticket agent only shows while no ticket is
+  // selected, so the pick clears the selection to land them in front of it.
+  function pickIssue(picked: ExternalIssue) {
+    setTicketAgentPrefill((current) => ({
+      id: (current?.id ?? 0) + 1,
+      text: ticketAgentPrompt(picked),
+    }));
+    setImportOpened(false);
+    setSelectedId("");
+    setView("loops");
   }
   function requestCollaboration(target: CollaborationTarget) {
     setCollaborationTarget(target);
@@ -787,7 +1227,6 @@ export default function App() {
               ""
             }
             loopProject={loopProject}
-            busyWorkers={busyWorkers}
             onWorkersChange={(workers) =>
               loopProject && saveProjectRecord({ ...loopProject, workers })
             }
@@ -829,7 +1268,13 @@ export default function App() {
             onOpenAccount={() => setCollaborationTarget("welcome")}
           />
         }
-        systemStatus={<SystemStatus runtime={runtime} />}
+        systemStatus={
+          <SystemStatus
+            runtime={runtime}
+            loopNote={loop.note}
+            busyWorkers={busyWorkers}
+          />
+        }
       >
         {taskStoreError && (
           <p className="task-error" role="alert">
@@ -1001,13 +1446,16 @@ export default function App() {
               )?.id ??
               ""
             }
-            onLoopTicket={setLoopTicketId}
+            onLoopTicket={(id) => {
+              // Pointing the loop at a ticket is a request to work on it. If
+              // the loop is not running, nothing would come of it otherwise.
+              setLoopTicketId(id);
+              if (!loop.running) loop.start();
+            }}
             update={updateWorkspace}
             onNewTicket={() => openTaskDraft()}
             onImportTicket={(provider) => {
-              setImportError(null);
               setImportProvider(provider ?? "Linear");
-              setImportToken("");
               setImportOpened(true);
             }}
             onNewProject={() => setProjectOpened(true)}
@@ -1018,6 +1466,7 @@ export default function App() {
               setView("tools");
             }}
             ready={tasksReady}
+            ticketAgentPrefill={ticketAgentPrefill}
             beta={betaEnabled(harnessSettings)}
           />
         )}
@@ -1090,14 +1539,14 @@ export default function App() {
                   <div>
                     <label>Import buttons</label>
                     <p>
-                      Only selected sources appear above the ticket queue.
-                      Credentials are entered during import.
+                      Only selected sources appear above the ticket queue. Each
+                      source searches with the connection set below.
                     </p>
                   </div>
                   <MultiSelect
                     size="xs"
                     className="settings-row-control"
-                    data={["Linear", "Jira", "Asana"]}
+                    data={ticketProviders}
                     value={visibleSettingsSources}
                     onChange={(value) => {
                       if (sourceSettingsProjectId)
@@ -1137,6 +1586,56 @@ export default function App() {
                       </Button>
                     </div>
                   )}
+                {connectionScopeId && (
+                  <>
+                    <p className="settings-group-note">
+                      {sourceSettingsProjectId
+                        ? `Anything left blank falls back to ${organization?.name ?? "the organization"}.`
+                        : "Every project in this organization uses these unless it sets its own."}
+                    </p>
+                    <div className="provider-connections">
+                      {ticketProviders.map((provider) => (
+                        <ProviderConnection
+                          key={provider}
+                          provider={provider}
+                          scope={connectionScope}
+                          scopeId={connectionScopeId}
+                          settings={connectionAt(
+                            connectionScope,
+                            connectionScopeId,
+                            provider,
+                          )}
+                          inherited={
+                            sourceSettingsProjectId
+                              ? connectionAt(
+                                  "organizations",
+                                  organization?.id ?? "",
+                                  provider,
+                                )
+                              : undefined
+                          }
+                          inheritedFrom={
+                            organization?.name ?? "the organization"
+                          }
+                          onPatch={(patch) => setConnection(provider, patch)}
+                          onConnected={(connected) =>
+                            setConnection(provider, { connected })
+                          }
+                          onUseOrganization={
+                            sourceSettingsProjectId &&
+                            connectionAt(
+                              "projects",
+                              sourceSettingsProjectId,
+                              provider,
+                            )
+                              ? () => useOrganizationConnection(provider)
+                              : null
+                          }
+                        />
+                      ))}
+                    </div>
+                  </>
+                )}
               </section>
 
               <section className="settings-group">
@@ -1589,86 +2088,35 @@ export default function App() {
       </Modal>
       <Modal
         opened={importOpened}
-        onClose={() => {
-          if (!importBusy) {
-            setImportOpened(false);
-            setImportToken("");
-          }
-        }}
+        onClose={() => setImportOpened(false)}
         title="Import a source ticket"
         centered
       >
-        <form
-          onSubmit={(event) => {
-            event.preventDefault();
-            void importTask();
+        {pickerProviders.length > 1 && (
+          <Select
+            label="Source"
+            data={pickerProviders}
+            value={importProvider}
+            allowDeselect={false}
+            onChange={(value) => {
+              if (!value) return;
+              setImportProvider(value as ExternalProvider);
+            }}
+          />
+        )}
+        <TicketPicker
+          key={importProvider}
+          provider={importProvider}
+          organizationId={project?.organizationId ?? ""}
+          projectId={project?.id ?? ""}
+          busy={!project}
+          onPickIssue={pickIssue}
+          onOpenSettings={() => {
+            setImportOpened(false);
+            setSourceSettingsProjectId(projectId);
+            setView("tools");
           }}
-        >
-          <p className="app-eyebrow">{importProvider.toUpperCase()}</p>
-          {importProvider === "Jira" && (
-            <>
-              <TextInput
-                required
-                mt="md"
-                label="Jira Cloud site"
-                placeholder="https://your-team.atlassian.net"
-                value={importJiraSite}
-                onChange={(event) =>
-                  setImportJiraSite(event.currentTarget.value)
-                }
-              />
-              <TextInput
-                required
-                mt="md"
-                label="Atlassian account email"
-                value={importJiraEmail}
-                onChange={(event) =>
-                  setImportJiraEmail(event.currentTarget.value)
-                }
-              />
-            </>
-          )}
-          <TextInput
-            required
-            mt="md"
-            label={importProvider === "Asana" ? "Task GID" : "Issue ID or key"}
-            placeholder={
-              importProvider === "Asana" ? "1200123456789" : "BRD-128"
-            }
-            value={importReference}
-            onChange={(event) => setImportReference(event.currentTarget.value)}
-          />
-          {/* A credential: never a draft, so it is not written to storage. */}
-          <TextInput
-            required
-            mt="md"
-            type="password"
-            label={
-              importProvider === "Jira"
-                ? "Atlassian API token"
-                : "Personal access token"
-            }
-            description="Used for this import only. Berdloop does not save it."
-            value={importToken}
-            onChange={(event) => setImportToken(event.currentTarget.value)}
-          />
-          {importError && (
-            <p role="alert" className="task-error">
-              {importError}
-            </p>
-          )}
-          <Button
-            fullWidth
-            mt="xl"
-            type="submit"
-            loading={importBusy}
-            disabled={
-              !project || !importReference.trim() || !importToken.trim()
-            }
-          >
-            Import into {project?.name ?? "project"}
-          </Button>
-        </form>
+        />
       </Modal>
       <Modal
         opened={taskOpened}

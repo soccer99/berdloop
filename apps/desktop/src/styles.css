@@ -8,8 +8,10 @@ button {
   font-family: inherit;
 }
 .desktop-shell {
+  /* The brand block and the sidebar share this, so they cannot drift apart. */
+  --sidebar-width: 248px;
   display: grid;
-  grid-template-columns: 248px minmax(0, 1fr);
+  grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
   grid-template-rows: 56px minmax(0, 1fr) 56px;
   height: 100vh;
   overflow: hidden;
@@ -233,6 +235,20 @@ button {
     10px ui-monospace,
     monospace;
 }
+/* Loop status sits at the far right, and truncates rather than pushing. */
+.system-footer-loop {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-left: auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.system-footer-workers {
+  color: #bcd3a8;
+}
 .connection-dot {
   display: inline-block;
   width: 5px;
@@ -248,35 +264,103 @@ button {
   min-height: 0;
   overflow-y: auto;
 }
+.ticket-source-settings {
+  margin-bottom: 20px;
+}
+.ticket-source-settings h2,
+.agent-preference h2 {
+  font-size: 16px;
+  font-weight: 500;
+  margin: 7px 0 10px;
+}
+.ticket-source-settings > p:not(.app-eyebrow) {
+  color: #91a486;
+  margin: 0 0 20px;
+  font-size: 12px;
+}
+.provider-connections {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 16px;
+  margin-bottom: 4px;
+}
+.provider-connection {
+  border: 1px solid #2c3928;
+  border-radius: 8px;
+  padding: 12px 14px 14px;
+}
+.provider-connection-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.provider-connection-heading h3 {
+  font-size: 14px;
+  font-weight: 500;
+  margin: 0;
+}
+.provider-connection-note {
+  color: #91a486;
+  font-size: 12px;
+  margin: 8px 0 0;
+}
+.provider-connection-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+.agent-preferences-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 16px;
+}
+.agent-preference-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.agent-preference-heading h2 {
+  margin-top: 0;
+}
 .app-header {
   grid-column: 1 / -1;
   grid-row: 1;
   border-bottom: 1px solid #2e3a2a;
-  display: grid;
-  grid-template-columns: subgrid;
+  display: flex;
+  align-items: stretch;
   background: #1b241c;
   font-size: 13px;
 }
 .header-brand {
+  width: var(--sidebar-width);
+  flex: none;
   display: flex;
   align-items: center;
   justify-content: space-between;
   padding: 0 20px;
   border-right: 1px solid #344331;
 }
-.header-breadcrumbs {
+/* Takes the leftover width and truncates, so nothing either side can move. */
+.header-path {
+  flex: 1;
+  min-width: 0;
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  min-width: 0;
   padding: 0 24px;
-}
-.header-path {
-  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.header-controls {
+  flex: none;
+  display: flex;
+  align-items: center;
+  padding: 0 16px 0 12px;
 }
 .mobile-menu-button {
   display: none;
@@ -907,7 +991,7 @@ main {
 }
 @media (max-width: 1150px) {
   .desktop-shell {
-    grid-template-columns: 206px minmax(0, 1fr);
+    --sidebar-width: 206px;
   }
   .app-sidebar {
     padding-left: 10px;
@@ -916,7 +1000,7 @@ main {
   main {
     padding: 28px 24px;
   }
-  .header-breadcrumbs,
+  .header-path,
   .preview-notice {
     padding-left: 20px;
     padding-right: 20px;
@@ -959,13 +1043,16 @@ main {
     padding: 0 16px;
     border-right: 0;
   }
+  .header-controls {
+    margin-left: auto;
+    padding: 8px 16px;
+  }
   .mobile-menu-button {
     display: inline-flex;
   }
-  .header-breadcrumbs {
-    width: 100%;
+  .header-path {
+    flex: 1 0 auto;
     min-height: 48px;
-    flex-wrap: wrap;
     padding: 8px 16px;
     border-top: 1px solid #2e3a2a;
   }
@@ -1157,6 +1244,60 @@ main {
   color: #d09c4f;
 }
 
+/* Ticket picker */
+.ticket-picker-note {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 16px;
+  font-size: 12px;
+  color: #a1b193;
+}
+.ticket-picker-list {
+  display: grid;
+  gap: 4px;
+  margin-top: 16px;
+  max-height: 320px;
+  overflow-y: auto;
+}
+.ticket-pick {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 4px 10px;
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.ticket-pick:hover:not(:disabled),
+.ticket-pick.active {
+  background: #1e2a1e;
+  border-color: #34452c;
+}
+.ticket-pick:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+.ticket-pick > code {
+  font-size: 11px;
+  color: #a1b193;
+}
+.ticket-pick > strong {
+  font-size: 13px;
+  font-weight: 500;
+}
+.ticket-pick > small {
+  grid-column: 1 / -1;
+  font-size: 11px;
+  color: #a1b193;
+}
+
 /* Agent chat */
 .agent-chat {
   display: flex;
@@ -1245,19 +1386,44 @@ main {
 }
 
 /* Optional worker controls below the ticket queue */
+/* One block: the worker count and the start button, joined and fixed width. */
 .loop-bar {
   display: flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-  flex-shrink: 0;
-}
-.loop-bar-note {
-  font-size: 12px;
-  max-width: 260px;
+  align-items: stretch;
+  flex: none;
+  height: 34px;
+  border: 1px solid #3d4d35;
+  border-radius: 8px;
+  background: #1d281c;
   overflow: hidden;
-  text-overflow: ellipsis;
+}
+.loop-bar-workers {
+  display: flex;
+  align-items: center;
+  padding-left: 8px;
+}
+.loop-bar-workers .mantine-NumberInput-input {
+  background: transparent;
+  /* The stepper sits in a 17px section over the right edge of the input. Pad
+   * past it so the right-aligned number does not touch the arrows. */
+  padding-right: 24px;
+  color: #d7e1cf;
+  font-size: 13px;
+  text-align: right;
+}
+.loop-bar-unit {
+  padding: 0 10px 0 4px;
+  color: #8aa17b;
+  font-size: 12px;
   white-space: nowrap;
+}
+.loop-bar .loop-bar-run {
+  height: auto;
+  min-height: 0;
+  width: 40px;
+  flex: none;
+  border-radius: 0;
+  border-left: 1px solid #3d4d35;
 }
 
 /* Settings page: one narrow reading column of named groups. Each setting is a

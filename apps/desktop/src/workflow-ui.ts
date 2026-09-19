@@ -38,11 +38,38 @@ export interface WorkflowRuntime {
   connected: boolean;
   /** Keys: ticket-agent:<project id>, planner:<ticket id>, or agent-task id. */
   threads: Record<string, AgentThreadView>;
-  mergeQueues?: Record<string, string[]>;
+  mergeQueues?: Record<string, MergeEntry[]>;
   ticketBranches?: Record<string, string>;
   pullRequests?: Record<string, { url: string; status: string }>;
   dispatch: (action: WorkflowAction) => Promise<void>;
 }
+/**
+ * One merge attempt on a ticket.
+ *
+ * Nothing is ever dropped from this list. An attempt that landed, gave up or
+ * died is kept beside the ones still in the line, so the list is the ticket's
+ * whole merge history and reads back the same weeks later.
+ */
+export interface MergeEntry {
+  taskId: string;
+  status: "waiting" | "merging" | "conflict" | "merged" | "left" | "abandoned";
+  /** When the attempt joined the line. Milliseconds since the epoch, 0 if unknown. */
+  at: number;
+}
+/** Attempts still in the line. Everything else is history. */
+export function mergeIsLive(entry: MergeEntry): boolean {
+  return ["waiting", "merging", "conflict"].includes(entry.status);
+}
+/** Merge history reuses the worker labels, so one state has one name everywhere. */
+export const mergeActivity: Record<MergeEntry["status"], AgentActivity> = {
+  waiting: "waiting-to-merge",
+  merging: "merging",
+  conflict: "fixing-conflicts",
+  merged: "merged",
+  left: "done",
+  abandoned: "blocked",
+};
+
 export const activityLabels: Record<AgentActivity, string> = {
   queued: "Queued",
   coding: "Coding",
@@ -54,12 +81,18 @@ export const activityLabels: Record<AgentActivity, string> = {
   "fixing-conflicts": "Fixing conflicts",
   paused: "Paused",
   blocked: "Blocked",
-  done: "Done",
+  done: "Done, not merged",
+  merged: "Merged",
 };
 export function taskActivity(
   task: AgentTask,
   thread?: AgentThreadView,
+  /** True once the merge queue records this task as landed. */
+  merged = false,
 ): AgentActivity {
+  // Finishing and merging are different things, and only one of them means the
+  // work exists outside the worker's own worktree. They never share a label.
+  if (task.status === "complete") return merged ? "merged" : "done";
   if (thread) return thread.activity;
   return (
     {

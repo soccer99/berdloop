@@ -25,6 +25,8 @@ export type HarnessId = "claude-code" | "codex";
 
 export interface LaunchInput extends BriefInput {
   harness: HarnessId;
+  /** The model this role was set to, as the harness names it. */
+  model?: string;
   trust?: Trust;
   binary?: string;
   extensions?: Extensions;
@@ -189,6 +191,11 @@ export interface ConversationInput {
    * its own plugins, none of them the user's.
    */
   home?: string;
+  /**
+   * The model this role was set to, as the harness names it. Empty or absent
+   * leaves the harness on its own default.
+   */
+  model?: string;
 }
 
 /**
@@ -222,6 +229,7 @@ export function planConversation(input: ConversationInput): LaunchPlan {
     const merged = inPrompt(base);
     const args = ["exec"];
     if (input.resume) args.push("resume", input.resume);
+    if (input.model) args.push("--model", input.model);
     args.push(
       // Codex has a real sandbox, so the tighter setting is a genuine one.
       ...(trust === "workspace"
@@ -261,6 +269,7 @@ export function planConversation(input: ConversationInput): LaunchPlan {
   } else if (input.sessionId) {
     args.push("--session-id", input.sessionId);
   }
+  if (input.model) args.push("--model", input.model);
   // Load nothing of the user's unless they have turned it on.
   args.push("--setting-sources", (extras.settingSources ?? []).join(","));
   if (extras.mcpConfig) {
@@ -335,6 +344,7 @@ export function planLaunch(input: LaunchInput): LaunchPlan {
     extensions: input.extensions,
     home: input.home,
     harness: input.harness,
+    model: input.model,
     role: input.role ?? "worker",
     cwd: input.worktree,
     prompt: buildTaskBrief(input),
