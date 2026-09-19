@@ -58,6 +58,7 @@ import type { ConversationSnapshot } from "./conversation-routing";
 import { HumanRequestCard } from "./agent-chat";
 import { orderAgentTasks, orderTickets, routeSteering } from "./jev";
 import { ChangesPanel } from "./changes-panel";
+import { useTaskChanges } from "./use-task-changes";
 import { stripDiffBodies } from "./diff";
 import { openExternally } from "./external-link";
 
@@ -596,10 +597,9 @@ export function QueueView({
   const [search, setSearch] = useState("");
   const [notice, setNotice] = useState("");
   const [quote, setQuote] = useState<{ id: number; text: string }>();
-  // Both are keyed by task id, so a tab choice and a file count never leak
-  // from the task they were made on to the next one opened.
+  // Keyed by task id, so a tab choice never leaks from the task it was made
+  // on to the next one opened.
   const [taskTabs, setTaskTabs] = useState<Record<string, string>>({});
-  const [changeCounts, setChangeCounts] = useState<Record<string, number>>({});
   const [editTicket, setEditTicket] = useState(false);
   const [taskEditor, setTaskEditor] = useState<AgentTask | "new" | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<{
@@ -627,6 +627,18 @@ export function QueueView({
   );
   const selected = tasks.find((item) => item.id === selectedTaskId);
   const thread = selected ? runtime?.threads[selected.id] : undefined;
+  const taskTab = selected ? (taskTabs[selected.id] ?? "thread") : "thread";
+  // The detail page owns the changes, so the tab label's count, the thread and
+  // the Changes tab read one value, and a shut tab does not follow the agent.
+  const changes = useTaskChanges({
+    projectId: ticket?.projectId ?? "",
+    ticket: ticket?.ticket ?? "",
+    taskId: selected?.id ?? "",
+    enabled: !!thread?.worktree,
+    streaming: thread?.streaming,
+    messageCount: thread?.messages.length ?? 0,
+    visible: taskTab === "changes",
+  });
   const mergeQueue: MergeEntry[] = ticket
     ? (runtime?.mergeQueues?.[ticket.id] ??
       tasks
@@ -1542,11 +1554,11 @@ export function QueueView({
                         )}
                       </div>
                       <Tabs
-                        // A hidden panel's effects are torn down under the
-                        // default Activity mode, which would stop the changes
-                        // reloading while the thread is on screen.
+                        // Keeping the hidden panel in the tree holds its scroll
+                        // and its seen marks; the fetching is the page's, not
+                        // the panel's, so nothing depends on this.
                         keepMountedMode="display-none"
-                        value={taskTabs[selected.id] ?? "thread"}
+                        value={taskTab}
                         onChange={(value) =>
                           setTaskTabs((current) => ({
                             ...current,
@@ -1572,10 +1584,9 @@ export function QueueView({
                             value="changes"
                             leftSection={<IconFileDiff size={14} />}
                             rightSection={
-                              changeCounts[selected.id] ===
-                              undefined ? undefined : (
+                              changes.data === undefined ? undefined : (
                                 <Badge size="xs" color="gray" variant="light">
-                                  {changeCounts[selected.id]}
+                                  {changes.data.files.length}
                                 </Badge>
                               )
                             }
@@ -1626,18 +1637,8 @@ export function QueueView({
                         <Tabs.Panel value="changes" pt="sm">
                           {thread?.worktree ? (
                             <ChangesPanel
-                              projectId={ticket.projectId}
-                              ticket={ticket.ticket}
                               taskId={selected.id}
-                              streaming={thread.streaming}
-                              messageCount={thread.messages.length}
-                              onCount={(count) =>
-                                setChangeCounts((current) =>
-                                  current[selected.id] === count
-                                    ? current
-                                    : { ...current, [selected.id]: count },
-                                )
-                              }
+                              changes={changes}
                               onQuote={(text) =>
                                 setQuote((current) => ({
                                   id: (current?.id ?? 0) + 1,

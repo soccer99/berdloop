@@ -1,7 +1,8 @@
-import { Fragment, useEffect, useRef, useState } from "react";
+import { Fragment, useState } from "react";
 import { Button, Checkbox, Loader, SegmentedControl } from "@mantine/core";
-import { invoke, isTauri } from "@tauri-apps/api/core";
+import { isTauri } from "@tauri-apps/api/core";
 import { parseDiff, quoteLine, type DiffLine } from "./diff";
+import type { ChangesBase, TaskChanges } from "./use-task-changes";
 
 export interface ChangedFile {
   path: string;
@@ -16,7 +17,6 @@ export interface Changes {
   files: ChangedFile[];
 }
 
-type Base = "ticket" | "commit" | "turn";
 const bases = [
   { value: "ticket", label: "Ticket branch" },
   { value: "commit", label: "Last commit" },
@@ -44,67 +44,25 @@ function writeSeen(taskId: string, seen: Record<string, string>) {
   }
 }
 
+/**
+ * The Changes tab's body. The fetching lives in the worker detail page above
+ * it (see `useTaskChanges`), so the thread reads the same value and a shut tab
+ * never polls.
+ */
 export function ChangesPanel({
-  projectId,
-  ticket,
   taskId,
-  streaming,
-  messageCount,
-  onCount,
+  changes,
   onQuote,
 }: {
-  projectId: string;
-  /** Ticket key, for example ENG-42. */
-  ticket: string;
   taskId: string;
-  streaming?: boolean;
-  messageCount: number;
-  /** Reports how many files the current base turned up, for the tab label. */
-  onCount?: (count: number) => void;
+  changes: TaskChanges;
   onQuote: (text: string) => void;
 }) {
-  const [base, setBase] = useState<Base>("ticket");
-  const [changes, setChanges] = useState<Changes>();
-  const [error, setError] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [nonce, setNonce] = useState(0);
+  const { base, setBase, data, error, loading, refresh } = changes;
   const [picked, setPicked] = useState("");
   const [seen, setSeen] = useState(() => readSeen(taskId));
-  const was = useRef(false);
-  const native = isTauri();
 
-  // Reload once the agent stops writing, not while it writes.
-  useEffect(() => {
-    if (was.current && !streaming) setNonce((current) => current + 1);
-    was.current = !!streaming;
-  }, [streaming]);
-
-  useEffect(() => {
-    if (!native) return;
-    let live = true;
-    setLoading(true);
-    invoke<Changes>("git_task_changes", { projectId, ticket, taskId, base })
-      .then((result) => {
-        if (!live) return;
-        setChanges(result);
-        setError("");
-        onCount?.(result.files.length);
-      })
-      .catch((cause) => {
-        if (!live) return;
-        setChanges(undefined);
-        setError(String(cause));
-        onCount?.(0);
-      })
-      .finally(() => {
-        if (live) setLoading(false);
-      });
-    return () => {
-      live = false;
-    };
-  }, [native, projectId, ticket, taskId, base, messageCount, nonce]);
-
-  if (!native) return null;
+  if (!isTauri()) return null;
 
   function mark(file: ChangedFile, checked: boolean) {
     setSeen((current) => {
@@ -128,27 +86,23 @@ export function ChangesPanel({
           size="xs"
           data={bases}
           value={base}
-          onChange={(value) => setBase(value as Base)}
+          onChange={(value) => setBase(value as ChangesBase)}
         />
-        <Button
-          variant="subtle"
-          size="xs"
-          onClick={() => setNonce((current) => current + 1)}
-        >
+        <Button variant="subtle" size="xs" onClick={refresh}>
           Refresh
         </Button>
         {loading && <Loader size="xs" />}
-        {changes && <small>{changes.baseLabel}</small>}
+        {data && <small>{data.baseLabel}</small>}
       </div>
       {error && (
         <p className="task-error" role="alert">
           {error}
         </p>
       )}
-      {!error && !loading && changes?.files.length === 0 && (
+      {!error && !loading && data?.files.length === 0 && (
         <small>No changes against this base yet.</small>
       )}
-      {changes?.files.map((file) => {
+      {data?.files.map((file) => {
         const read = seen[file.path] === file.fingerprint;
         return (
           <article className="wf-file" key={file.path}>
