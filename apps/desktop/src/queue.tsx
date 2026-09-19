@@ -56,6 +56,7 @@ import type { ConversationSnapshot } from "./conversation-routing";
 import { HumanRequestCard } from "./agent-chat";
 import { orderAgentTasks, orderTickets, routeSteering } from "./jev";
 import { ChangesPanel } from "./changes-panel";
+import { stripDiffBodies } from "./diff";
 import { openExternally } from "./external-link";
 
 interface QueueProps {
@@ -197,6 +198,12 @@ function Log({
     if (follow.current && scroll.current)
       scroll.current.scrollTop = scroll.current.scrollHeight;
   }, [messages, streaming]);
+  // A diff is read in the Changes tab, never here, so whatever an agent pasted
+  // into its own text is taken out before the thread draws it. A message that
+  // was nothing but a diff has nothing left to say and is not drawn at all.
+  const shown = messages
+    .map((message) => ({ ...message, text: stripDiffBodies(message.text) }))
+    .filter((message) => message.text);
   return (
     <div
       className="wf-log"
@@ -212,12 +219,12 @@ function Log({
             el.scrollHeight - el.scrollTop - el.clientHeight < 60;
       }}
     >
-      {messages.length === 0 && (
+      {shown.length === 0 && (
         <p className="wf-log-empty">
           No messages yet. Instructions and agent updates appear here.
         </p>
       )}
-      {messages.map((message) => (
+      {shown.map((message) => (
         <article
           className={`wf-message wf-message-${message.role}`}
           key={message.id}
@@ -991,7 +998,8 @@ export function QueueView({
               <RowStats thread={currentThread} now={now} />
             </small>
             <p>
-              {currentThread?.messages.at(-1)?.text ??
+              {/* The same text as the thread, so no diff leaks through here either. */}
+              {stripDiffBodies(currentThread?.messages.at(-1)?.text ?? "") ||
                 (item.status === "queued" && item.dependencyIds.length
                   ? "Waiting for dependencies"
                   : queued

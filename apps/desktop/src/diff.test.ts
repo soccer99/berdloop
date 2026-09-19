@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { parseDiff, quoteLine } from "./diff";
+import { parseDiff, quoteLine, stripDiffBodies } from "./diff";
 
 describe("parseDiff", () => {
   test("numbers the lines of every hunk", () => {
@@ -124,5 +124,108 @@ describe("quoteLine", () => {
 
   test("quotes a whole file without a line", () => {
     expect(quoteLine("src/foo.ts")).toBe("In `src/foo.ts`:\n\n");
+  });
+});
+
+describe("stripDiffBodies", () => {
+  test("a fenced diff loses the hunk and keeps the prose", () => {
+    const message = [
+      "I widened the timeout, because the merge queue was outrunning it.",
+      "",
+      "```diff",
+      "diff --git a/src/queue.ts b/src/queue.ts",
+      "index 1111111..2222222 100644",
+      "--- a/src/queue.ts",
+      "+++ b/src/queue.ts",
+      "@@ -10,3 +10,3 @@ function wait() {",
+      " const start = now();",
+      "-const limit = 1000;",
+      "+const limit = 5000;",
+      "```",
+      "",
+      "Tests pass. Merging next.",
+    ].join("\n");
+    expect(stripDiffBodies(message)).toBe(
+      [
+        "I widened the timeout, because the merge queue was outrunning it.",
+        "",
+        "Tests pass. Merging next.",
+      ].join("\n"),
+    );
+  });
+
+  test("an unfenced diff goes, header and all", () => {
+    expect(
+      stripDiffBodies(
+        [
+          "Here is what changed:",
+          "diff --git a/a.ts b/a.ts",
+          "--- a/a.ts",
+          "+++ b/a.ts",
+          "@@ -1,2 +1,2 @@",
+          "-const one = 1;",
+          "+const one = 2;",
+          "That is the whole of it.",
+        ].join("\n"),
+      ),
+    ).toBe("Here is what changed:\nThat is the whole of it.");
+  });
+
+  test("a bare hunk goes without any header above it", () => {
+    expect(
+      stripDiffBodies(
+        ["Before", "@@ -3,2 +3,2 @@", "-old();", "+new();", "After"].join("\n"),
+      ),
+    ).toBe("Before\nAfter");
+  });
+
+  test("an unlabelled fence holding a diff goes too", () => {
+    expect(
+      stripDiffBodies(
+        ["Look:", "```", "@@ -1 +1 @@", "-a", "+b", "```", "Done."].join("\n"),
+      ),
+    ).toBe("Look:\nDone.");
+  });
+
+  test("a message that is only a diff strips to nothing", () => {
+    expect(stripDiffBodies(["@@ -1 +1 @@", "-a", "+b"].join("\n"))).toBe("");
+  });
+
+  test("text with no diff in it comes back untouched", () => {
+    const message = [
+      "Two things to note:",
+      "",
+      "- the worker merged first",
+      "- the rest is markdown, not a diff",
+      "",
+      "---",
+      "",
+      "```ts",
+      "const a = 1;",
+      "```",
+      "",
+      "+1 to landing it.",
+    ].join("\n");
+    expect(stripDiffBodies(message)).toBe(message);
+  });
+
+  test("a code fence keeps every line of its code", () => {
+    const message = ["```sh", "git diff", "- not a deletion", "```"].join("\n");
+    expect(stripDiffBodies(message)).toBe(message);
+  });
+
+  test("a bullet list under a hunk survives", () => {
+    expect(
+      stripDiffBodies(
+        [
+          "@@ -1,2 +1,2 @@",
+          "-a",
+          "+b",
+          "",
+          "- and then I ran the tests",
+          "- they pass",
+        ].join("\n"),
+      ),
+    ).toBe("- and then I ran the tests\n- they pass");
   });
 });

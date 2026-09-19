@@ -19,6 +19,7 @@ import {
   type AgentThreadView,
   type ThreadMessage,
 } from "./workflow-ui";
+import { stripDiffBodies } from "./diff";
 
 /**
  * One agent conversation.
@@ -304,12 +305,16 @@ export function HumanRequestCard({
 }
 
 function Bubble({ message }: { message: ThreadMessage }) {
+  // Diffs are read in the Changes tab. This chat shows what was said about a
+  // change, so a hunk pasted into the text goes before the bubble is drawn.
+  const text = stripDiffBodies(message.text);
+  if (!text) return null;
   if (message.role === "system") {
-    return <p className="agent-chat-system">{message.text}</p>;
+    return <p className="agent-chat-system">{text}</p>;
   }
   return (
     <div className={`agent-chat-message ${message.role}`}>
-      <p>{message.text}</p>
+      <p>{text}</p>
       {message.delivery && message.role === "user" && (
         <small className={message.delivery === "pending" ? "warn" : "muted"}>
           {DELIVERY_NOTE[message.delivery]}
