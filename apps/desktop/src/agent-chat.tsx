@@ -22,6 +22,8 @@ import {
 import { diffFiles, stripDiffBodies } from "./diff";
 import { ThreadFiles } from "./thread-files";
 import type { Changes } from "./changes-panel";
+import { useDraft } from "./drafts";
+import { shouldSendOnKey } from "./send-shortcut";
 
 /**
  * One agent conversation.
@@ -44,6 +46,12 @@ export interface HumanRequest {
 }
 
 export interface AgentChatProps {
+  /**
+   * The subject this conversation is about: a ticket agent, a task agent or a
+   * worker. Unsent text is kept under this key, so leaving the conversation
+   * and coming back does not throw it away.
+   */
+  draftKey: string;
   thread?: AgentThreadView;
   /** Anything this agent is waiting on a person for. */
   requests?: HumanRequest[];
@@ -70,6 +78,12 @@ export interface AgentChatProps {
   changes?: Changes;
 }
 
+/** Said next to every send control, so the keystroke is discoverable. */
+const SEND_HINT = "Send · Enter, or Cmd+Enter / Ctrl+Enter";
+
+/** The question variant answers on the modifier alone: Enter is a newline. */
+const ANSWER_HINT = "Send · Cmd+Enter / Ctrl+Enter";
+
 const DELIVERY_NOTE: Record<NonNullable<ThreadMessage["delivery"]>, string> = {
   saved: "Saved",
   pending: "Waits until the agent starts",
@@ -79,6 +93,7 @@ const DELIVERY_NOTE: Record<NonNullable<ThreadMessage["delivery"]>, string> = {
 };
 
 export function AgentChat({
+  draftKey,
   thread,
   requests = [],
   onAnswer,
@@ -90,7 +105,7 @@ export function AgentChat({
   placeholder,
   changes,
 }: AgentChatProps) {
-  const [draft, setDraft] = useState("");
+  const [draft, setDraft, , clearSentDraft] = useDraft(draftKey);
   const [busy, setBusy] = useState(false);
   const tail = useRef<HTMLDivElement>(null);
 
@@ -109,12 +124,16 @@ export function AgentChat({
   }, [messages.length, streaming]);
 
   async function send() {
-    const text = draft.trim();
+    const sent = draft;
+    const text = sent.trim();
     if (!text || busy) return;
     setBusy(true);
-    setDraft("");
     try {
       await onSend(text);
+      // Cleared here and nowhere else: a send that threw leaves the typed
+      // text as the only copy of it. Nothing is disabled while the send is in
+      // flight, so anything typed meanwhile was never sent and is kept.
+      clearSentDraft(sent);
     } finally {
       setBusy(false);
     }
@@ -218,21 +237,44 @@ export function AgentChat({
           }
           onChange={(event) => setDraft(event.currentTarget.value)}
           onKeyDown={(event) => {
-            // Enter sends. A newline still needs a modifier, as everywhere else.
+            // A half-typed CJK word is not an instruction: leave the IME alone.
+            if (event.nativeEvent.isComposing) return;
+            // Cmd+Enter and Ctrl+Enter send, the same keystroke as every other
+            // composer here, judged by the one shared predicate.
+            if (
+              shouldSendOnKey(
+                {
+                  key: event.key,
+                  metaKey: event.metaKey,
+                  ctrlKey: event.ctrlKey,
+                  shiftKey: event.shiftKey,
+                  isComposing: event.nativeEvent.isComposing,
+                },
+                { text: draft, busy },
+              )
+            ) {
+              event.preventDefault();
+              void send();
+              return;
+            }
+            // Bare Enter sends too, as it always has here. A newline still
+            // needs a modifier, as everywhere else.
             if (event.key === "Enter" && !event.shiftKey) {
               event.preventDefault();
               void send();
             }
           }}
         />
-        <ActionIcon
-          size="lg"
-          disabled={!draft.trim() || busy}
-          onClick={() => void send()}
-          aria-label="Send"
-        >
-          <IconArrowUp size={17} />
-        </ActionIcon>
+        <Tooltip label={SEND_HINT}>
+          <ActionIcon
+            size="lg"
+            disabled={!draft.trim() || busy}
+            onClick={() => void send()}
+            aria-label="Send"
+          >
+            <IconArrowUp size={17} />
+          </ActionIcon>
+        </Tooltip>
       </div>
     </section>
   );
@@ -251,8 +293,24 @@ export function HumanRequestCard({
   request: HumanRequest;
   onAnswer?: AgentChatProps["onAnswer"];
 }) {
-  const [note, setNote] = useState("");
+  // Keyed by the request, and by the task it belongs to, so a half-typed
+  // reason survives the card unmounting and is never shown against another.
+  const [note, setNote, clearNote] = useDraft(
+    `human-request:${request.taskId}:${request.id}`,
+  );
   const approval = request.kind === "approval";
+
+  async function answer(approved: boolean, text: string) {
+    await onAnswer?.(request.id, approved, text);
+    clearNote();
+  }
+
+  /** The question variant's one way to answer, for the button and the key. */
+  function submitAnswer() {
+    const text = note.trim();
+    if (!text) return;
+    void answer(true, text);
+  }
 
   return (
     <div className="agent-ask">
@@ -264,18 +322,14 @@ export function HumanRequestCard({
         <div className="agent-ask-actions">
           <Button
             size="xs"
-            onClick={() =>
-              void onAnswer?.(request.id, true, note || "Allowed.")
-            }
+            onClick={() => void answer(true, note || "Allowed.")}
           >
             Allow
           </Button>
           <Button
             size="xs"
             variant="default"
-            onClick={() =>
-              void onAnswer?.(request.id, false, note || "Refused.")
-            }
+            onClick={() => void answer(false, note || "Refused.")}
           >
             Refuse
           </Button>
@@ -295,14 +349,31 @@ export function HumanRequestCard({
             placeholder="Your answer"
             value={note}
             onChange={(event) => setNote(event.currentTarget.value)}
+            onKeyDown={(event) => {
+              // Only the question variant takes a keystroke. An approval has
+              // Allow and Refuse, and Enter cannot say which one you meant.
+              if (
+                shouldSendOnKey(
+                  {
+                    key: event.key,
+                    metaKey: event.metaKey,
+                    ctrlKey: event.ctrlKey,
+                    shiftKey: event.shiftKey,
+                    isComposing: event.nativeEvent.isComposing,
+                  },
+                  { text: note },
+                )
+              ) {
+                event.preventDefault();
+                submitAnswer();
+              }
+            }}
           />
-          <Button
-            size="xs"
-            disabled={!note.trim()}
-            onClick={() => void onAnswer?.(request.id, true, note.trim())}
-          >
-            Send
-          </Button>
+          <Tooltip label={ANSWER_HINT}>
+            <Button size="xs" disabled={!note.trim()} onClick={submitAnswer}>
+              Send
+            </Button>
+          </Tooltip>
         </div>
       )}
     </div>
@@ -316,6 +387,11 @@ function Bubble({
   message: ThreadMessage;
   changes?: Changes;
 }) {
+  // A tool line is a tool's name and the arguments it was called with, not
+  // prose an agent wrote, so it is drawn as it came and never summarised.
+  if (message.role === "tool") {
+    return <ToolLine name={message.text} />;
+  }
   // Diffs are read in the Changes tab. This chat shows what was said about a
   // change, so a hunk pasted into the text goes before the bubble is drawn,
   // and the files it named become one row each in its place.
@@ -344,12 +420,31 @@ function Bubble({
   );
 }
 
-/** A tool line, for a caller that wants to show what an agent reached for. */
+/**
+ * A tool line, for a caller that wants to show what an agent reached for.
+ *
+ * The first line says the tool and what it was called with. Anything after it
+ * is the full input, which opens on a click: twenty tool calls stay a list,
+ * and any one of them can still be read.
+ */
 export function ToolLine({ name }: { name: string }) {
+  const newline = name.indexOf("\n");
+  const head = newline < 0 ? name : name.slice(0, newline);
+  const detail = newline < 0 ? "" : name.slice(newline + 1);
+  if (!detail) {
+    return (
+      <span className="agent-chat-tool">
+        <IconTool size={12} /> {head}
+      </span>
+    );
+  }
   return (
-    <span className="agent-chat-tool">
-      <IconTool size={12} /> {name}
-    </span>
+    <details className="agent-chat-tool">
+      <summary>
+        <IconTool size={12} /> {head}
+      </summary>
+      <pre>{detail}</pre>
+    </details>
   );
 }
 

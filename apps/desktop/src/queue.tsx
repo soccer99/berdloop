@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActionIcon,
   Badge,
@@ -26,6 +26,7 @@ import {
   IconPlayerPlay,
   IconPlayerStop,
   IconPlus,
+  IconRefresh,
   IconSearch,
   IconSparkles,
   IconTerminal2,
@@ -33,6 +34,7 @@ import {
 } from "@tabler/icons-react";
 import {
   addAgentTask,
+  requeueAgentTask,
   type AgentTask,
   type ExternalProvider,
   type Project,
@@ -55,8 +57,17 @@ import {
 import "./workflow.css";
 import type { Runtime } from "./workflow-runtime";
 import type { ConversationSnapshot } from "./conversation-routing";
-import { HumanRequestCard } from "./agent-chat";
+import { HumanRequestCard, ToolLine } from "./agent-chat";
+import { packText, unpackText, useDraft } from "./drafts";
+import {
+  appliedQuote,
+  forgetQuote,
+  type Quote,
+  quotePrefill,
+  rememberQuote,
+} from "./quote-prefill";
 import { orderAgentTasks, orderTickets, routeSteering } from "./jev";
+import { shouldSendOnKey } from "./send-shortcut";
 import { ChangesPanel } from "./changes-panel";
 import { useTaskChanges } from "./use-task-changes";
 import { focusFile, focusFor, type FocusRequest } from "./changes-focus";
@@ -213,11 +224,15 @@ function Log({
   // into its own text is taken out before the thread draws it and the files it
   // named become one row each. A message that was nothing but a diff keeps its
   // rows; one with neither words nor files left is not drawn at all.
+  //
+  // A tool line is exempt: its text is a tool's name and the arguments it was
+  // called with, not prose an agent wrote, so it is drawn as it came.
   const shown = messages
     .map((message) => ({
       ...message,
-      text: stripDiffBodies(message.text),
-      files: diffFiles(message.text),
+      text:
+        message.role === "tool" ? message.text : stripDiffBodies(message.text),
+      files: message.role === "tool" ? [] : diffFiles(message.text),
     }))
     .filter((message) => message.text || message.files.length);
   return (
@@ -240,46 +255,52 @@ function Log({
           No messages yet. Instructions and agent updates appear here.
         </p>
       )}
-      {shown.map((message) => (
-        <article
-          className={`wf-message wf-message-${message.role}`}
-          key={message.id}
-        >
-          <div>
-            <strong>
-              {message.role === "user"
-                ? "You"
-                : message.role === "agent"
-                  ? "Agent"
-                  : "Activity"}
-            </strong>
-            {message.at && (
-              <time dateTime={new Date(message.at).toISOString()}>
-                {new Date(message.at).toLocaleTimeString([], {
-                  hour: "2-digit",
-                  minute: "2-digit",
-                })}
-              </time>
-            )}
-            {message.target === "all-workers" && (
-              <span>To all ticket workers</span>
-            )}
-            {message.delivery && (
-              <span>
-                {message.delivery === "saved"
-                  ? "Saved · not sent"
-                  : message.delivery}
-              </span>
-            )}
-          </div>
-          {message.text && <p>{message.text}</p>}
-          <ThreadFiles
-            files={message.files}
-            changes={changes}
-            onOpen={onOpenChanges}
-          />
-        </article>
-      ))}
+      {shown.map((message) =>
+        // A tool call is not something anybody said. It gets one line, so a
+        // run of twenty of them still reads as one stretch of work.
+        message.role === "tool" ? (
+          <ToolLine key={message.id} name={message.text} />
+        ) : (
+          <article
+            className={`wf-message wf-message-${message.role}`}
+            key={message.id}
+          >
+            <div>
+              <strong>
+                {message.role === "user"
+                  ? "You"
+                  : message.role === "agent"
+                    ? "Agent"
+                    : "Activity"}
+              </strong>
+              {message.at && (
+                <time dateTime={new Date(message.at).toISOString()}>
+                  {new Date(message.at).toLocaleTimeString([], {
+                    hour: "2-digit",
+                    minute: "2-digit",
+                  })}
+                </time>
+              )}
+              {message.target === "all-workers" && (
+                <span>To all ticket workers</span>
+              )}
+              {message.delivery && (
+                <span>
+                  {message.delivery === "saved"
+                    ? "Saved · not sent"
+                    : message.delivery}
+                </span>
+              )}
+            </div>
+            {message.text && <p>{message.text}</p>}
+            <ThreadFiles
+              files={message.files}
+              changes={changes}
+              onOpen={onOpenChanges}
+            />
+          </article>
+        ),
+      )}
       {streaming && (
         <div className="wf-streaming">
           <span className="connection-dot" />
@@ -290,7 +311,13 @@ function Log({
   );
 }
 
+/** Said on every send control, so the keystroke is discoverable. */
+function sendHint(connected: boolean) {
+  return `${connected ? "Send instruction" : "Save instruction"} · Cmd+Enter / Ctrl+Enter`;
+}
+
 function Composer({
+  draftKey,
   label,
   placeholder,
   connected,
@@ -298,7 +325,14 @@ function Composer({
   targets,
   inlineSend = false,
   quote,
+  onQuoteApplied,
 }: {
+  /**
+   * The subject being written about, named by the mount site: the ticket
+   * agent, the planner or one worker. The unsent text is kept under this key,
+   * so it comes back after the body unmounts or the whole composer remounts.
+   */
+  draftKey: string;
   label: string;
   placeholder: string;
   connected: boolean;
@@ -306,31 +340,37 @@ function Composer({
   targets?: { value: string; label: string }[];
   inlineSend?: boolean;
   /** Text to start a message with. A new `id` adds it to the draft. */
-  quote?: { id: number; text: string };
+  quote?: Quote;
+  onQuoteApplied?: () => void;
 }) {
-  const [text, setText] = useState("");
+  const [text, setText, , clearSentDraft] = useDraft(draftKey);
   const [target, setTarget] = useState(targets?.[0]?.value ?? "worker");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const input = useRef<HTMLTextAreaElement>(null);
-  const applied = useRef(0);
-  const quoted = useRef("");
   useEffect(() => {
-    if (!quote || applied.current === quote.id) return;
-    applied.current = quote.id;
-    // Replace the quote still at the top of the draft, else add to it.
-    setText((current) =>
-      quoted.current && current.startsWith(quoted.current)
-        ? quote.text + current.slice(quoted.current.length)
-        : quote.text + current,
-    );
-    quoted.current = quote.text;
-    input.current?.focus();
-  }, [quote]);
+    if (!quote) return;
+    // What the draft already carries is remembered outside this component,
+    // because the draft outlives it: a ref would reset on remount and prepend
+    // the same quote on top of the restored copy of itself. `quotePrefill`
+    // holds the rule, and returns null when there is nothing left to do.
+    const prefill = quotePrefill(text, quote, appliedQuote(draftKey));
+    if (prefill) {
+      rememberQuote(draftKey, prefill.applied);
+      if (prefill.text !== text) {
+        setText(prefill.text);
+        input.current?.focus();
+      }
+    }
+    // The quote is one instruction, not lasting state. Telling the view it
+    // landed is what stops it following the person to the next task.
+    onQuoteApplied?.();
+  }, [quote, draftKey, text, setText, onQuoteApplied]);
   const sendButton = (
     <Button
       size="xs"
       type="submit"
+      title={sendHint(connected)}
       disabled={!text.trim()}
       loading={busy}
       rightSection={<IconArrowUp size={14} />}
@@ -344,11 +384,20 @@ function Composer({
       onSubmit={async (event) => {
         event.preventDefault();
         if (!text.trim()) return;
+        const sent = text;
         setBusy(true);
         setError("");
         try {
-          await onSend(text.trim(), target as WorkflowAction["target"]);
-          setText("");
+          await onSend(sent.trim(), target as WorkflowAction["target"]);
+          // Only here. The catch below leaves the draft alone, because a send
+          // that failed leaves the typed text as the only copy. The box stays
+          // live while the send is in flight, so anything typed meanwhile was
+          // never sent and stays where it is.
+          if (clearSentDraft(sent)) {
+            // The draft went with it, and so did the quote at its top. When
+            // it did not, the quote is still sitting in what stayed behind.
+            forgetQuote(draftKey);
+          }
         } catch (cause) {
           setError(String(cause));
         } finally {
@@ -366,11 +415,30 @@ function Composer({
           maxRows={7}
           value={text}
           onChange={(event) => setText(event.currentTarget.value)}
+          onKeyDown={(event) => {
+            if (
+              !shouldSendOnKey(
+                {
+                  key: event.key,
+                  metaKey: event.metaKey,
+                  ctrlKey: event.ctrlKey,
+                  shiftKey: event.shiftKey,
+                  isComposing: event.nativeEvent.isComposing,
+                },
+                { text, busy },
+              )
+            )
+              return;
+            event.preventDefault();
+            // Through the form, so onSubmit's error handling, busy flag and
+            // clear-on-success run exactly as they do for the send button.
+            event.currentTarget.form?.requestSubmit();
+          }}
         />
         {inlineSend && (
           <ActionIcon
-            aria-label={connected ? "Send instruction" : "Save instruction"}
-            title={connected ? "Send instruction" : "Save instruction"}
+            aria-label={sendHint(connected)}
+            title={sendHint(connected)}
             size="sm"
             type="submit"
             disabled={!text.trim()}
@@ -394,8 +462,8 @@ function Composer({
           ) : (
             <small>
               {connected
-                ? "Instructions stay with this thread."
-                : "Saved locally until agents are connected."}
+                ? "Instructions stay with this thread. Cmd+Enter (Ctrl+Enter) sends."
+                : "Saved locally until agents are connected. Cmd+Enter (Ctrl+Enter) saves."}
             </small>
           )}
           {!inlineSend && sendButton}
@@ -411,6 +479,7 @@ function Composer({
 }
 
 function AgentConversation({
+  draftKey,
   messages,
   streaming,
   label,
@@ -420,9 +489,12 @@ function AgentConversation({
   targets,
   inlineSend,
   quote,
+  onQuoteApplied,
   changes,
   onOpenChanges,
 }: {
+  /** Subject of the unsent text, passed straight to the composer. */
+  draftKey: string;
   messages: ThreadMessage[];
   streaming?: boolean;
   label: string;
@@ -432,7 +504,9 @@ function AgentConversation({
   targets?: { value: string; label: string }[];
   inlineSend?: boolean;
   /** Text to put at the top of the draft. A new id applies it again. */
-  quote?: { id: number; text: string };
+  quote?: Quote;
+  /** Told once the composer has taken the quote in, so it can be dropped. */
+  onQuoteApplied?: () => void;
   /** The task's changes, for the line counts on the file rows. */
   changes?: Changes;
   onOpenChanges?: (path: string) => void;
@@ -446,6 +520,7 @@ function AgentConversation({
         onOpenChanges={onOpenChanges}
       />
       <Composer
+        draftKey={draftKey}
         label={label}
         placeholder={placeholder}
         connected={connected}
@@ -453,6 +528,7 @@ function AgentConversation({
         targets={targets}
         inlineSend={inlineSend}
         quote={quote}
+        onQuoteApplied={onQuoteApplied}
       />
     </>
   );
@@ -559,6 +635,7 @@ function Coordinator({
           style={{ height }}
         >
           <AgentConversation
+            draftKey={threadKey}
             messages={threadMessages(thread?.messages, messages)}
             streaming={thread?.streaming}
             quote={quote}
@@ -618,13 +695,22 @@ export function QueueView({
   onPrepareAgent,
   beta = false,
 }: QueueProps) {
+  /** What the view is scoped to: one project, or a whole organization. */
+  const projectScope = projectId || `organization:${organizationId}`;
   const [selectedTaskId, setSelectedTaskId] = useState("");
   const dragging = useRef<{ kind: "ticket" | "task"; id: string } | null>(null);
   const threadPanel = useRef<HTMLElement>(null);
   const [step, setStep] = useState("work");
-  const [search, setSearch] = useState("");
+  const [search, setSearch] = useDraft(`ticket-search:${projectScope}`);
   const [notice, setNotice] = useState("");
-  const [quote, setQuote] = useState<{ id: number; text: string }>();
+  // A quote is an instruction the composer carries out once and then drops,
+  // so the composer's draft is the only place it lives afterwards. Leaving it
+  // here would hand the previous task's diff to the next task's composer.
+  const [quote, setQuote] = useState<Quote>();
+  // Ids rise for the life of the view, not of `quote`, which keeps going back
+  // to undefined: counting from what is there now would hand out id 1 twice.
+  const quotes = useRef(0);
+  const onQuoteApplied = useCallback(() => setQuote(undefined), []);
   // Keyed by task id, so a tab choice never leaks from the task it was made
   // on to the next one opened.
   const [taskTabs, setTaskTabs] = useState<Record<string, string>>({});
@@ -693,7 +779,7 @@ export function QueueView({
   const mergePosition = (taskId: string) =>
     stillWaiting.findIndex((item) => item.taskId === taskId);
   const connected = !!runtime?.connected;
-  const ticketAgentKey = `ticket-agent:${projectId || `organization:${organizationId}`}`;
+  const ticketAgentKey = `ticket-agent:${projectScope}`;
   const plannerKey = `planner:${ticket?.id ?? ""}`;
   const visibleTickets = tickets.filter((item) =>
     `${item.title} ${item.ticket}`.toLowerCase().includes(search.toLowerCase()),
@@ -717,9 +803,9 @@ export function QueueView({
     setStep("work");
     setNotice("");
   }, [selectedTicketId]);
-  useEffect(() => {
-    setSearch("");
-  }, [projectId]);
+  // No effect clears the search box when the project changes. The draft is
+  // keyed by the project, so another project's filter is never shown, and
+  // blanking it here would write an empty value over the draft being read.
   useEffect(() => {
     if (selectedTaskId && window.matchMedia("(max-width: 800px)").matches) {
       threadPanel.current?.scrollIntoView({ block: "start" });
@@ -922,6 +1008,14 @@ export function QueueView({
       list.splice(to, 0, moved);
       return { ...current, [key]: list } as TaskWorkspace;
     });
+  }
+  function requeue(task: AgentTask) {
+    try {
+      update((current) => requeueAgentTask(current, task.id));
+      setNotice(`${task.title} goes back to a fresh worker.`);
+    } catch (cause) {
+      setNotice(String(cause));
+    }
   }
   function remove() {
     if (!deleteTarget) return;
@@ -1567,6 +1661,23 @@ export function QueueView({
                           >
                             Edit task & prompt
                           </Button>
+                          <Button
+                            variant="subtle"
+                            size="xs"
+                            leftSection={<IconRefresh size={13} />}
+                            // Streaming is the one honest sign that a worker
+                            // is attached. Status is not: a task whose app was
+                            // killed still reads "running" with nobody on it.
+                            disabled={
+                              !ready ||
+                              selected.status === "complete" ||
+                              thread?.streaming
+                            }
+                            title="Hand this task to a fresh worker on the next loop tick"
+                            onClick={() => requeue(selected)}
+                          >
+                            Force re-run
+                          </Button>
                         </div>
                         <p>
                           {selected.prompt ??
@@ -1644,6 +1755,7 @@ export function QueueView({
                             ),
                           )}
                           <AgentConversation
+                            draftKey={`worker:${selected.id}`}
                             messages={threadMessages(
                               thread?.messages,
                               savedMessages[selected.id],
@@ -1661,6 +1773,7 @@ export function QueueView({
                             }
                             connected={connected}
                             quote={quote}
+                            onQuoteApplied={onQuoteApplied}
                             changes={changes.data}
                             onOpenChanges={(path) => {
                               setTaskTabs((current) => ({
@@ -1687,12 +1800,10 @@ export function QueueView({
                               taskId={selected.id}
                               changes={changes}
                               focus={focusFor(changesFocus, selected.id)}
-                              onQuote={(text) =>
-                                setQuote((current) => ({
-                                  id: (current?.id ?? 0) + 1,
-                                  text,
-                                }))
-                              }
+                              onQuote={(text) => {
+                                quotes.current += 1;
+                                setQuote({ id: quotes.current, text });
+                              }}
                             />
                           ) : (
                             <small>
@@ -2002,8 +2113,18 @@ function TicketEditor({
   onClose: () => void;
   onSave: (title: string, criteria: string) => void;
 }) {
-  const [title, setTitle] = useState(ticket.title);
-  const [criteria, setCriteria] = useState(ticket.criteria);
+  // Each seed doubles as its own base, so a draft is kept until the field it
+  // was taken from moves: the ticket agent can rewrite requirements through
+  // ticket_requirements while this modal sits closed, and a draft written
+  // against the old wording would be answering a question nobody asked.
+  const [title, setTitle, clearTitle] = useDraft(
+    `ticket-editor:${ticket.id}:title`,
+    { seed: ticket.title },
+  );
+  const [criteria, setCriteria, clearCriteria] = useDraft(
+    `ticket-editor:${ticket.id}:criteria`,
+    { seed: ticket.criteria },
+  );
   return (
     <Modal
       opened={opened}
@@ -2016,6 +2137,8 @@ function TicketEditor({
         onSubmit={(event) => {
           event.preventDefault();
           onSave(title.trim(), criteria.trim());
+          clearTitle();
+          clearCriteria();
         }}
       >
         <TextInput
@@ -2044,6 +2167,27 @@ function TicketEditor({
     </Modal>
   );
 }
+/**
+ * A draft holds text, so the dependency multi-select travels as JSON. An empty
+ * list has to survive too, which is why it is `[]` and not the empty string:
+ * blank text is never stored, so clearing every dependency would otherwise read
+ * back as the saved list.
+ */
+function packIds(ids: string[]) {
+  return JSON.stringify(ids);
+}
+
+function unpackIds(value: string): string[] {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return Array.isArray(parsed)
+      ? parsed.filter((id): id is string => typeof id === "string")
+      : [];
+  } catch {
+    return [];
+  }
+}
+
 function TaskEditor({
   opened,
   task,
@@ -2069,13 +2213,36 @@ function TaskEditor({
     prompt: string,
   ) => void;
 }) {
-  const [title, setTitle] = useState(task?.title ?? "");
-  const [criteria, setCriteria] = useState(task?.criteria ?? "");
-  const [instruction, setInstruction] = useState(
-    prompt ?? (task ? `${task.title}\n\n${task.criteria}` : ""),
+  // One subject per task, and the create form is its own. Every seed doubles
+  // as its own base, so a draft is dropped once the saved field it was written
+  // against has moved on.
+  const subject = `task-editor:${task?.id ?? "new"}`;
+  const [title, setTitle, clearTitle] = useDraft(`${subject}:title`, {
+    seed: task?.title ?? "",
+  });
+  const [criteria, setCriteria, clearCriteria] = useDraft(
+    `${subject}:criteria`,
+    { seed: task?.criteria ?? "" },
   );
-  const [dependencies, setDependencies] = useState(task?.dependencyIds ?? []);
-  const [assignee, setAssignee] = useState(task?.assigneeId ?? "");
+  const [packedInstruction, setInstruction, clearInstruction] = useDraft(
+    `${subject}:instruction`,
+    {
+      seed: packText(
+        prompt ?? (task ? `${task.title}\n\n${task.criteria}` : ""),
+      ),
+    },
+  );
+  const [packedDependencies, setDependencies, clearDependencies] = useDraft(
+    `${subject}:dependencies`,
+    { seed: packIds(task?.dependencyIds ?? []) },
+  );
+  const [packedAssignee, setAssignee, clearAssignee] = useDraft(
+    `${subject}:assignee`,
+    { seed: packText(task?.assigneeId ?? "") },
+  );
+  const instruction = unpackText(packedInstruction);
+  const assignee = unpackText(packedAssignee);
+  const dependencies = unpackIds(packedDependencies);
   const [error, setError] = useState("");
   // Exclude descendants as dependencies so editing cannot introduce a cycle.
   const excluded = new Set(task ? [task.id] : []);
@@ -2104,6 +2271,11 @@ function TaskEditor({
               },
               instruction.trim() || `${title.trim()}\n\n${criteria.trim()}`,
             );
+            clearTitle();
+            clearCriteria();
+            clearInstruction();
+            clearDependencies();
+            clearAssignee();
           } catch (cause) {
             setError(String(cause));
           }
@@ -2124,7 +2296,9 @@ function TaskEditor({
           minRows={5}
           autosize
           value={instruction}
-          onChange={(event) => setInstruction(event.currentTarget.value)}
+          onChange={(event) =>
+            setInstruction(packText(event.currentTarget.value))
+          }
         />
         <Textarea
           mt="md"
@@ -2141,14 +2315,14 @@ function TaskEditor({
             .filter((item) => !excluded.has(item.id))
             .map((item) => ({ value: item.id, label: item.title }))}
           value={dependencies}
-          onChange={setDependencies}
+          onChange={(ids) => setDependencies(packIds(ids))}
         />
         <TextInput
           mt="md"
           label="Assigned agent"
           description="Optional. Leave empty for the next available worker."
           value={assignee}
-          onChange={(event) => setAssignee(event.currentTarget.value)}
+          onChange={(event) => setAssignee(packText(event.currentTarget.value))}
         />
         {error && (
           <p role="alert" className="task-error">

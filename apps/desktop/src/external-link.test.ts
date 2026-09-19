@@ -1,5 +1,4 @@
 import { describe, expect, mock, test } from "bun:test";
-import * as core from "@tauri-apps/api/core";
 
 /**
  * One markup, two builds. A link to a pull request has to reach the person's
@@ -9,9 +8,15 @@ import * as core from "@tauri-apps/api/core";
 const opened: string[] = [];
 let tauri = false;
 
-// A module mock is global to the whole test run, so this one has to keep
-// every other export of the module: a test file loaded after this one still
-// needs the real invoke.
+/**
+ * `mock.module` replaces the module for the whole run, not just this file, so
+ * the stand-in has to carry the rest of `core` with it. Most of the app imports
+ * `invoke` from here, and a namespace without it cannot be linked: leaving it
+ * out failed whichever unrelated files bun happened to load after this one.
+ * `tauri` is false by the time they do, which is what the real `isTauri` says
+ * outside a Tauri window anyway.
+ */
+const core = await import("@tauri-apps/api/core");
 mock.module("@tauri-apps/api/core", () => ({ ...core, isTauri: () => tauri }));
 mock.module("@tauri-apps/plugin-opener", () => ({
   openUrl: async (url: string) => {

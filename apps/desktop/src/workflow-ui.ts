@@ -4,7 +4,8 @@ import type { AgentActivity, AgentTask, Task } from "@berdloop/core";
 export type { AgentActivity };
 export interface ThreadMessage {
   id: string;
-  role: "user" | "agent" | "system";
+  /** `tool` is one thing the agent reached for, drawn as a line, not prose. */
+  role: "user" | "agent" | "system" | "tool";
   text: string;
   at?: string | number;
   delivery?: "saved" | "pending" | "delivered" | "applied" | "failed";
