@@ -74,12 +74,9 @@ describe("standingOrders", () => {
         .map((name) => name.slice(noun.length + 1))
         .sort();
     const six = ["add", "edit", "merge", "remove", "reorder", "split"];
-    expect(operations("ticket-agent", "ticket")).toEqual([
-      ...six,
-      "pause",
-      "replan",
-      "resume",
-    ].sort());
+    expect(operations("ticket-agent", "ticket")).toEqual(
+      [...six, "pause", "replan", "resume"].sort(),
+    );
     expect(operations("task-agent", "task")).toEqual(
       [...six, "steer", "stop"].sort(),
     );
@@ -373,7 +370,10 @@ describe("per-worker runtime", () => {
   // Several workers share one machine. Ports and connection strings reach the
   // agent's own process, not only the worktree's env file, so a command the
   // agent types by hand still lands on its own port and its own database.
-  const runtime = { PORT: "41060", DATABASE_URL: "postgres://localhost/app_wt3" };
+  const runtime = {
+    PORT: "41060",
+    DATABASE_URL: "postgres://localhost/app_wt3",
+  };
 
   for (const harness of ["claude-code", "codex"] as const) {
     test(`${harness} runs with this worker's own ports and database`, () => {

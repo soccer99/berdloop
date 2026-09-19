@@ -61,14 +61,16 @@ import {
 import { HarnessModelSelects } from "./harness-model-selects";
 import { useHarnessCatalog } from "./harness-catalog";
 import { pruneDraftsForOwners, useDraft } from "./drafts";
+import { moveNewTicketDrafts, newTicketDraftKey } from "./new-ticket-draft";
 
 // The WorkOS adapter will provide this after account auth is connected.
 const workosSession: AccountSession | null = null;
 
 /**
- * The two pickers in the new-ticket form. What a person types there is
- * unsent work and lives in `useDraft`; these are re-aimed at the project in
- * view every time the form opens, so there is nothing to keep.
+ * The two pickers in the new-ticket form. What a person types there is unsent
+ * work and lives in `useDraft`; these are re-aimed every time the form opens,
+ * so there is nothing to keep. `projectId` is the project the ticket will be
+ * created in, which is also what names those drafts: see `new-ticket-draft`.
  */
 interface DraftTarget {
   projectId: string;
@@ -312,18 +314,19 @@ export default function App() {
     notes: string[];
   } | null>(null);
   const [draft, setDraft] = useState<DraftTarget>(emptyDraftTarget);
-  // Everything typed into the new-ticket form, kept against the project in
-  // view, so closing the modal or leaving the view never throws it away.
+  // Everything typed into the new-ticket form, kept against the project the
+  // ticket will be created in, so closing the modal or leaving the view never
+  // throws it away. That is `draft.projectId`, not the project in view: the
+  // organization view has none, and two organizations must not share a draft.
   const [ticketCriteriaSeed, setTicketCriteriaSeed] = useState("");
-  const newTicketKey = `new-ticket:${projectId || "none"}`;
   const [ticketTitle, setTicketTitle, clearTicketTitle] = useDraft(
-    `${newTicketKey}:title`,
+    newTicketDraftKey(draft.projectId, "title"),
   );
   const [ticketReference, setTicketReference, clearTicketReference] = useDraft(
-    `${newTicketKey}:reference`,
+    newTicketDraftKey(draft.projectId, "reference"),
   );
   const [ticketCriteria, setTicketCriteria, clearTicketCriteria] = useDraft(
-    `${newTicketKey}:criteria`,
+    newTicketDraftKey(draft.projectId, "criteria"),
     { seed: ticketCriteriaSeed },
   );
   const [runtime, setRuntime] = useState("Browser preview");
@@ -663,6 +666,18 @@ export default function App() {
     } finally {
       setProjectBusy(false);
     }
+  }
+  /**
+   * Aims the form at another project. The drafts are keyed on the target, so
+   * what has been typed is carried over: re-aiming must not empty the form.
+   */
+  function retargetDraft(projectId: string) {
+    moveNewTicketDrafts(draft.projectId, projectId, [
+      { field: "title", text: ticketTitle },
+      { field: "reference", text: ticketReference },
+      { field: "criteria", text: ticketCriteria, seed: ticketCriteriaSeed },
+    ]);
+    setDraft({ ...draft, projectId });
   }
   function openTaskDraft(criteria = "") {
     const target = project ?? organizationProjects[0];
@@ -1680,7 +1695,7 @@ export default function App() {
             label="Project"
             data={projectOptions}
             value={draft.projectId || null}
-            onChange={(value) => setDraft({ ...draft, projectId: value ?? "" })}
+            onChange={(value) => retargetDraft(value ?? "")}
             allowDeselect={false}
           />
           <Select

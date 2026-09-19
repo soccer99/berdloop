@@ -74,11 +74,41 @@ function mount(key: string, options: Omit<DraftOptions, "storage"> = {}) {
       removeDraft(key, settings);
       value = options.seed ?? "";
     },
+    /** `clearIfUnchanged`: only the text that was actually sent is cleared. */
+    clearIfUnchanged(sent: string) {
+      if (value !== sent) {
+        return false;
+      }
+      removeDraft(key, settings);
+      value = options.seed ?? "";
+      return true;
+    },
   };
 }
 
 function stored(key: string) {
   return storage.getItem(draftStorageKey(key));
+}
+
+/** Runs `body` in a world where reaching for localStorage throws, as a webview
+ * that has been told to refuse storage does. */
+function withStorageRefused(body: () => void) {
+  const original = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+  Object.defineProperty(globalThis, "localStorage", {
+    configurable: true,
+    get() {
+      throw new Error("storage is disabled");
+    },
+  });
+  try {
+    body();
+  } finally {
+    if (original) {
+      Object.defineProperty(globalThis, "localStorage", original);
+    } else {
+      delete (globalThis as { localStorage?: unknown }).localStorage;
+    }
+  }
 }
 
 describe("a draft outliving its editor", () => {
@@ -99,6 +129,35 @@ describe("a draft outliving its editor", () => {
     expect(stored("worker:task-7")).not.toBeNull();
 
     composer.clear();
+
+    expect(composer.value).toBe("");
+    expect(stored("worker:task-7")).toBeNull();
+    expect(mount("worker:task-7").value).toBe("");
+  });
+
+  test("text typed during an in-flight send survives that send", async () => {
+    const composer = mount("worker:task-7");
+    composer.type("Re-run the failing migration");
+    const sent = composer.value;
+
+    // Nothing is disabled while the send is in flight, so the person carries
+    // on typing the next instruction before the first one has resolved.
+    const send = Promise.resolve();
+    composer.type("And then check the logs");
+    await send;
+    expect(composer.clearIfUnchanged(sent)).toBe(false);
+
+    expect(composer.value).toBe("And then check the logs");
+    expect(mount("worker:task-7").value).toBe("And then check the logs");
+  });
+
+  test("a send nobody typed over clears the box and the storage", async () => {
+    const composer = mount("worker:task-7");
+    composer.type("Re-run the failing migration");
+    const sent = composer.value;
+
+    await Promise.resolve();
+    expect(composer.clearIfUnchanged(sent)).toBe(true);
 
     expect(composer.value).toBe("");
     expect(stored("worker:task-7")).toBeNull();
@@ -313,11 +372,14 @@ describe("reading what is stored", () => {
   });
 
   test("no storage at all degrades to no draft rather than throwing", () => {
-    // Neither a webview that refuses storage nor this test runner has one.
-    expect(readDraft("worker:task-1")).toBe("");
-    expect(saveDraft("worker:task-1", "typed")).toBeNull();
-    expect(() => removeDraft("worker:task-1")).not.toThrow();
-    expect(pruneDrafts([])).toEqual([]);
+    // A webview can refuse storage outright. Drafts are a convenience, so
+    // losing them must not take the editor down with them.
+    withStorageRefused(() => {
+      expect(readDraft("worker:task-1")).toBe("");
+      expect(saveDraft("worker:task-1", "typed")).toBeNull();
+      expect(() => removeDraft("worker:task-1")).not.toThrow();
+      expect(pruneDrafts([])).toEqual([]);
+    });
   });
 
   test("resolveDraftValue and nextDraftRecord agree on what counts", () => {
