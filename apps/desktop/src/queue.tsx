@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActionIcon,
   Badge,
@@ -49,6 +49,13 @@ import "./workflow.css";
 import type { Runtime } from "./workflow-runtime";
 import { HumanRequestCard } from "./agent-chat";
 import { useDraft } from "./drafts";
+import {
+  appliedQuote,
+  forgetQuote,
+  type Quote,
+  quotePrefill,
+  rememberQuote,
+} from "./quote-prefill";
 import { orderAgentTasks, orderTickets, routeSteering } from "./jev";
 import { ChangesPanel } from "./changes-panel";
 
@@ -193,6 +200,7 @@ function Composer({
   targets,
   inlineSend = false,
   quote,
+  onQuoteApplied,
 }: {
   /**
    * The subject being written about, named by the mount site: the ticket
@@ -206,30 +214,32 @@ function Composer({
   onSend: (text: string, target: WorkflowAction["target"]) => Promise<void>;
   targets?: { value: string; label: string }[];
   inlineSend?: boolean;
-  quote?: { id: number; text: string };
+  quote?: Quote;
+  onQuoteApplied?: () => void;
 }) {
   const [text, setText, clearDraft] = useDraft(draftKey);
   const [target, setTarget] = useState(targets?.[0]?.value ?? "worker");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const input = useRef<HTMLTextAreaElement>(null);
-  const applied = useRef(0);
-  const quoted = useRef("");
   useEffect(() => {
-    if (!quote || applied.current === quote.id) return;
-    applied.current = quote.id;
-    // A prefill never costs the person what they typed: the quote replaces
-    // only the previous quote, when that is still sitting at the top of the
-    // draft, and otherwise goes in front of the draft. Either way the typed
-    // text stays below it, and the result is stored like any other draft.
-    setText((current) =>
-      quoted.current && current.startsWith(quoted.current)
-        ? quote.text + current.slice(quoted.current.length)
-        : quote.text + current,
-    );
-    quoted.current = quote.text;
-    input.current?.focus();
-  }, [quote]);
+    if (!quote) return;
+    // What the draft already carries is remembered outside this component,
+    // because the draft outlives it: a ref would reset on remount and prepend
+    // the same quote on top of the restored copy of itself. `quotePrefill`
+    // holds the rule, and returns null when there is nothing left to do.
+    const prefill = quotePrefill(text, quote, appliedQuote(draftKey));
+    if (prefill) {
+      rememberQuote(draftKey, prefill.applied);
+      if (prefill.text !== text) {
+        setText(prefill.text);
+        input.current?.focus();
+      }
+    }
+    // The quote is one instruction, not lasting state. Telling the view it
+    // landed is what stops it following the person to the next task.
+    onQuoteApplied?.();
+  }, [quote, draftKey, text, setText, onQuoteApplied]);
   const sendButton = (
     <Button
       size="xs"
@@ -254,6 +264,7 @@ function Composer({
           // Only here. The catch below leaves the draft alone, because a send
           // that failed leaves the typed text as the only copy.
           clearDraft();
+          forgetQuote(draftKey);
         } catch (cause) {
           setError(String(cause));
         } finally {
@@ -326,6 +337,7 @@ function AgentConversation({
   targets,
   inlineSend,
   quote,
+  onQuoteApplied,
 }: {
   /** Subject of the unsent text, passed straight to the composer. */
   draftKey: string;
@@ -338,7 +350,9 @@ function AgentConversation({
   targets?: { value: string; label: string }[];
   inlineSend?: boolean;
   /** Text to put at the top of the draft. A new id applies it again. */
-  quote?: { id: number; text: string };
+  quote?: Quote;
+  /** Told once the composer has taken the quote in, so it can be dropped. */
+  onQuoteApplied?: () => void;
 }) {
   return (
     <>
@@ -352,6 +366,7 @@ function AgentConversation({
         targets={targets}
         inlineSend={inlineSend}
         quote={quote}
+        onQuoteApplied={onQuoteApplied}
       />
     </>
   );
@@ -517,7 +532,14 @@ export function QueueView({
   const [step, setStep] = useState("work");
   const [search, setSearch] = useDraft(`ticket-search:${projectScope}`);
   const [notice, setNotice] = useState("");
-  const [quote, setQuote] = useState<{ id: number; text: string }>();
+  // A quote is an instruction the composer carries out once and then drops,
+  // so the composer's draft is the only place it lives afterwards. Leaving it
+  // here would hand the previous task's diff to the next task's composer.
+  const [quote, setQuote] = useState<Quote>();
+  // Ids rise for the life of the view, not of `quote`, which keeps going back
+  // to undefined: counting from what is there now would hand out id 1 twice.
+  const quotes = useRef(0);
+  const onQuoteApplied = useCallback(() => setQuote(undefined), []);
   const [editTicket, setEditTicket] = useState(false);
   const [taskEditor, setTaskEditor] = useState<AgentTask | "new" | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<{
@@ -1425,12 +1447,10 @@ export function QueueView({
                           taskId={selected.id}
                           streaming={thread.streaming}
                           messageCount={thread.messages.length}
-                          onQuote={(text) =>
-                            setQuote((current) => ({
-                              id: (current?.id ?? 0) + 1,
-                              text,
-                            }))
-                          }
+                          onQuote={(text) => {
+                            quotes.current += 1;
+                            setQuote({ id: quotes.current, text });
+                          }}
                         />
                       )}
                       <div className="wf-thread-subheading">
@@ -1471,6 +1491,7 @@ export function QueueView({
                         }
                         connected={connected}
                         quote={quote}
+                        onQuoteApplied={onQuoteApplied}
                         onSend={(text, target) =>
                           send(selected.id, text, target, selected.id)
                         }
