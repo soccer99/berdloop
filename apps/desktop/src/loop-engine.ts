@@ -13,6 +13,7 @@ import {
 } from "@berdloop/agent";
 import {
   setAgentTaskStatus,
+  type AgentTask,
   type AgentTaskStatus,
   type Project,
   type Task,
@@ -34,8 +35,6 @@ import { nextWorkerTicket } from "./ticket-scheduling";
 
 /** How long a start failure or forge error waits before it is retried. */
 const RETRY_MS = 30_000;
-/** How often an approved pull request is checked on the forge. */
-const PULL_POLL_MS = 30_000;
 /** A run this young is still settling; do not reconcile it against records. */
 const SETTLE_MS = 5_000;
 /** Review agents that exit without submitting are restarted at most this often. */
@@ -50,7 +49,10 @@ export interface LoopWorld {
   preferredTicketId?: string;
   slots: number;
   harness: HarnessId;
+  /** Empty leaves the harness on its own default. */
+  model: string;
   reviewHarness: HarnessId;
+  reviewModel: string;
 }
 
 export interface LaunchContext {
@@ -125,6 +127,8 @@ export class LoopEngine {
   private active: Record<string, ActiveRun> = {};
   private pinned?: string;
   private ticketId?: string;
+  /** Set on start: check for tasks left running by workers that are gone. */
+  private recover = false;
   private prepared = new Map<string, string>();
   private ticketOpen = new Set<string>();
   private reviewStarted = new Map<string, string>();
@@ -154,6 +158,10 @@ export class LoopEngine {
     this.generation += 1;
     this.retryAt.clear();
     this.running = true;
+    // Worker processes do not survive the window closing, but their task status
+    // does. Anything left saying "running" is checked against what is actually
+    // alive before the loop plans around it.
+    this.recover = true;
     this.say("Starting.");
   }
 
@@ -203,6 +211,70 @@ export class LoopEngine {
     );
   }
 
+  /**
+   * Put back any task that says it is running with nobody running it.
+   *
+   * A worker is its own process: it dies with the app, or crashes, and the
+   * status it left behind outlives it. Nothing else notices, and because a
+   * running task is never handed out again, everything waiting on it waits
+   * forever while workers sit idle. This is the only thing that clears that.
+   */
+  /** Tasks that say they are running without this loop having handed them out. */
+  private claimingWork(projectId: string): AgentTask[] {
+    const { workspace } = this.deps.read();
+    const tickets = new Set(
+      workspace.tasks
+        .filter((item) => item.projectId === projectId)
+        .map((item) => item.id),
+    );
+    return workspace.agentTasks.filter(
+      (item) =>
+        tickets.has(item.parentTaskId) &&
+        item.status === "running" &&
+        this.active[item.id]?.state !== "running" &&
+        this.active[item.id]?.state !== "starting",
+    );
+  }
+
+  private async requeueAbandoned(claiming: AgentTask[]): Promise<void> {
+    const live = await this.deps
+      .invoke<{ agentId: string; streaming: boolean; interrupted?: boolean }[]>(
+        "agent_conversations",
+      )
+      .catch(() => []);
+    // An interrupted thread is one the app is already starting again on its
+    // own session and its own worktree. Handing its task out as well would put
+    // two workers on it, so it counts as taken.
+    const taken = new Set(
+      live
+        .filter((item) => item.streaming || item.interrupted)
+        .map((item) => item.agentId),
+    );
+    // A worker's conversation is keyed by its task id.
+    const abandoned = claiming.filter((item) => !taken.has(item.id));
+    if (!abandoned.length) return;
+    const complete = new Set(
+      this.deps
+        .read()
+        .workspace.agentTasks.filter((item) => item.status === "complete")
+        .map((item) => item.id),
+    );
+    for (const task of abandoned) {
+      this.setActive(task.id, undefined);
+      // "queued" alone would never be picked up again: promotion to "ready"
+      // only happens to a task's siblings, never to the one being written.
+      this.setTaskStatus(
+        task.id,
+        task.dependencyIds.every((id) => complete.has(id)) ? "ready" : "queued",
+      );
+    }
+    this.say(
+      abandoned.length === 1
+        ? `${abandoned[0].title} had no worker. Queued it again.`
+        : `${abandoned.length} tasks had no worker. Queued them again.`,
+    );
+  }
+
   private setTaskStatus(taskId: string, status: AgentTaskStatus) {
     this.deps.update((current) => {
       try {
@@ -236,6 +308,17 @@ export class LoopEngine {
     if (!project?.path) {
       this.say("Choose a project folder first.");
       return;
+    }
+
+    if (this.recover) {
+      this.recover = false;
+      // Checked without awaiting anything, so a start with nothing to recover
+      // reaches its first real step on this very tick.
+      const claiming = this.claimingWork(project.id);
+      if (claiming.length) {
+        await this.requeueAbandoned(claiming);
+        if (this.stale(generation)) return;
+      }
     }
 
     await this.collect();
@@ -344,7 +427,14 @@ export class LoopEngine {
     }
   }
 
-  /** Tickets in review need a reviewer, or a look at the forge. */
+  /**
+   * Tickets in review need a reviewer.
+   *
+   * Only starting one happens here, because only the window can launch an
+   * agent. What the forge says about the pull request afterwards - its build,
+   * its merge - is followed by the backend watcher, for every project and
+   * whether or not this loop is running.
+   */
   private async reviews(project: Project, generation: number): Promise<void> {
     const tickets = this.deps
       .read()
@@ -357,8 +447,6 @@ export class LoopEngine {
     for (const ticket of tickets) {
       if (ticket.pullRequest!.review === "pending") {
         await this.startReview(ticket, project);
-      } else if (ticket.pullRequest!.review === "approved") {
-        await this.syncPull(ticket, project);
       }
       if (this.stale(generation)) return;
     }
@@ -394,6 +482,7 @@ export class LoopEngine {
       const launch = this.deps.launch();
       const plan = planConversation({
         harness: this.deps.read().reviewHarness,
+        model: this.deps.read().reviewModel,
         role: "pr-code-review",
         cwd: context.path,
         prompt: [
@@ -424,34 +513,6 @@ export class LoopEngine {
     }
   }
 
-  private async syncPull(ticket: Task, project: Project): Promise<void> {
-    const at = this.retryAt.get(ticket.id) ?? 0;
-    if (this.now() < at) return;
-    this.retryAt.set(ticket.id, this.now() + PULL_POLL_MS);
-    try {
-      const pull = await this.deps.invoke<{ state: string; url: string }>(
-        "ticket_pr_sync",
-        { projectId: project.id, ticketId: ticket.id, source: project.path },
-      );
-      const said: Record<string, string> = {
-        merged: `${ticket.ticket} is merged and complete.`,
-        "waiting-for-human": `${ticket.ticket} is approved. Merge its pull request when you are ready.`,
-        "checks-pending": `${ticket.ticket}: waiting for checks on the pull request.`,
-        "checks-failed": `${ticket.ticket}: checks failed on the pull request. Fix them, or merge by hand.`,
-        blocked: `${ticket.ticket}: the forge blocks this merge. See the pull request.`,
-        closed: `${ticket.ticket}: the pull request was closed on the forge.`,
-        "head-moved": `${ticket.ticket}: new commits on the pull request. Review starts again.`,
-      };
-      this.say(
-        said[pull.state] ?? `${ticket.ticket}: pull request is ${pull.state}.`,
-      );
-    } catch (cause) {
-      this.say(
-        `Could not check the pull request for ${ticket.ticket}: ${cause}`,
-      );
-    }
-  }
-
   private async run(
     next: LoopStep,
     project: Project,
@@ -465,8 +526,26 @@ export class LoopEngine {
           "git_prepare",
           { projectId, source: project.path },
         );
+        // Whether a pull request can be opened at all is settled here, before
+        // a single worker runs. Finding out afterwards meant a whole ticket's
+        // worth of tokens was already spent on work that could not be
+        // published.
+        const forge = await this.deps
+          .invoke<string>("forge_check", { path: project.path })
+          .then(
+            (who) => ({ ready: true, detail: who }),
+            (cause: unknown) => ({ ready: false, detail: String(cause) }),
+          );
+        if (!forge.ready) {
+          // Nothing is marked prepared, so no worker starts and this is tried
+          // again next tick. Signing in is all it takes to get going.
+          this.say(`No pull requests for this project yet. ${forge.detail}`);
+          return;
+        }
         this.prepared.set(projectId, ready.baseBranch);
-        this.say(`Staging ready on ${ready.baseBranch}.`);
+        this.say(
+          `Staging ready on ${ready.baseBranch}. Publishing to ${forge.detail}.`,
+        );
         return;
       }
       case "open-ticket": {
@@ -524,6 +603,7 @@ export class LoopEngine {
           }
           const plan = planConversation({
             harness: this.deps.read().harness,
+            model: this.deps.read().model,
             role: "worker",
             taskId: task.id,
             cwd: tree.path,

@@ -74,6 +74,21 @@ export function planLoop(state: LoopState): LoopStep[] {
   if (progress.blocked) {
     return [{ kind: "wait", reason: "Every remaining task is blocked." }];
   }
+  // The workspace still says these are running, but this loop is not running
+  // them. Their worker died with an earlier window, and recovery has not put
+  // them back yet. Saying "waiting on another task" here sent people looking
+  // for a dependency that does not exist.
+  if (progress.running) {
+    return [
+      {
+        kind: "wait",
+        reason:
+          progress.running === 1
+            ? "One task says it is running with no worker on it. Start the loop again to recover it."
+            : `${progress.running} tasks say they are running with no worker on them. Start the loop again to recover them.`,
+      },
+    ];
+  }
   return [
     {
       kind: "wait",

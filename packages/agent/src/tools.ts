@@ -101,7 +101,8 @@ const TICKET_QUEUE: QueueWords = {
   plural: "tickets",
   criteria: "requirements",
   criteriaHint: "What the finished ticket must do.",
-  addUse: "For work that did not come from Jira, Linear or Asana.",
+  addUse:
+    "For work that did not come from Jira, Linear or Asana. An issue that did comes in through ticket_import, which fetches its real text and keeps the link back to the provider.",
 };
 
 const TASK_QUEUE: QueueWords = {
@@ -321,6 +322,14 @@ export const berdloopTools: ToolSpec[] = [
     use: "The first thing you do on your turn. It answers with the list of conflicted files, which will be empty when the merge was clean.",
   },
   {
+    name: "merge_conflicts",
+    roles: ["worker"],
+    summary:
+      "Show both sides of every conflicted file, and when each was written.",
+    args: [TASK_ARG],
+    use: "Call this the moment merge_sync reports a conflict, before you open a file. It names each side's last commit and its date, which is what tells you whether the other change already knew about yours.",
+  },
+  {
     name: "merge_land",
     roles: ["worker"],
     summary: "Move the ticket branch onto your finished work.",
@@ -402,7 +411,7 @@ export const berdloopTools: ToolSpec[] = [
           "What you did, and the check you ran that proves the criteria are met. If blocked, what stopped you.",
       },
     ],
-    use: "The last thing you do, whatever the outcome.",
+    use: "The last thing you do, whatever the outcome. `complete` is refused unless your work has landed on the ticket branch, so merge before you report. Reporting is not optional: a task nobody reports is recorded as blocked when you exit.",
   },
 
   // ---- task agent: steers the workers on its ticket ----
@@ -474,6 +483,26 @@ export const berdloopTools: ToolSpec[] = [
     summary: "Start giving out work for a ticket again.",
     args: [TICKET_ARG],
     use: "The queue picks up where it stopped.",
+  },
+  {
+    name: "ticket_import",
+    roles: ["ticket-agent"],
+    summary:
+      "Read a ticket from Linear, Jira or Asana and put it on the queue.",
+    args: [
+      {
+        name: "provider",
+        required: true,
+        description: "Linear, Jira or Asana.",
+      },
+      {
+        name: "reference",
+        required: true,
+        description:
+          "The provider key or ID, for example BRD-128 or an Asana task GID.",
+      },
+    ],
+    use: "It fetches the real ticket body from the provider and keeps the link back to it, so the ticket carries its source, its key and its URL. Importing the same issue again updates the ticket it already made rather than adding a second one. The connection a person set in settings is used, so no token is ever passed.",
   },
   {
     name: "ticket_replan",

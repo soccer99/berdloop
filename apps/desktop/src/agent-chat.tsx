@@ -99,6 +99,11 @@ export function AgentChat({
   const streaming = thread?.streaming ?? false;
   // A waiting agent is not idle. It has stopped and is holding its place.
   const waiting = requests.length > 0;
+  // A worker that has stopped can still be written to: the message reopens its
+  // task rather than being delivered to nobody.
+  const finished =
+    !streaming &&
+    (thread?.activity === "done" || thread?.activity === "blocked");
 
   useEffect(() => {
     tail.current?.scrollIntoView({ block: "end", behavior: "smooth" });
@@ -208,7 +213,9 @@ export function AgentChat({
           placeholder={
             streaming
               ? "Interrupt the agent with a new instruction…"
-              : "Send an instruction. It waits until the agent starts."
+              : finished
+                ? "Say what to change. The task is queued again and picks up where it left off."
+                : "Send an instruction. It waits until the agent starts."
           }
           onChange={(event) => setDraft(event.currentTarget.value)}
           onKeyDown={(event) => {
@@ -389,7 +396,8 @@ function colourFor(activity: AgentThreadView["activity"]): string {
       "fixing-conflicts": "red",
       paused: "gray",
       blocked: "red",
-      done: "green",
+      done: "yellow",
+      merged: "green",
     } as const
   )[activity];
 }

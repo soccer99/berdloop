@@ -3,6 +3,7 @@
 //! in requests. Coordinator commands use the same workspace as UI get/set calls.
 use crate::{
     conversations::{Scope, UserMessage},
+    tickets::ExternalIssue,
     workspace::{self},
 };
 use serde::{Deserialize, Serialize};
@@ -35,6 +36,7 @@ pub const COMMANDS: &[&str] = &[
     "task-reorder",
     "queue-show",
     // One-sided: a ticket holds running workers, a task is one of them.
+    "ticket-import",
     "ticket-pause",
     "ticket-resume",
     "ticket-replan",
@@ -228,6 +230,71 @@ fn release_merge_place(app: &tauri::AppHandle, w: &Value, scope: &Scope, ticket:
     }
 }
 
+/// The origin an imported ticket must have come from, as a browser reads it.
+/// Anything that is not plain HTTPS is refused: a ticket's link is followed by
+/// a person later, and by then nobody remembers where it came from.
+fn https_origin(url: &str) -> Result<String, String> {
+    let parsed = reqwest::Url::parse(url).map_err(|_| "Provider returned an invalid ticket URL")?;
+    let host = parsed.host_str().unwrap_or("");
+    if parsed.scheme() != "https" || host.is_empty() {
+        return Err("Provider returned an invalid ticket URL".into());
+    }
+    Ok(match parsed.port() {
+        Some(port) => format!("https://{host}:{port}"),
+        None => format!("https://{host}"),
+    })
+}
+
+/// Write a fetched issue into the ticket queue, on the same terms as the
+/// window's own importer: importing an issue twice updates the ticket it
+/// already made instead of queueing the work again.
+fn import_issue(w: &mut Value, project_id: &str, issue: &ExternalIssue) -> Result<String, String> {
+    if issue.id.trim().is_empty() || issue.key.trim().is_empty() || issue.title.trim().is_empty() {
+        return Err("Provider returned an incomplete ticket".into());
+    }
+    let origin = https_origin(&issue.url)?;
+    let now = workspace::now();
+    let tickets = w["tasks"].as_array_mut().ok_or("Invalid tickets")?;
+    let existing = tickets.iter_mut().find(|ticket| {
+        ticket["source"] == json!(issue.provider)
+            && ticket["sourceId"] == json!(issue.id)
+            // Two Jira sites hand out the same issue IDs, so a Jira ticket
+            // counts as the same one only when it came from the same site.
+            && (issue.provider != "Jira"
+                || ticket["sourceUrl"]
+                    .as_str()
+                    .is_some_and(|url| url.starts_with(&format!("{origin}/"))))
+    });
+    let action = match existing {
+        Some(ticket) => {
+            ticket["title"] = json!(issue.title);
+            ticket["ticket"] = json!(issue.key);
+            ticket["sourceUrl"] = json!(issue.url);
+            ticket["sourceStatus"] = json!(issue.status);
+            ticket["updatedAt"] = json!(now);
+            "updated"
+        }
+        None => {
+            tickets.push(json!({
+                "id": uuid::Uuid::new_v4().to_string(),
+                "projectId": project_id,
+                "title": issue.title,
+                "criteria": issue.description,
+                "source": issue.provider,
+                "sourceId": issue.id,
+                "sourceUrl": issue.url,
+                "sourceStatus": issue.status,
+                "ticket": issue.key,
+                "stage": "Branch",
+                "status": "queued",
+                "updatedAt": now,
+            }));
+            "created"
+        }
+    };
+    Ok(json!({"ticket": issue.key, "action": action}).to_string())
+}
+
 fn instruct(app: &tauri::AppHandle, scope: Scope, text: String) -> Result<(), String> {
     crate::agent::queue_instruction(
         app,
@@ -316,6 +383,20 @@ pub fn execute(app: &tauri::AppHandle, scope: &Scope, request: Request) -> Resul
                     ..scope.clone()
                 },
             )?;
+        }
+        "ticket-import" => {
+            // The agent names a provider and a reference and nothing else. The
+            // connection is resolved here, from the scope this agent was
+            // started with, so no token is ever in a command or in a reply.
+            let issue = tauri::async_runtime::block_on(crate::tickets::fetch(
+                app,
+                required(args, "provider")?.to_string(),
+                required(args, "reference")?.to_string(),
+                &scope.organization_id,
+                &scope.project_id,
+            ))?;
+            let (_, result) = store.change(|w| import_issue(w, &scope.project_id, &issue))?;
+            return Ok(result);
         }
         "ticket-replan" => {
             let ticket = ticket_id(&w, scope, Some(required(args, "ticket")?))?;
@@ -1112,6 +1193,135 @@ mod tests {
         assert!(authorize(&scope("pr-code-review", Some("t")), "pr-review-submit").is_ok());
         assert!(authorize(&scope("ticket-agent", None), "queue-show").is_ok());
         assert!(authorize(&scope("ticket-agent", None), "merge-land").is_err());
+        // Importing reaches a provider with the project's own credentials, so
+        // it belongs to the one agent that owns the ticket queue.
+        assert!(authorize(&scope("ticket-agent", None), "ticket-import").is_ok());
+        assert!(authorize(&scope("task-agent", Some("t")), "ticket-import").is_err());
+        assert!(authorize(&scope("worker", Some("t")), "ticket-import").is_err());
+        assert!(authorize(&scope("pr-code-review", Some("t")), "ticket-import").is_err());
+    }
+
+    fn issue(provider: &str, id: &str, key: &str, title: &str, url: &str) -> ExternalIssue {
+        ExternalIssue {
+            provider: provider.into(),
+            id: id.into(),
+            key: key.into(),
+            url: url.into(),
+            title: title.into(),
+            description: "What the ticket asks for".into(),
+            status: "In Progress".into(),
+            updated_at: String::new(),
+        }
+    }
+
+    /// The fetch needs a provider and a token, but what it does to the queue
+    /// does not, so that is what is proven here.
+    #[test]
+    fn importing_the_same_issue_twice_updates_the_ticket_it_already_made() {
+        let dir = std::env::temp_dir().join(format!("berdloop-import-{}", uuid::Uuid::new_v4()));
+        let store = Store(dir.join("tasks.json"));
+        let first = issue(
+            "Linear",
+            "issue-1",
+            "ENG-42",
+            "Search is slow",
+            "https://linear.app/acme/issue/ENG-42",
+        );
+        let (w, reply) = store.change(|w| import_issue(w, "p", &first)).unwrap();
+        assert_eq!(reply, r#"{"action":"created","ticket":"ENG-42"}"#);
+        assert_eq!(w["tasks"].as_array().unwrap().len(), 1);
+        assert_eq!(w["tasks"][0]["projectId"], "p");
+        assert_eq!(w["tasks"][0]["criteria"], "What the ticket asks for");
+        assert_eq!(w["tasks"][0]["source"], "Linear");
+        assert_eq!(w["tasks"][0]["sourceId"], "issue-1");
+        assert_eq!(w["tasks"][0]["stage"], "Branch");
+        assert_eq!(w["tasks"][0]["status"], "queued");
+        let id = w["tasks"][0]["id"].clone();
+
+        // Same issue, renamed at the provider and given a new key.
+        let again = ExternalIssue {
+            title: "Search is far too slow".into(),
+            key: "ENG-43".into(),
+            status: "Done".into(),
+            ..first.clone()
+        };
+        let (w, reply) = store.change(|w| import_issue(w, "p", &again)).unwrap();
+        assert_eq!(reply, r#"{"action":"updated","ticket":"ENG-43"}"#);
+        assert_eq!(
+            w["tasks"].as_array().unwrap().len(),
+            1,
+            "a second import must not queue the work twice"
+        );
+        assert_eq!(w["tasks"][0]["id"], id, "the ticket keeps its identity");
+        assert_eq!(w["tasks"][0]["title"], "Search is far too slow");
+        assert_eq!(w["tasks"][0]["ticket"], "ENG-43");
+        assert_eq!(w["tasks"][0]["sourceStatus"], "Done");
+
+        // Another provider's issue of the same ID is a different ticket.
+        let (w, _) = store
+            .change(|w| {
+                import_issue(
+                    w,
+                    "p",
+                    &issue(
+                        "Asana",
+                        "issue-1",
+                        "issue-1",
+                        "Something else",
+                        "https://app.asana.com/0/1/issue-1",
+                    ),
+                )
+            })
+            .unwrap();
+        assert_eq!(w["tasks"].as_array().unwrap().len(), 2);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_import_refuses_an_incomplete_ticket_and_a_link_nobody_can_follow() {
+        let mut w = workspace::empty();
+        let good = issue(
+            "Jira",
+            "10001",
+            "ENG-1",
+            "Title",
+            "https://acme.atlassian.net/browse/ENG-1",
+        );
+        for missing in [
+            ExternalIssue {
+                id: "  ".into(),
+                ..good.clone()
+            },
+            ExternalIssue {
+                key: String::new(),
+                ..good.clone()
+            },
+            ExternalIssue {
+                title: " ".into(),
+                ..good.clone()
+            },
+            ExternalIssue {
+                url: "http://acme.atlassian.net/browse/ENG-1".into(),
+                ..good.clone()
+            },
+            ExternalIssue {
+                url: "not a URL".into(),
+                ..good.clone()
+            },
+        ] {
+            assert!(import_issue(&mut w, "p", &missing).is_err());
+        }
+        assert!(import_issue(&mut w, "p", &good).is_ok());
+        // A Jira ID only says which issue it is on one site, so the same ID
+        // from another site must make its own ticket.
+        let elsewhere = ExternalIssue {
+            url: "https://other.atlassian.net/browse/ENG-1".into(),
+            ..good.clone()
+        };
+        assert!(import_issue(&mut w, "p", &elsewhere).is_ok());
+        assert_eq!(w["tasks"].as_array().unwrap().len(), 2);
+        assert!(import_issue(&mut w, "p", &good).is_ok());
+        assert_eq!(w["tasks"].as_array().unwrap().len(), 2);
     }
 
     #[test]

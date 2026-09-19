@@ -5,23 +5,41 @@ pub mod control;
 mod conversations;
 pub mod devenv;
 mod extensions;
+pub mod forge;
 pub mod git;
 mod harness_models;
 mod harness_settings;
 pub mod human;
+pub mod integration_secrets;
 pub mod jev;
 pub mod mcp;
 pub mod merge_queue;
 mod pr_review;
 mod projects;
 mod sessions;
+pub mod tickets;
 pub mod workspace;
 
-use base64::Engine;
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use std::{fs, sync::Mutex, time::Duration};
+use serde::Serialize;
+use serde_json::Value;
+use std::{fs, sync::Mutex};
 use tauri::Manager;
+
+/// Run blocking work off the main thread, and answer when it is done.
+///
+/// Tauri runs a command that is not `async` on the main thread, so git, the
+/// network and the file system each freeze the window until they return. Any
+/// command that touches one hands the work to a pool and awaits the result, so
+/// the caller still just gets a promise and the app keeps drawing.
+pub async fn offload<T, F>(work: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .map_err(|error| format!("Background work did not finish: {error}"))?
+}
 
 #[derive(Serialize)]
 struct RuntimeInfo {
@@ -77,210 +95,26 @@ fn save_task_workspace(
     Ok(())
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ImportRequest {
-    provider: String,
-    reference: String,
-    token: String,
-    jira_site: Option<String>,
-    jira_email: Option<String>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ExternalIssue {
-    provider: String,
-    id: String,
-    key: String,
-    url: String,
-    title: String,
-    description: String,
-    status: String,
-}
-
-fn plain_text(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        Value::Array(items) => items.iter().map(plain_text).collect::<Vec<_>>().join("\n"),
-        Value::Object(map) => {
-            let own = map.get("text").and_then(Value::as_str).unwrap_or("");
-            let nested = map.get("content").map(plain_text).unwrap_or_default();
-            if own.is_empty() {
-                nested
-            } else {
-                own.to_string()
-            }
-        }
-        _ => String::new(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::plain_text;
-    use serde_json::json;
-
-    #[test]
-    fn jira_description_becomes_plain_text() {
-        let description = json!({
-            "type": "doc",
-            "content": [
-                { "type": "paragraph", "content": [{ "type": "text", "text": "First" }] },
-                { "type": "paragraph", "content": [{ "type": "text", "text": "Second" }] }
-            ]
-        });
-        assert_eq!(plain_text(&description), "First\nSecond");
-    }
-}
-
-fn required_string<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
-    value[key]
-        .as_str()
-        .filter(|text| !text.is_empty())
-        .ok_or_else(|| format!("Provider response is missing {key}."))
-}
-
-#[tauri::command]
-async fn fetch_external_issue(input: ImportRequest) -> Result<ExternalIssue, String> {
-    let reference = input.reference.trim();
-    let token = input.token.trim();
-    if reference.is_empty()
-        || reference.len() > 128
-        || !reference
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-')
-        || token.is_empty()
-    {
-        return Err("Enter a valid ticket ID and access token.".to_string());
-    }
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .build()
-        .map_err(|_| "Could not start the provider request.".to_string())?;
-    let response = match input.provider.as_str() {
-        "Linear" => {
-            client
-                .post("https://api.linear.app/graphql")
-                .header("Authorization", token)
-                .json(&json!({
-                    "query": "query Issue($id: String!) { issue(id: $id) { id identifier title description url state { name } } }",
-                    "variables": { "id": reference }
-                }))
-                .send()
-                .await
-        }
-        "Asana" => {
-            if !reference.chars().all(|c| c.is_ascii_digit()) {
-                return Err("Enter the numeric Asana task GID.".to_string());
-            }
-            client
-                .get(format!("https://app.asana.com/api/1.0/tasks/{reference}"))
-                .bearer_auth(token)
-                .query(&[("opt_fields", "gid,name,notes,permalink_url,completed")])
-                .send()
-                .await
-        }
-        "Jira" => {
-            let site = input.jira_site.as_deref().unwrap_or("").trim();
-            let email = input.jira_email.as_deref().unwrap_or("").trim();
-            let url = reqwest::Url::parse(site)
-                .map_err(|_| "Enter the full HTTPS Jira Cloud site URL.".to_string())?;
-            let host = url.host_str().unwrap_or("");
-            if url.scheme() != "https"
-                || !host.ends_with(".atlassian.net")
-                || url.port().is_some()
-                || url.path() != "/"
-                || url.query().is_some()
-                || !url.username().is_empty()
-                || email.is_empty()
-            {
-                return Err("Enter a Jira Cloud site URL and account email.".to_string());
-            }
-            let auth = base64::engine::general_purpose::STANDARD.encode(format!("{email}:{token}"));
-            client
-                .get(format!("https://{host}/rest/api/3/issue/{reference}"))
-                .header("Authorization", format!("Basic {auth}"))
-                .query(&[("fields", "summary,description,status")])
-                .send()
-                .await
-        }
-        _ => return Err("Unsupported task provider.".to_string()),
-    }
-    .map_err(|_| "Could not reach the task provider.".to_string())?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "Provider returned HTTP {}.",
-            response.status().as_u16()
-        ));
-    }
-    let body: Value = response
-        .json()
-        .await
-        .map_err(|_| "Provider returned invalid JSON.".to_string())?;
-    match input.provider.as_str() {
-        "Linear" => {
-            if body["errors"]
-                .as_array()
-                .is_some_and(|errors| !errors.is_empty())
-            {
-                return Err("Linear could not load this issue.".to_string());
-            }
-            let issue = &body["data"]["issue"];
-            Ok(ExternalIssue {
-                provider: input.provider,
-                id: required_string(issue, "id")?.to_string(),
-                key: required_string(issue, "identifier")?.to_string(),
-                url: required_string(issue, "url")?.to_string(),
-                title: required_string(issue, "title")?.to_string(),
-                description: issue["description"].as_str().unwrap_or("").to_string(),
-                status: issue["state"]["name"].as_str().unwrap_or("").to_string(),
-            })
-        }
-        "Asana" => {
-            let issue = &body["data"];
-            Ok(ExternalIssue {
-                provider: input.provider,
-                id: required_string(issue, "gid")?.to_string(),
-                key: required_string(issue, "gid")?.to_string(),
-                url: required_string(issue, "permalink_url")?.to_string(),
-                title: required_string(issue, "name")?.to_string(),
-                description: issue["notes"].as_str().unwrap_or("").to_string(),
-                status: if issue["completed"].as_bool().unwrap_or(false) {
-                    "Complete"
-                } else {
-                    "Open"
-                }
-                .to_string(),
-            })
-        }
-        "Jira" => {
-            let key = required_string(&body, "key")?;
-            let site = input.jira_site.unwrap_or_default();
-            Ok(ExternalIssue {
-                provider: input.provider,
-                id: required_string(&body, "id")?.to_string(),
-                key: key.to_string(),
-                url: format!("{}/browse/{key}", site.trim_end_matches('/')),
-                title: required_string(&body["fields"], "summary")?.to_string(),
-                description: plain_text(&body["fields"]["description"]),
-                status: body["fields"]["status"]["name"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string(),
-            })
-        }
-        _ => unreachable!(),
-    }
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_opener::init())
         .manage(WorkspaceLock(Mutex::new(())))
         .manage(agent::Running::default())
+        .manage(pr_review::Watched::default())
+        // Conversations outlive the process that ran them: a rebuild, a
+        // reload or a crash leaves the work where it was, and the app picks
+        // it back up rather than starting from an empty window.
+        .setup(|app| {
+            agent::recover(app.handle());
+            agent::autosave(app.handle().clone());
+            // A build finishes whether or not a person has the loop running,
+            // so following pull requests cannot depend on the window.
+            pr_review::watch(app.handle().clone());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             runtime_info,
             projects::project_inspect,
@@ -296,7 +130,10 @@ pub fn run() {
             control::ticket_control,
             agent_preferences::load_agent_preferences,
             agent_preferences::save_agent_preferences,
-            fetch_external_issue,
+            integration_secrets::save_integration_secret,
+            integration_secrets::clear_integration_secret,
+            tickets::fetch_external_issue,
+            tickets::search_external_issues,
             sessions::sessions_list,
             agent::agent_start,
             agent::agent_stop,
@@ -325,6 +162,8 @@ pub fn run() {
             pr_review::publish_ticket_pr,
             pr_review::pr_review_context,
             pr_review::ticket_pr_sync,
+            pr_review::watch_projects,
+            forge::forge_check,
             git::git_task_reports,
             merge_queue::merge_line
         ])

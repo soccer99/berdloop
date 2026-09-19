@@ -1465,7 +1465,14 @@ pub fn devenv_preview(path: String) -> Result<Setup, String> {
 
 /// Answer any worker waiting on the broker. Called on the app's tick.
 #[tauri::command]
-pub fn devenv_serve(app: tauri::AppHandle, project_id: String) -> Result<Vec<String>, String> {
+pub async fn devenv_serve(
+    app: tauri::AppHandle,
+    project_id: String,
+) -> Result<Vec<String>, String> {
+    crate::offload(move || devenv_serve_blocking(app, project_id)).await
+}
+
+fn devenv_serve_blocking(app: tauri::AppHandle, project_id: String) -> Result<Vec<String>, String> {
     let staging = crate::git::staging_for(&app, &project_id)?;
     let Some(source) = staging.source() else {
         return Ok(Vec::new());
