@@ -1,4 +1,5 @@
 import { describe, expect, mock, test } from "bun:test";
+import * as core from "@tauri-apps/api/core";
 
 /**
  * One markup, two builds. A link to a pull request has to reach the person's
@@ -8,7 +9,10 @@ import { describe, expect, mock, test } from "bun:test";
 const opened: string[] = [];
 let tauri = false;
 
-mock.module("@tauri-apps/api/core", () => ({ isTauri: () => tauri }));
+// A module mock is global to the whole test run, so this one has to keep
+// every other export of the module: a test file loaded after this one still
+// needs the real invoke.
+mock.module("@tauri-apps/api/core", () => ({ ...core, isTauri: () => tauri }));
 mock.module("@tauri-apps/plugin-opener", () => ({
   openUrl: async (url: string) => {
     opened.push(url);
