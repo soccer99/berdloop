@@ -19,8 +19,8 @@ import {
   type AgentThreadView,
   type ThreadMessage,
 } from "./workflow-ui";
-import { diffFiles, stripDiffBodies } from "./diff";
 import { ThreadFiles } from "./thread-files";
+import { threadRows, type ThreadRow } from "./thread-rows";
 import type { Changes } from "./changes-panel";
 
 /**
@@ -196,7 +196,7 @@ export function AgentChat({
               "Nothing said yet. Ask for a change, or steer the work."}
           </p>
         )}
-        {messages.map((entry) => (
+        {threadRows(messages).map((entry) => (
           <Bubble key={entry.id} message={entry} changes={changes} />
         ))}
         {streaming && !messages.length && <Loader size="xs" />}
@@ -313,16 +313,16 @@ function Bubble({
   message,
   changes,
 }: {
-  message: ThreadMessage;
+  message: ThreadRow;
   changes?: Changes;
 }) {
   // Diffs are read in the Changes tab. This chat shows what was said about a
-  // change, so a hunk pasted into the text goes before the bubble is drawn,
-  // and the files it named become one row each in its place.
-  const text = stripDiffBodies(message.text);
-  const files = diffFiles(message.text);
-  if (!text && !files.length) return null;
-  if (message.role === "system") {
+  // change, and one row for each file the agent wrote; `threadRows` has
+  // already taken the hunks out and worked out which rows belong here.
+  const { text, files } = message;
+  // A file row is not something anybody said, so it stands on its own rather
+  // than inside a speech bubble.
+  if (message.role === "system" || message.role === "tool") {
     return (
       <>
         {text && <p className="agent-chat-system">{text}</p>}

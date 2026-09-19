@@ -4,8 +4,12 @@ import type { AgentActivity, AgentTask, Task } from "@berdloop/core";
 export type { AgentActivity };
 export interface ThreadMessage {
   id: string;
-  role: "user" | "agent" | "system";
+  /** A `tool` message is a file the agent wrote, not something said. */
+  role: "user" | "agent" | "system" | "tool";
+  /** What was said, or on a `tool` message the name of the tool. */
   text: string;
+  /** The file a `tool` message's tool call wrote. */
+  path?: string;
   at?: string | number;
   delivery?: "saved" | "pending" | "delivered" | "applied" | "failed";
   target?: WorkflowAction["target"];

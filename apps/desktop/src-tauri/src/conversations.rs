@@ -64,6 +64,11 @@ pub struct Message {
     pub at: u128,
     pub delivery: Option<String>,
     pub target: Option<String>,
+    /// The file a `tool` message's tool call wrote. Absent on anything said.
+    ///
+    /// Defaulted so a thread saved before file rows existed still reads back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -181,6 +186,7 @@ impl Conversation {
             at: crate::human::now_ms(),
             delivery: Some("pending".into()),
             target: message.target,
+            path: None,
         });
         self.revision += 1;
         Ok(())
@@ -201,6 +207,27 @@ impl Conversation {
             at: crate::human::now_ms(),
             delivery: None,
             target: None,
+            path: None,
+        });
+        self.trim();
+        self.revision += 1;
+    }
+
+    /// Record a file the agent wrote, in its place in the thread.
+    ///
+    /// A diff is read in the Changes tab now, so a file change reaches the
+    /// chat as this and nothing else: the tool that wrote it and the path it
+    /// wrote, which the thread draws as one row. The counts are not here
+    /// because the repository knows them and the tool call does not.
+    pub fn touched(&mut self, tool: &str, path: String) {
+        self.messages.push(Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            role: "tool".into(),
+            text: tool.into(),
+            at: crate::human::now_ms(),
+            delivery: None,
+            target: None,
+            path: Some(path),
         });
         self.trim();
         self.revision += 1;

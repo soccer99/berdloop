@@ -214,6 +214,83 @@ fn text_of(value: &serde_json::Value, key: &str) -> Option<String> {
     value.get(key).and_then(|v| v.as_str()).map(str::to_string)
 }
 
+/// The keys a file-changing tool call uses to name the file it wrote.
+///
+/// Claude Code's Edit, MultiEdit and Write carry `file_path`, NotebookEdit
+/// carries `notebook_path`, and Codex's patch items carry `path`. A tool that
+/// names no file — a Bash line that writes by itself — leaves no row, because
+/// nothing here can tell what it touched.
+const TOOL_PATH_KEYS: [&str; 3] = ["file_path", "notebook_path", "path"];
+
+/// The files one line of a CLI's JSON stream says the agent wrote.
+///
+/// Read apart from `parse_line` because it answers a different question. That
+/// one builds the chunks the chat displays; this one records which files were
+/// written, in the order the agent wrote them. The thread shows those as one
+/// row each, which is the only place a change is named now that the diff
+/// itself is read in the Changes tab.
+///
+/// Each entry is the tool's name and the path it wrote.
+fn edited_paths(harness: &str, line: &serde_json::Value) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if harness == "Codex" || harness == "codex" {
+        if line.get("type").and_then(|v| v.as_str()) != Some("item.completed") {
+            return out;
+        }
+        let Some(item) = line.get("item") else {
+            return out;
+        };
+        let kind = item
+            .get("item_type")
+            .or_else(|| item.get("type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("item");
+        if !is_edit(kind) {
+            return out;
+        }
+        // Codex names one file on the item, or several under `changes`, keyed
+        // by path. Both are read, so a patch over two files is two rows.
+        out.extend(tool_paths(item).into_iter().map(|p| (kind.to_string(), p)));
+        if let Some(changes) = item.get("changes").and_then(|v| v.as_object()) {
+            out.extend(changes.keys().map(|p| (kind.to_string(), p.clone())));
+        }
+        return out;
+    }
+    if line.get("type").and_then(|v| v.as_str()) != Some("assistant") {
+        return out;
+    }
+    let blocks = line
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array());
+    for block in blocks.into_iter().flatten() {
+        if block.get("type").and_then(|v| v.as_str()) != Some("tool_use") {
+            continue;
+        }
+        let Some(name) = text_of(block, "name") else {
+            continue;
+        };
+        if !is_edit(&name) {
+            continue;
+        }
+        let Some(input) = block.get("input") else {
+            continue;
+        };
+        out.extend(tool_paths(input).into_iter().map(|p| (name.clone(), p)));
+    }
+    out
+}
+
+/// The first path a tool's arguments name, if they name one at all.
+fn tool_paths(input: &serde_json::Value) -> Vec<String> {
+    TOOL_PATH_KEYS
+        .iter()
+        .find_map(|key| text_of(input, key))
+        .filter(|path| !path.trim().is_empty())
+        .into_iter()
+        .collect()
+}
+
 /// Turn one line of a CLI's JSON stream into zero or more display chunks.
 /// Returns the session id whenever the line reveals it.
 fn parse_line(
@@ -643,6 +720,7 @@ pub fn agent_start(
             };
             let mut chunks = Vec::new();
             let found = parse_line(&harness, &value, &mut chunks);
+            let written = edited_paths(&harness, &value);
             if let Some(session) = &found {
                 stream_session = Some(session.clone());
             }
@@ -674,6 +752,11 @@ pub fn agent_start(
                             }
                             _ => {}
                         }
+                    }
+                    // After the line's own text, so a file row sits under the
+                    // words the agent wrote before reaching for the tool.
+                    for (tool, path) in &written {
+                        thread.touched(tool, path.clone());
                     }
                     publish(&app_handle, thread);
                 }
@@ -1338,6 +1421,61 @@ mod tests {
         assert!(!is_edit("Bash"));
         assert!(!is_edit("Read"));
         assert!(!is_edit("merge-wait"));
+    }
+
+    fn written(harness: &str, raw: &str) -> Vec<(String, String)> {
+        edited_paths(harness, &serde_json::from_str(raw).unwrap())
+    }
+
+    #[test]
+    fn two_claude_edits_name_two_files_in_order() {
+        assert_eq!(
+            written(
+                "Claude Code",
+                r#"{"type":"assistant","message":{"content":[
+                    {"type":"tool_use","name":"Edit","input":{"file_path":"src/a.ts"}},
+                    {"type":"tool_use","name":"Edit","input":{"file_path":"src/b.ts"}}]}}"#,
+            ),
+            [
+                ("Edit".to_string(), "src/a.ts".to_string()),
+                ("Edit".to_string(), "src/b.ts".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_tool_that_writes_no_file_names_none() {
+        assert!(written(
+            "Claude Code",
+            r#"{"type":"assistant","message":{"content":[
+                {"type":"tool_use","name":"Bash","input":{"command":"ls"}},
+                {"type":"tool_use","name":"Read","input":{"file_path":"src/a.ts"}}]}}"#,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn a_notebook_edit_names_its_own_key() {
+        assert_eq!(
+            written(
+                "Claude Code",
+                r#"{"type":"assistant","message":{"content":[
+                    {"type":"tool_use","name":"NotebookEdit","input":{"notebook_path":"run.ipynb"}}]}}"#,
+            ),
+            [("NotebookEdit".to_string(), "run.ipynb".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_codex_patch_names_every_file_it_changed() {
+        assert_eq!(
+            written(
+                "Codex",
+                r#"{"type":"item.completed","item":{"item_type":"file_change",
+                    "changes":{"src/a.ts":{"kind":"update"}}}}"#,
+            ),
+            [("file_change".to_string(), "src/a.ts".to_string())]
+        );
     }
 
     #[test]

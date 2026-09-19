@@ -60,8 +60,9 @@ import { orderAgentTasks, orderTickets, routeSteering } from "./jev";
 import { ChangesPanel } from "./changes-panel";
 import { useTaskChanges } from "./use-task-changes";
 import { focusFile, focusFor, type FocusRequest } from "./changes-focus";
-import { diffFiles, stripDiffBodies } from "./diff";
+import { stripDiffBodies } from "./diff";
 import { ThreadFiles } from "./thread-files";
+import { lastSaid, threadRows } from "./thread-rows";
 import type { Changes } from "./changes-panel";
 import { openExternally } from "./external-link";
 
@@ -209,17 +210,10 @@ function Log({
     if (follow.current && scroll.current)
       scroll.current.scrollTop = scroll.current.scrollHeight;
   }, [messages, streaming]);
-  // A diff is read in the Changes tab, never here, so whatever an agent pasted
-  // into its own text is taken out before the thread draws it and the files it
-  // named become one row each. A message that was nothing but a diff keeps its
-  // rows; one with neither words nor files left is not drawn at all.
-  const shown = messages
-    .map((message) => ({
-      ...message,
-      text: stripDiffBodies(message.text),
-      files: diffFiles(message.text),
-    }))
-    .filter((message) => message.text || message.files.length);
+  // A diff is read in the Changes tab, never here. Each file the agent wrote
+  // becomes one row where it was written, and whatever diff an agent pasted
+  // into its own text is taken out before the thread draws it.
+  const shown = threadRows(messages);
   return (
     <div
       className="wf-log"
@@ -240,46 +234,57 @@ function Log({
           No messages yet. Instructions and agent updates appear here.
         </p>
       )}
-      {shown.map((message) => (
-        <article
-          className={`wf-message wf-message-${message.role}`}
-          key={message.id}
-        >
-          <div>
-            <strong>
-              {message.role === "user"
-                ? "You"
-                : message.role === "agent"
-                  ? "Agent"
-                  : "Activity"}
-            </strong>
-            {message.at && (
-              <time dateTime={new Date(message.at).toISOString()}>
-                {new Date(message.at).toLocaleTimeString([], {
-                  hour: "2-digit",
-                  minute: "2-digit",
-                })}
-              </time>
-            )}
-            {message.target === "all-workers" && (
-              <span>To all ticket workers</span>
-            )}
-            {message.delivery && (
-              <span>
-                {message.delivery === "saved"
-                  ? "Saved · not sent"
-                  : message.delivery}
-              </span>
-            )}
-          </div>
-          {message.text && <p>{message.text}</p>}
+      {shown.map((message) =>
+        // A file row is nobody speaking, so it gets no name and no time above
+        // it: the point of the row is that it is one line.
+        message.role === "tool" ? (
           <ThreadFiles
+            key={message.id}
             files={message.files}
             changes={changes}
             onOpen={onOpenChanges}
           />
-        </article>
-      ))}
+        ) : (
+          <article
+            className={`wf-message wf-message-${message.role}`}
+            key={message.id}
+          >
+            <div>
+              <strong>
+                {message.role === "user"
+                  ? "You"
+                  : message.role === "agent"
+                    ? "Agent"
+                    : "Activity"}
+              </strong>
+              {message.at && (
+                <time dateTime={new Date(message.at).toISOString()}>
+                  {new Date(message.at).toLocaleTimeString([], {
+                    hour: "2-digit",
+                    minute: "2-digit",
+                  })}
+                </time>
+              )}
+              {message.target === "all-workers" && (
+                <span>To all ticket workers</span>
+              )}
+              {message.delivery && (
+                <span>
+                  {message.delivery === "saved"
+                    ? "Saved · not sent"
+                    : message.delivery}
+                </span>
+              )}
+            </div>
+            {message.text && <p>{message.text}</p>}
+            <ThreadFiles
+              files={message.files}
+              changes={changes}
+              onOpen={onOpenChanges}
+            />
+          </article>
+        ),
+      )}
       {streaming && (
         <div className="wf-streaming">
           <span className="connection-dot" />
@@ -1048,8 +1053,9 @@ export function QueueView({
               <RowStats thread={currentThread} now={now} />
             </small>
             <p>
-              {/* The same text as the thread, so no diff leaks through here either. */}
-              {stripDiffBodies(currentThread?.messages.at(-1)?.text ?? "") ||
+              {/* The same text as the thread, so no diff leaks through here
+                  either. A file row says nothing, so the last words win. */}
+              {stripDiffBodies(lastSaid(currentThread?.messages)) ||
                 (item.status === "queued" && item.dependencyIds.length
                   ? "Waiting for dependencies"
                   : queued
