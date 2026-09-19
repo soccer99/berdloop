@@ -5,26 +5,37 @@ agent thread. The thread keeps the words.
 
 ## Which path actually put hunks on screen
 
-Two candidates were named, and only one of them does it.
+Two candidates were named in the ticket, and only one of them does it.
+Every path that renders agent text was walked; all four are below, with
+the one to strip first.
 
-- **The thread's message text. This is the one.** `Log` in
-  `apps/desktop/src/queue.tsx` renders `message.text` verbatim, so whatever an
-  agent wrote arrives on screen as it was written, fenced diff and all. One
-  `Log`, through `AgentConversation`, is every thread in the app: the worker
-  thread, the ticket agent's chat and the planner's. The task row's one-line
-  preview of the last message (`queue.tsx`, the row's `<p>`) shows the same
-  text, so it is stripped with it.
-- **The tool line does not.** `ToolLine` in `apps/desktop/src/agent-chat.tsx`
-  renders an icon and a tool name and nothing else. The native side agrees:
-  `parse_claude` and `parse_codex` in `apps/desktop/src-tauri/src/agent.rs`
-  push a `"tool"` chunk carrying only the tool's name, and the stream loop in
-  the same file turns that chunk into an activity label and an edit count. No
-  tool body is ever appended to a conversation. Only `"text"` chunks, an
-  assistant's own prose, become agent messages.
-- `Bubble` in `apps/desktop/src/agent-chat.tsx` would print `message.text`
+- **The thread's message text. This is the one.** `Log`
+  (`apps/desktop/src/queue.tsx:194`) renders `message.text` verbatim at
+  `queue.tsx:275`, so whatever an agent wrote arrives on screen as it was
+  written, fenced diff and all. One `Log`, through `AgentConversation`, is
+  every thread in the app: the worker thread, the ticket agent's chat and the
+  planner's. The task row's one-line preview of the last message
+  (`queue.tsx:1052`) shows the same text, so it is stripped with it. The fix
+  sits on the same path: `queue.tsx:219-220` runs `stripDiffBodies` and
+  `diffFiles` over each message before it is drawn.
+- **The tool line does not.** `ToolLine`
+  (`apps/desktop/src/agent-chat.tsx:348`) renders an icon and a tool name and
+  nothing else. The native side agrees: `parse_claude`
+  (`apps/desktop/src-tauri/src/agent.rs:246`) and `parse_codex`
+  (`agent.rs:278`) push a `"tool"` chunk carrying only the tool's name, and the
+  stream loop's `"tool"` arm (`agent.rs:668`) turns that chunk into an activity
+  label and an edit count without appending any text to the conversation. Only
+  `"text"` chunks (`agent.rs:659`), an assistant's own prose, become agent
+  messages.
+- **The Changes tab's own renderer is deliberate and stays.** `ChangesPanel`
+  (`apps/desktop/src/changes-panel.tsx:53`) calls `parseDiff` at
+  `changes-panel.tsx:173` to draw hunks. That is the one place a diff is meant
+  to be read, so it is the destination of this ticket, not a path to strip.
+- `Bubble` in `apps/desktop/src/agent-chat.tsx:312` would print `message.text`
   verbatim in the same way, but `AgentChat` is exported and never mounted:
-  `queue.tsx` imports only `HumanRequestCard` from that module. It is stripped
-  alongside the live path so the two renderers cannot drift.
+  `queue.tsx:58` imports only `HumanRequestCard` from that module. It is
+  stripped alongside the live path (`agent-chat.tsx:322-323`) so the two
+  renderers cannot drift.
 
 So the diff bodies in the thread are the agent's own prose quoting a diff, and
 that is what is taken out.
@@ -89,7 +100,79 @@ has the file in it.
 - [ ] A row reading `no diff to show` takes neither tab nor Enter.
 - [ ] Quote in the opened file still prefills the composer.
 
-## Order
+## Checks
 
-This touches `queue.tsx` alongside LOCAL-9b1540fd and LOCAL-192f8bfc, and
-lands after them.
+`make test` passes end to end on this branch, with nothing left to fix:
+
+- `bun run check` — typecheck across all six workspaces, then `bun test`
+  (**217 pass, 0 fail**, 541 expect() calls across 20 files), then the desktop
+  and web production builds. The new suites are in it: `diff.test.ts`,
+  `diff-summary.test.ts`, `changes-focus.test.ts`, `use-task-changes.test.ts`.
+- `bun run format:check` — clean.
+- `cargo fmt --check` — clean.
+- `cargo check --locked` — clean, no warnings.
+- `cargo test --locked` — **179 passed, 0 failed**, 3 ignored.
+
+## What a reviewer should walk through in the app
+
+No worker can open the desktop app, so the click-through below is left for a
+person. The logic under each step is covered by unit tests with no app
+rendered — `diff.test.ts` and `diff-summary.test.ts` for what is stripped and
+what a row says, `changes-focus.test.ts` for where a row lands,
+`use-task-changes.test.ts` for the fetching — but that the wiring is really on
+screen is what these steps prove.
+
+Run a worker on a task that edits **two** files, then:
+
+- [ ] **Two rows, no hunks.** The agent thread shows one compact summary row
+      per touched file — two rows — each reading verb, path and counts, e.g.
+      `edited apps/desktop/src/queue.tsx  +24 -7`. Scroll the whole thread: no
+      `@@` hunk header, no `+`/`-` body line, no fenced diff anywhere in it.
+      The task row's one-line preview in the list is likewise free of diff
+      text.
+- [ ] **A row is the verb the repository reports.** The verbs come from the
+      same A/M/D/R vocabulary `ChangedFile` carries — added / edited / deleted
+      / renamed — and the counts match what the Changes tab shows for that
+      file, not any number the agent quoted in its prose.
+- [ ] **The prose survives.** Whatever the agent wrote around the diff is
+      still there, unaltered. A `- like this` bullet, a `---` rule, a `+1` and
+      a `sh` fence are not mistaken for diff and are left alone.
+- [ ] **Clicking a row lands on that file.** Press the first row. The detail
+      page turns to the **Changes** tab, that file's section is expanded and
+      scrolled into view, and the keyboard focus is on it — not on the top of
+      the tab. Go back to the **Agent thread** tab, press the *second* row, and
+      land on the second file the same way.
+- [ ] **Quoting a line reaches the composer.** In the opened file in the
+      Changes tab, quote a line. The quoted text appears in the composer,
+      ready to send.
+
+The finer-grained focus behaviour — tab order, Enter, pressing the same row
+twice, an already-seen file, and a row marked `no diff to show` — is listed
+under *Where the row lands* above.
+
+## Order, and the overlap in `queue.tsx`
+
+This ticket rewrites the parts of `queue.tsx` and `agent-chat.tsx` that two
+other tickets also touch, and it is branched from before either of them
+landed. Whoever merges this to `main` should expect to resolve that by hand;
+nothing here is meant to undo either one.
+
+Comparing this branch against `main` from their common base
+(`7b4fb46`), the files changed on both sides are:
+`apps/desktop/src/queue.tsx`, `apps/desktop/src/agent-chat.tsx`,
+`apps/desktop/src/workflow.css` and `package.json`.
+
+- **LOCAL-192f8bfc — Cmd+Enter sends from the agent text inputs** (PR #4,
+  merged). On `main` this adds send-shortcut wiring at `queue.tsx:361` and
+  `agent-chat.tsx:230` and `:336`, plus `send-shortcut.ts`. None of it is on
+  this branch. Its hunks sit in the composer and the message list — the same
+  two regions this ticket reworks — so keep both: the shortcut handlers and
+  the summary-row rendering are independent and must both survive.
+- **LOCAL-9b1540fd — Unsent text in every input survives navigating away and
+  back** (PR #3, merged). It adds `drafts.ts`, `use-draft`, `new-ticket-draft`
+  and `quote-prefill.ts`, and rewrites the `queue.tsx` composer onto
+  `useDraft(draftKey)`. None of it is on this branch either. Note especially
+  `quote-prefill.ts`: it owns the quote-to-composer step of the walkthrough
+  above, which this branch still does through the local `quote` state at
+  `queue.tsx:627` and `:1690`. On merge that step should end up going through
+  `quote-prefill`, and the walkthrough's last box re-checked once it does.
