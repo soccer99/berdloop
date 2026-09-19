@@ -8,7 +8,16 @@ import { describe, expect, mock, test } from "bun:test";
 const opened: string[] = [];
 let tauri = false;
 
-mock.module("@tauri-apps/api/core", () => ({ isTauri: () => tauri }));
+/**
+ * `mock.module` replaces the module for the whole run, not just this file, so
+ * the stand-in has to carry the rest of `core` with it. Most of the app imports
+ * `invoke` from here, and a namespace without it cannot be linked: leaving it
+ * out failed whichever unrelated files bun happened to load after this one.
+ * `tauri` is false by the time they do, which is what the real `isTauri` says
+ * outside a Tauri window anyway.
+ */
+const core = await import("@tauri-apps/api/core");
+mock.module("@tauri-apps/api/core", () => ({ ...core, isTauri: () => tauri }));
 mock.module("@tauri-apps/plugin-opener", () => ({
   openUrl: async (url: string) => {
     opened.push(url);
