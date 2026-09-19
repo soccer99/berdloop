@@ -9,9 +9,18 @@
  *
  * Because the key follows the target, re-aiming the Project select would drop
  * what has been typed. `moveNewTicketDrafts` carries it across, so changing the
- * project changes where the ticket lands and nothing else.
+ * project changes where the ticket lands and nothing else. It carries text
+ * across without erasing text: a project that already has a draft of its own
+ * keeps it unless the form is actually carrying something over it.
  */
-import { removeDraft, saveDraft, type DraftOptions } from "./drafts";
+import {
+  nextDraftRecord,
+  readDraftRecord,
+  removeDraft,
+  resolveDraftValue,
+  saveDraft,
+  type DraftOptions,
+} from "./drafts";
 
 /** The fields of the new-ticket form that hold unsent text. */
 export type NewTicketField = "title" | "reference" | "criteria";
@@ -38,10 +47,25 @@ export interface NewTicketDraftText {
   seed?: string;
 }
 
+/** Whether a subject already holds a draft the form would show. */
+function holdsDraft(key: string, options: DraftOptions) {
+  const record = readDraftRecord(key, options);
+  return (
+    record !== null &&
+    resolveDraftValue(record, options) !== (options.seed ?? "")
+  );
+}
+
 /**
  * Re-aims the form's drafts from one project at another, carrying the text on
  * screen across. Pass the live values: they are newer than anything stored.
  * Aiming at the project already targeted leaves everything where it is.
+ *
+ * An empty field carries nothing, so it is not written over a project that
+ * already has a draft stored: the form reopens aimed at the project in view,
+ * not at the one last typed for, so pointing the select back at that project
+ * is how the draft is reached again, and writing the empty form over it first
+ * would be the one action that destroys it.
  */
 export function moveNewTicketDrafts(
   from: string,
@@ -53,7 +77,16 @@ export function moveNewTicketDrafts(
     return;
   }
   for (const { field, text, seed } of texts) {
-    saveDraft(newTicketDraftKey(to, field), text, { ...options, seed });
+    const fieldOptions: DraftOptions = { ...options, seed };
+    const destination = newTicketDraftKey(to, field);
+    // What is on screen wins whenever it is a draft at all; only a field with
+    // nothing to carry defers to what the destination already holds.
+    if (
+      nextDraftRecord(text, fieldOptions) ||
+      !holdsDraft(destination, fieldOptions)
+    ) {
+      saveDraft(destination, text, fieldOptions);
+    }
     removeDraft(newTicketDraftKey(from, field), options);
   }
 }
