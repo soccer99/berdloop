@@ -209,7 +209,8 @@ function queueTools(q: QueueWords): ToolSpec[] {
         {
           name: "title",
           required: false,
-          description: "Name for the combined record. Titles are joined if you leave it out.",
+          description:
+            "Name for the combined record. Titles are joined if you leave it out.",
         },
         {
           name: q.criteria,
@@ -357,7 +358,8 @@ export const berdloopTools: ToolSpec[] = [
   {
     name: "db_reset",
     roles: ["worker"],
-    summary: "Empty and rebuild your own databases, then run migrations and seeds.",
+    summary:
+      "Empty and rebuild your own databases, then run migrations and seeds.",
     args: [TASK_ARG],
     use: "When you need a clean database to test against, or your migrations have left it in a state you cannot use. It affects only your own databases. Wait for it to finish before you start the app.",
   },
