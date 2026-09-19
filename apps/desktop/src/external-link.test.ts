@@ -8,7 +8,17 @@ import { describe, expect, mock, test } from "bun:test";
 const opened: string[] = [];
 let tauri = false;
 
-mock.module("@tauri-apps/api/core", () => ({ isTauri: () => tauri }));
+/**
+ * `mock.module` replaces the module for the whole test process, not just
+ * this file, and the order test files run in differs between macOS and
+ * Linux. Keep every other export, or whichever file happens to load
+ * `invoke` after this one fails to find it.
+ */
+const core = await import("@tauri-apps/api/core");
+mock.module("@tauri-apps/api/core", () => ({
+  ...core,
+  isTauri: () => tauri,
+}));
 mock.module("@tauri-apps/plugin-opener", () => ({
   openUrl: async (url: string) => {
     opened.push(url);

@@ -214,6 +214,67 @@ fn text_of(value: &serde_json::Value, key: &str) -> Option<String> {
     value.get(key).and_then(|v| v.as_str()).map(str::to_string)
 }
 
+/// The keys worth putting on the line itself, most telling first. A Bash call
+/// says its command, a file tool says its file; anything else falls back to the
+/// whole input, so a tool this list has never heard of still says something.
+const TOOL_SUMMARY_KEYS: [&str; 8] = [
+    "command",
+    "file_path",
+    "path",
+    "pattern",
+    "url",
+    "query",
+    "description",
+    "prompt",
+];
+
+/// A tool line: "Name · what it was called with", then the full input below.
+///
+/// The window shows the first line and opens the rest on a click, so a run of
+/// tool calls still reads as a list while any one of them can be read in full.
+fn tool_label(name: &str, input: Option<&serde_json::Value>) -> String {
+    let Some(input) = input.filter(|value| {
+        value.as_object().is_some_and(|fields| !fields.is_empty())
+            || (!value.is_null() && !value.is_object())
+    }) else {
+        return name.to_string();
+    };
+    let detail = serde_json::to_string_pretty(input).unwrap_or_default();
+    let summary = TOOL_SUMMARY_KEYS
+        .iter()
+        .find_map(|key| text_of(input, key))
+        .unwrap_or_else(|| detail.clone());
+    format!(
+        "{name} · {}\n{}",
+        one_line(&summary, 120),
+        clamp(&detail, 4000)
+    )
+}
+
+/// The first line of something, short enough to sit in a list.
+fn one_line(text: &str, limit: usize) -> String {
+    let first = text.lines().next().unwrap_or("").trim();
+    let rest = text.lines().count() > 1;
+    let mut out = clamp(first, limit);
+    if rest && !out.ends_with('…') {
+        out.push('…');
+    }
+    out
+}
+
+fn clamp(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    text.chars().take(limit).collect::<String>() + "…"
+}
+
+/// What a tool line is classified by: its name and arguments, never the full
+/// input, so a command that merely mentions "edit" is not counted as one.
+fn tool_head(label: &str) -> &str {
+    label.split('\n').next().unwrap_or(label)
+}
+
 /// Turn one line of a CLI's JSON stream into zero or more display chunks.
 /// Returns the session id whenever the line reveals it.
 fn parse_line(
@@ -243,7 +304,8 @@ fn parse_claude(line: &serde_json::Value, out: &mut Vec<(&'static str, String)>)
                     }
                     Some("thinking") => out.push(("thinking", String::new())),
                     Some("tool_use") => {
-                        out.push(("tool", text_of(block, "name").unwrap_or_default()));
+                        let name = text_of(block, "name").unwrap_or_default();
+                        out.push(("tool", tool_label(&name, block.get("input"))));
                     }
                     _ => {}
                 }
@@ -274,7 +336,15 @@ fn parse_codex(line: &serde_json::Value, out: &mut Vec<(&'static str, String)>) 
                 }
                 "reasoning" => out.push(("thinking", String::new())),
                 _ => {
-                    let label = text_of(item, "command").unwrap_or_else(|| kind.to_string());
+                    let label = match text_of(item, "command") {
+                        Some(command) => format!(
+                            "{} · {}\n{}",
+                            kind,
+                            one_line(&command, 120),
+                            clamp(&command, 4000)
+                        ),
+                        None => kind.to_string(),
+                    };
                     out.push(("tool", label));
                 }
             }
@@ -666,11 +736,21 @@ pub fn agent_start(
                                 },
                             ),
                             "tool" => {
-                                thread.activity = activity_of(text).into();
-                                if is_edit(text) {
+                                let head = tool_head(text);
+                                thread.activity = activity_of(head).into();
+                                if is_edit(head) {
                                     thread.edits += 1;
                                 }
-                                thread.revision += 1;
+                                // The thread showed only the agent's prose, so
+                                // a worker that spent ten minutes running
+                                // commands looked idle. Its own role keeps it
+                                // out of the prose and lets the window draw it
+                                // as a tool line.
+                                if text.is_empty() {
+                                    thread.revision += 1;
+                                } else {
+                                    thread.append("tool", text.clone());
+                                }
                             }
                             _ => {}
                         }
@@ -1353,6 +1433,22 @@ mod tests {
     }
 
     #[test]
+    fn a_tool_line_carries_its_arguments() {
+        let (out, _) = chunks(
+            "Claude Code",
+            r#"{"type":"assistant","message":{"content":[
+                {"type":"tool_use","name":"Bash","input":{"command":"git status\ngit log","description":"look"}}]}}"#,
+        );
+        let (kind, label) = &out[0];
+        assert_eq!(*kind, "tool");
+        // The line itself says the command; the rest is the whole input, below.
+        assert_eq!(label.lines().next().unwrap(), "Bash · git status…");
+        assert!(label.contains("\"description\": \"look\""));
+        // Classification reads the line, never the arguments under it.
+        assert!(!is_edit(tool_head(label)));
+    }
+
+    #[test]
     fn a_failed_claude_result_is_an_error() {
         let (out, _) = chunks(
             "Claude Code",
@@ -1383,7 +1479,7 @@ mod tests {
             "Codex",
             r#"{"type":"item.completed","item":{"item_type":"command_execution","command":"ls -la"}}"#,
         );
-        assert_eq!(out, [("tool", "ls -la".into())]);
+        assert_eq!(out, [("tool", "command_execution · ls -la\nls -la".into())]);
     }
     #[cfg(unix)]
     fn live_fixture(program: &str, delivery: &str) -> Live {

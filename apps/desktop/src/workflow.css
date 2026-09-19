@@ -189,6 +189,15 @@
 .wf-message-system p {
   color: #93a688;
 }
+/* One tool call, one row: quieter than a message and never boxed like one. */
+.wf-log > .agent-chat-tool {
+  display: flex;
+  padding: 3px 0 3px 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.wf-log > details.agent-chat-tool {
+  display: block;
+}
 .wf-streaming {
   font-size: 12px;
   color: #b0ca98;

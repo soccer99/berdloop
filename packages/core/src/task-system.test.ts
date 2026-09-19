@@ -4,6 +4,7 @@ import {
   canCompleteParent,
   emptyTaskWorkspace,
   importIssue,
+  requeueAgentTask,
   setAgentTaskStatus,
   TaskRepository,
   topTicket,
@@ -225,5 +226,49 @@ describe("the ticket the loop takes", () => {
     ).toBe("next");
     expect(topTicket([ticket("done", "complete")])).toBeUndefined();
     expect(topTicket([])).toBeUndefined();
+  });
+  test("a blocked task goes back to the queue, and waits if its dependencies are not done", () => {
+    const parent = importIssue(
+      emptyTaskWorkspace(),
+      issue,
+      "project",
+      "2026-01-01",
+      () => "parent",
+    ).workspace;
+    const first = addAgentTask(
+      parent,
+      {
+        parentTaskId: "parent",
+        title: "First",
+        criteria: "Done",
+        dependencyIds: [],
+      },
+      "2026-01-02",
+      () => "a",
+    );
+    const second = addAgentTask(
+      first,
+      {
+        parentTaskId: "parent",
+        title: "Second",
+        criteria: "Done",
+        dependencyIds: ["a"],
+      },
+      "2026-01-03",
+      () => "b",
+    );
+    // What a worker that could not be started leaves behind.
+    const stuck = setAgentTaskStatus(second, "a", "blocked", "2026-01-04");
+    expect(
+      requeueAgentTask(stuck, "a", "2026-01-05").agentTasks[0].status,
+    ).toBe("ready");
+    // The dependent one is still waiting on it, so it queues instead.
+    const bothStuck = setAgentTaskStatus(stuck, "b", "blocked", "2026-01-04");
+    expect(
+      requeueAgentTask(bothStuck, "b", "2026-01-05").agentTasks[1].status,
+    ).toBe("queued");
+    expect(() => requeueAgentTask(bothStuck, "missing")).toThrow(
+      "does not exist",
+    );
   });
 });

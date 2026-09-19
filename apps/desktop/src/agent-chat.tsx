@@ -20,6 +20,7 @@ import {
   type ThreadMessage,
 } from "./workflow-ui";
 import { useDraft } from "./drafts";
+import { shouldSendOnKey } from "./send-shortcut";
 
 /**
  * One agent conversation.
@@ -71,6 +72,12 @@ export interface AgentChatProps {
   onStop?: () => void;
   placeholder?: string;
 }
+
+/** Said next to every send control, so the keystroke is discoverable. */
+const SEND_HINT = "Send · Enter, or Cmd+Enter / Ctrl+Enter";
+
+/** The question variant answers on the modifier alone: Enter is a newline. */
+const ANSWER_HINT = "Send · Cmd+Enter / Ctrl+Enter";
 
 const DELIVERY_NOTE: Record<NonNullable<ThreadMessage["delivery"]>, string> = {
   saved: "Saved",
@@ -224,21 +231,44 @@ export function AgentChat({
           }
           onChange={(event) => setDraft(event.currentTarget.value)}
           onKeyDown={(event) => {
-            // Enter sends. A newline still needs a modifier, as everywhere else.
+            // A half-typed CJK word is not an instruction: leave the IME alone.
+            if (event.nativeEvent.isComposing) return;
+            // Cmd+Enter and Ctrl+Enter send, the same keystroke as every other
+            // composer here, judged by the one shared predicate.
+            if (
+              shouldSendOnKey(
+                {
+                  key: event.key,
+                  metaKey: event.metaKey,
+                  ctrlKey: event.ctrlKey,
+                  shiftKey: event.shiftKey,
+                  isComposing: event.nativeEvent.isComposing,
+                },
+                { text: draft, busy },
+              )
+            ) {
+              event.preventDefault();
+              void send();
+              return;
+            }
+            // Bare Enter sends too, as it always has here. A newline still
+            // needs a modifier, as everywhere else.
             if (event.key === "Enter" && !event.shiftKey) {
               event.preventDefault();
               void send();
             }
           }}
         />
-        <ActionIcon
-          size="lg"
-          disabled={!draft.trim() || busy}
-          onClick={() => void send()}
-          aria-label="Send"
-        >
-          <IconArrowUp size={17} />
-        </ActionIcon>
+        <Tooltip label={SEND_HINT}>
+          <ActionIcon
+            size="lg"
+            disabled={!draft.trim() || busy}
+            onClick={() => void send()}
+            aria-label="Send"
+          >
+            <IconArrowUp size={17} />
+          </ActionIcon>
+        </Tooltip>
       </div>
     </section>
   );
@@ -267,6 +297,13 @@ export function HumanRequestCard({
   async function answer(approved: boolean, text: string) {
     await onAnswer?.(request.id, approved, text);
     clearNote();
+  }
+
+  /** The question variant's one way to answer, for the button and the key. */
+  function submitAnswer() {
+    const text = note.trim();
+    if (!text) return;
+    void answer(true, text);
   }
 
   return (
@@ -306,14 +343,31 @@ export function HumanRequestCard({
             placeholder="Your answer"
             value={note}
             onChange={(event) => setNote(event.currentTarget.value)}
+            onKeyDown={(event) => {
+              // Only the question variant takes a keystroke. An approval has
+              // Allow and Refuse, and Enter cannot say which one you meant.
+              if (
+                shouldSendOnKey(
+                  {
+                    key: event.key,
+                    metaKey: event.metaKey,
+                    ctrlKey: event.ctrlKey,
+                    shiftKey: event.shiftKey,
+                    isComposing: event.nativeEvent.isComposing,
+                  },
+                  { text: note },
+                )
+              ) {
+                event.preventDefault();
+                submitAnswer();
+              }
+            }}
           />
-          <Button
-            size="xs"
-            disabled={!note.trim()}
-            onClick={() => void answer(true, note.trim())}
-          >
-            Send
-          </Button>
+          <Tooltip label={ANSWER_HINT}>
+            <Button size="xs" disabled={!note.trim()} onClick={submitAnswer}>
+              Send
+            </Button>
+          </Tooltip>
         </div>
       )}
     </div>
@@ -321,6 +375,9 @@ export function HumanRequestCard({
 }
 
 function Bubble({ message }: { message: ThreadMessage }) {
+  if (message.role === "tool") {
+    return <ToolLine name={message.text} />;
+  }
   if (message.role === "system") {
     return <p className="agent-chat-system">{message.text}</p>;
   }
@@ -337,12 +394,31 @@ function Bubble({ message }: { message: ThreadMessage }) {
   );
 }
 
-/** A tool line, for a caller that wants to show what an agent reached for. */
+/**
+ * A tool line, for a caller that wants to show what an agent reached for.
+ *
+ * The first line says the tool and what it was called with. Anything after it
+ * is the full input, which opens on a click: twenty tool calls stay a list,
+ * and any one of them can still be read.
+ */
 export function ToolLine({ name }: { name: string }) {
+  const newline = name.indexOf("\n");
+  const head = newline < 0 ? name : name.slice(0, newline);
+  const detail = newline < 0 ? "" : name.slice(newline + 1);
+  if (!detail) {
+    return (
+      <span className="agent-chat-tool">
+        <IconTool size={12} /> {head}
+      </span>
+    );
+  }
   return (
-    <span className="agent-chat-tool">
-      <IconTool size={12} /> {name}
-    </span>
+    <details className="agent-chat-tool">
+      <summary>
+        <IconTool size={12} /> {head}
+      </summary>
+      <pre>{detail}</pre>
+    </details>
   );
 }
 
