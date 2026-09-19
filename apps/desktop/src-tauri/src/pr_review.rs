@@ -179,8 +179,8 @@ pub fn publish(
 #[derive(Serialize, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PullState {
-    /// One of: merged, open, checks-pending, checks-failed, blocked, closed,
-    /// head-moved, waiting-for-human.
+    /// One of: merged, open, checks-pending, checks-failed, conflicts,
+    /// blocked, closed, head-moved, waiting-for-human.
     pub state: String,
     pub url: String,
 }
@@ -209,6 +209,8 @@ fn ticket_pr_sync_blocking(
 ) -> Result<PullState, String> {
     pr_sync(
         &workspace::for_app(&app)?,
+        &git::staging_for(&app, &project_id)?,
+        Path::new(&source),
         &project_id,
         &ticket_id,
         forge::for_repo(Path::new(&source))?.as_ref(),
@@ -217,6 +219,8 @@ fn ticket_pr_sync_blocking(
 
 pub fn pr_sync(
     store: &workspace::Store,
+    staging: &git::Staging,
+    source: &Path,
     project_id: &str,
     ticket_id: &str,
     forge: &dyn Forge,
@@ -245,12 +249,19 @@ pub fn pr_sync(
         state = "merged".into();
     }
     // A broken build is treated as a reviewer would be: it says what is wrong,
-    // and the ticket goes back to the workers with that as its next work.
-    if state == "checks-failed" {
-        let findings = ci_findings(&view, &head);
-        if !findings.is_empty() {
-            store.change(|w| queue_fix_tasks(w, project_id, ticket_id, &findings))?;
+    // and the ticket goes back to the workers with that as its next work. A
+    // branch that will not merge is the same thing said by the host instead of
+    // by a job, and it goes back the same way.
+    let findings = match state.as_str() {
+        "checks-failed" => ci_findings(&view, &head),
+        "conflicts" => {
+            let base = pull["baseBranch"].as_str().unwrap_or("main");
+            conflict_findings(&staging.forge_base(source, base), base, &head)
         }
+        _ => Vec::new(),
+    };
+    if !findings.is_empty() {
+        store.change(|w| queue_fix_tasks(w, project_id, ticket_id, &findings))?;
     }
     store.change(|w| {
         let item = w["tasks"]
@@ -350,6 +361,13 @@ pub fn pull_state(view: &Value, head: &str, review: &str, policy: &str) -> Strin
     if view["headRefOid"].as_str().is_some_and(|sha| sha != head) {
         return "head-moved".into();
     }
+    // A branch that cannot merge is read before its build is. The host runs
+    // most checks against the merge it cannot make, so a conflicted pull
+    // request reports whatever the last mergeable commit reported, or nothing
+    // at all, and waiting on that build left it sitting still forever.
+    if view["mergeStateStatus"].as_str() == Some("DIRTY") {
+        return "conflicts".into();
+    }
     // The build is read before the review is. A failing build is work whoever
     // reviews it, and waiting for a verdict that may never come left every
     // broken pull request sitting still.
@@ -421,6 +439,33 @@ pub fn ci_findings(view: &Value, head: &str) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+/// One task to bring the base branch in and resolve what clashes.
+///
+/// The conflicting files are not listed. The host reports that a merge fails,
+/// never which hunks lose, and only the merge itself can say: the worker runs
+/// it in its own worktree and reads exactly what comes out.
+///
+/// Keyed by the head, so the same broken commit is queued once however often
+/// it is polled, and a new head that still conflicts gets a fresh attempt.
+pub fn conflict_findings(base_ref: &str, base_branch: &str, head: &str) -> Vec<Value> {
+    let criteria = [
+        format!("The pull request cannot merge: commit {head} conflicts with {base_branch}."),
+        format!(
+            "In your worktree run `git merge {base_ref}`, resolve every conflicted file, and commit."
+        ),
+        "Keep both intentions. Never drop the base branch's work to make the merge go through."
+            .to_string(),
+        "Then land as usual: merge_sync, then merge_land.".to_string(),
+        format!("Done when `git merge {base_ref}` reports nothing left to merge."),
+    ]
+    .join("\n");
+    vec![json!({
+        "title": format!("Resolve conflicts with {base_branch}"),
+        "criteria": criteria,
+        "ciKey": format!("conflict:{head}"),
+    })]
 }
 
 fn review_context(
@@ -697,7 +742,16 @@ fn watch_pass(app: &tauri::AppHandle) -> Result<(), String> {
             .or_insert_with(|| forge::for_repo(Path::new(&project.path)));
         // One pull request the host cannot answer for must not stop the rest.
         let outcome = match forge {
-            Ok(forge) => pr_sync(&store, &project_id, &ticket_id, forge.as_ref()),
+            Ok(forge) => git::staging_for(app, &project_id).and_then(|staging| {
+                pr_sync(
+                    &store,
+                    &staging,
+                    Path::new(&project.path),
+                    &project_id,
+                    &ticket_id,
+                    forge.as_ref(),
+                )
+            }),
             Err(error) => Err(error.clone()),
         };
         if let Err(error) = outcome {
@@ -952,9 +1006,16 @@ mod tests {
         // Not approved yet: nothing merges whatever the forge says.
         bench.view(&format!(r#"{{"state":"OPEN","headRefOid":"{}","mergeStateStatus":"CLEAN","statusCheckRollup":[]}}"#, first.head));
         assert_eq!(
-            pr_sync(&bench.store, "p", "t1", &bench.forge())
-                .unwrap()
-                .state,
+            pr_sync(
+                &bench.store,
+                &bench.staging,
+                &bench.source,
+                "p",
+                "t1",
+                &bench.forge()
+            )
+            .unwrap()
+            .state,
             "open"
         );
         assert!(!bench.calls().contains("merge "));
@@ -973,32 +1034,60 @@ mod tests {
         // A pending check holds the merge; a failed one refuses it.
         bench.view(&format!(r#"{{"state":"OPEN","headRefOid":"{}","mergeStateStatus":"CLEAN","statusCheckRollup":[{{"conclusion":"","status":"IN_PROGRESS"}}]}}"#, first.head));
         assert_eq!(
-            pr_sync(&bench.store, "p", "t1", &bench.forge())
-                .unwrap()
-                .state,
+            pr_sync(
+                &bench.store,
+                &bench.staging,
+                &bench.source,
+                "p",
+                "t1",
+                &bench.forge()
+            )
+            .unwrap()
+            .state,
             "checks-pending"
         );
         bench.view(&format!(r#"{{"state":"OPEN","headRefOid":"{}","mergeStateStatus":"CLEAN","statusCheckRollup":[{{"conclusion":"FAILURE"}}]}}"#, first.head));
         assert_eq!(
-            pr_sync(&bench.store, "p", "t1", &bench.forge())
-                .unwrap()
-                .state,
+            pr_sync(
+                &bench.store,
+                &bench.staging,
+                &bench.source,
+                "p",
+                "t1",
+                &bench.forge()
+            )
+            .unwrap()
+            .state,
             "checks-failed"
         );
         // Branch protection on the forge is respected, never forced.
         bench.view(&format!(r#"{{"state":"OPEN","headRefOid":"{}","mergeStateStatus":"BLOCKED","statusCheckRollup":[{{"conclusion":"SUCCESS"}}]}}"#, first.head));
         assert_eq!(
-            pr_sync(&bench.store, "p", "t1", &bench.forge())
-                .unwrap()
-                .state,
+            pr_sync(
+                &bench.store,
+                &bench.staging,
+                &bench.source,
+                "p",
+                "t1",
+                &bench.forge()
+            )
+            .unwrap()
+            .state,
             "blocked"
         );
         // A commit pushed behind our back invalidates the approval.
         bench.view(r#"{"state":"OPEN","headRefOid":"someone-else","mergeStateStatus":"CLEAN","statusCheckRollup":[{"conclusion":"SUCCESS"}]}"#);
         assert_eq!(
-            pr_sync(&bench.store, "p", "t1", &bench.forge())
-                .unwrap()
-                .state,
+            pr_sync(
+                &bench.store,
+                &bench.staging,
+                &bench.source,
+                "p",
+                "t1",
+                &bench.forge()
+            )
+            .unwrap()
+            .state,
             "head-moved"
         );
         assert_eq!(bench.ticket()["pullRequest"]["review"], "pending");
@@ -1017,9 +1106,16 @@ mod tests {
             .unwrap();
         bench.view(&format!(r#"{{"state":"OPEN","headRefOid":"{}","mergeStateStatus":"CLEAN","statusCheckRollup":[{{"conclusion":"SUCCESS"}},{{"state":"SUCCESS"}}]}}"#, first.head));
         assert_eq!(
-            pr_sync(&bench.store, "p", "t1", &bench.forge())
-                .unwrap()
-                .state,
+            pr_sync(
+                &bench.store,
+                &bench.staging,
+                &bench.source,
+                "p",
+                "t1",
+                &bench.forge()
+            )
+            .unwrap()
+            .state,
             "merged"
         );
         assert!(
@@ -1058,18 +1154,32 @@ mod tests {
         submit_to(&bench.store, &scope, &published.head, "Fine", "[]").unwrap();
         bench.view(&format!(r#"{{"state":"OPEN","headRefOid":"{}","mergeStateStatus":"CLEAN","statusCheckRollup":[{{"conclusion":"SUCCESS"}}]}}"#, published.head));
         assert_eq!(
-            pr_sync(&bench.store, "p", "t1", &bench.forge())
-                .unwrap()
-                .state,
+            pr_sync(
+                &bench.store,
+                &bench.staging,
+                &bench.source,
+                "p",
+                "t1",
+                &bench.forge()
+            )
+            .unwrap()
+            .state,
             "waiting-for-human"
         );
         assert!(!bench.calls().contains("merge "));
         assert_eq!(bench.ticket()["status"], "review");
         bench.view(r#"{"state":"MERGED"}"#);
         assert_eq!(
-            pr_sync(&bench.store, "p", "t1", &bench.forge())
-                .unwrap()
-                .state,
+            pr_sync(
+                &bench.store,
+                &bench.staging,
+                &bench.source,
+                "p",
+                "t1",
+                &bench.forge()
+            )
+            .unwrap()
+            .state,
             "merged"
         );
         assert_eq!(bench.ticket()["status"], "complete");
@@ -1189,6 +1299,116 @@ mod tests {
             .collect();
         assert_eq!(fixes.len(), 1, "polling must not queue the same job twice");
         assert_eq!(fixes[0]["status"], json!("ready"));
+    }
+
+    /// A branch that will not merge is work, not a wait.
+    ///
+    /// The host runs its checks against a merge it cannot make, so this one
+    /// reports its build as still pending forever. Reading the build first
+    /// left the pull request sitting there.
+    #[test]
+    fn a_conflicting_branch_queues_one_resolve_task_per_head() {
+        let head = "abc";
+        let view: Value = serde_json::from_str(&format!(
+            r#"{{"state":"OPEN","headRefOid":"{head}","mergeStateStatus":"DIRTY","statusCheckRollup":[{{"name":"desktop","conclusion":"IN_PROGRESS"}}]}}"#
+        ))
+        .unwrap();
+        assert_eq!(pull_state(&view, head, "pending", "manual"), "conflicts");
+        // Approved and automatic changes nothing: it still cannot merge.
+        assert_eq!(
+            pull_state(&view, head, "approved", "automatic"),
+            "conflicts"
+        );
+
+        let mut w = json!({"schemaVersion":1,
+            "tasks":[{"id":"other","projectId":"p"},
+                     {"id":"t","projectId":"p","status":"review","stage":"Review"}],
+            "agentTasks":[{"id":"done","parentTaskId":"t","status":"complete"}]});
+        let findings = conflict_findings("forge/main", "main", head);
+        queue_fix_tasks(&mut w, "p", "t", &findings).unwrap();
+        queue_fix_tasks(&mut w, "p", "t", &findings).unwrap();
+        let fixes: Vec<_> = w["agentTasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|task| task["reviewFix"] == json!(true))
+            .collect();
+        assert_eq!(fixes.len(), 1, "polling must not queue the same head twice");
+        assert_eq!(w["tasks"][0]["id"], json!("t"));
+        assert_eq!(w["tasks"][0]["status"], json!("running"));
+        let criteria = fixes[0]["criteria"].as_str().unwrap();
+        assert!(criteria.contains("git merge forge/main"), "{criteria}");
+
+        // A later head that still conflicts is a fresh attempt, not a repeat.
+        queue_fix_tasks(
+            &mut w,
+            "p",
+            "t",
+            &conflict_findings("forge/main", "main", "def"),
+        )
+        .unwrap();
+        assert_eq!(
+            w["agentTasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|task| task["reviewFix"] == json!(true))
+                .count(),
+            2
+        );
+    }
+
+    /// End to end: the host says the branch conflicts, and the worker queue
+    /// gets a task naming the base as the host has it.
+    #[test]
+    #[cfg(unix)]
+    fn the_watcher_sends_a_conflict_back_to_the_workers() {
+        let bench = Bench::new();
+        finished_ticket(&bench, "automatic");
+        let published = publish(
+            &bench.store,
+            &bench.staging,
+            "p",
+            "t1",
+            bench.source.to_str().unwrap(),
+            &bench.forge(),
+        )
+        .unwrap();
+        bench.view(&format!(
+            r#"{{"state":"OPEN","headRefOid":"{}","mergeStateStatus":"DIRTY","statusCheckRollup":[]}}"#,
+            published.head
+        ));
+        assert_eq!(
+            pr_sync(
+                &bench.store,
+                &bench.staging,
+                &bench.source,
+                "p",
+                "t1",
+                &bench.forge()
+            )
+            .unwrap()
+            .state,
+            "conflicts"
+        );
+        let w = bench.store.load().unwrap();
+        assert_eq!(w["tasks"][0]["status"], json!("running"));
+        assert_eq!(w["tasks"][0]["stage"], json!("Engineer"));
+        let fix = w["agentTasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|task| task["reviewFix"] == json!(true))
+            .expect("a resolve task")
+            .clone();
+        assert_eq!(fix["status"], json!("ready"));
+        // The base is taken from the host's copy, which is what the pull
+        // request is judged against.
+        let criteria = fix["criteria"].as_str().unwrap();
+        assert!(criteria.contains("git merge forge/main"), "{criteria}");
+        // Nothing merged, and the checkout is untouched.
+        assert!(!bench.calls().contains("merge 1"), "{}", bench.calls());
+        assert!(sh(&bench.source, &["git", "status", "--porcelain"]).is_empty());
     }
 
     #[test]

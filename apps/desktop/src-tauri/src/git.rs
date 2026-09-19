@@ -33,6 +33,9 @@ use std::process::Command;
 /// The remote inside the staging repository that points at the user's folder.
 const LOCAL: &str = "local";
 
+/// Where the base branch as the host has it is kept, apart from the user's own.
+const FORGE: &str = "forge";
+
 /// Tail of a prepare log kept for the window. Enough to show why an install
 /// failed without holding a whole build log in the app's state.
 const PREPARE_TAIL: usize = 4000;
@@ -550,6 +553,31 @@ impl Staging {
             staging: bare.to_string_lossy().into_owned(),
             base_branch: base,
         })
+    }
+
+    /// Bring in the base branch as the forge has it, under its own remote name.
+    ///
+    /// A pull request is judged against the base on the host, which can be
+    /// ahead of the user's checkout: that is how a ticket branch that merged
+    /// cleanly here still conflicts there. The ref is kept as `forge/<base>`
+    /// rather than `local/<base>`, so nothing that branches from the user's
+    /// own base changes; only the worker resolving the conflict reads it.
+    ///
+    /// Returns the ref to merge, falling back to the user's own base when
+    /// there is no `origin` to ask, or no network to ask it over.
+    pub fn forge_base(&self, source: &Path, base_branch: &str) -> String {
+        let ours = format!("{LOCAL}/{base_branch}");
+        // The same network call `publish` already makes in the user's own
+        // repository. It writes no branch and touches no working tree.
+        if git(source, &["fetch", "--quiet", "origin", base_branch]).is_err() {
+            return ours;
+        }
+        let refspec =
+            format!("+refs/remotes/origin/{base_branch}:refs/remotes/{FORGE}/{base_branch}");
+        match git(&self.bare(), &["fetch", "--quiet", LOCAL, &refspec]) {
+            Ok(_) => format!("{FORGE}/{base_branch}"),
+            Err(_) => ours,
+        }
     }
 
     /// Open the ticket's collecting branch and its worktree.
