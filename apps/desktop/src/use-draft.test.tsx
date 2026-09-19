@@ -4,10 +4,11 @@
  * The sibling `drafts.test.ts` covers the pure functions the hook is built
  * from. Those can be checked against a plain object, but they leave the hook's
  * own code unrun: the render-phase reset when the key or the base moves, the
- * effect that writes, and `clearDraft`, which removes through Mantine's
- * `useLocalStorage` rather than through `saveDraft`. Everything here goes
- * through a real React root against a real `window.localStorage`, so a change
- * that broke any of those three would be caught.
+ * effect that writes, `clearDraft`, which removes through Mantine's
+ * `useLocalStorage` rather than through `saveDraft`, and `clearIfUnchanged`,
+ * which has to read the box as it stands now rather than as the send handler
+ * captured it. Everything here goes through a real React root against a real
+ * `window.localStorage`, so a change that broke any of those would be caught.
  *
  * The hook writes through Mantine and reads through `readDraft`, so a test
  * cannot hand it a stand-in store: the two halves would end up looking at
@@ -84,6 +85,25 @@ function mount(key: string, options: EditorOptions = {}) {
         live![2]();
       });
     },
+    /**
+     * An awaited send, started the way a composer starts one: the handler
+     * closes over the text and the `clearIfUnchanged` of the render it fired
+     * in, and only clears once the send has resolved. Whatever was typed in
+     * between belongs to the render that returns, not to this one, which is
+     * exactly what the hook's live ref exists to notice.
+     */
+    startSend() {
+      const sent = live![0];
+      const clearIfUnchanged = live![3];
+      return async () => {
+        await Promise.resolve();
+        let cleared = false;
+        act(() => {
+          cleared = clearIfUnchanged(sent);
+        });
+        return cleared;
+      };
+    },
     /** A send that succeeds and takes its composer down in the same tick. */
     clearAndUnmount() {
       act(() => {
@@ -152,6 +172,35 @@ describe("a rendered useDraft", () => {
     composer.clearAndUnmount();
 
     expect(stored("worker:task-7")).toBeNull();
+    expect(mount("worker:task-7").value).toBe("");
+  });
+
+  test("text typed during an in-flight send survives that send", async () => {
+    const composer = mount("worker:task-7");
+    composer.type("Re-run the failing migration");
+    const finish = composer.startSend();
+
+    // Nothing is disabled while the send is in flight, so the person carries
+    // on typing the next instruction before the first one has resolved. That
+    // text was never sent, so the send resolving must not take it away.
+    composer.type("And then check the logs");
+
+    expect(await finish()).toBe(false);
+    expect(composer.value).toBe("And then check the logs");
+    expect(stored("worker:task-7")?.text).toBe("And then check the logs");
+    composer.unmount();
+    expect(mount("worker:task-7").value).toBe("And then check the logs");
+  });
+
+  test("a send nobody typed over clears the box and the storage", async () => {
+    const composer = mount("worker:task-7");
+    composer.type("Re-run the failing migration");
+    const finish = composer.startSend();
+
+    expect(await finish()).toBe(true);
+    expect(composer.value).toBe("");
+    expect(stored("worker:task-7")).toBeNull();
+    composer.unmount();
     expect(mount("worker:task-7").value).toBe("");
   });
 
