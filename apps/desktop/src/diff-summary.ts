@@ -1,5 +1,6 @@
 /** Summarising a changed file down to the one line the chat thread shows. */
 import type { ChangedFile } from "./changes-panel";
+import { parseDiff } from "./diff";
 
 export type Verb = "added" | "edited" | "deleted" | "renamed";
 
@@ -34,17 +35,20 @@ export interface FileSummary {
 /**
  * Added and removed line counts for one file's unified diff.
  *
- * The `---` and `+++` file headers name the file rather than its content, so
- * they are skipped. Hunk headers and the no-newline note start with neither
- * marker and so count for nothing on their own.
+ * Counted from `parseDiff`, the same reading the Changes tab renders, so the
+ * row's `+n -n` and the red and green lines in the tab can never disagree.
+ * Reading only inside the hunks is what keeps the count right for a removed
+ * line whose own text starts with `--`, or an added one starting with `++`:
+ * the file headers sit in the preamble, which `parseDiff` drops.
  */
 export function countDiffLines(diff: string): DiffCounts {
   let added = 0;
   let removed = 0;
-  for (const line of diff.split("\n")) {
-    if (line.startsWith("+++") || line.startsWith("---")) continue;
-    if (line.startsWith("+")) added++;
-    else if (line.startsWith("-")) removed++;
+  for (const hunk of parseDiff(diff)) {
+    for (const line of hunk.lines) {
+      if (line.kind === "add") added++;
+      else if (line.kind === "del") removed++;
+    }
   }
   return { added, removed };
 }

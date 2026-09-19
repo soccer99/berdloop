@@ -6,6 +6,16 @@ import {
   verbFor,
 } from "./diff-summary";
 import type { ChangedFile } from "./changes-panel";
+import { parseDiff } from "./diff";
+
+/** What `parseDiff` counts, which is what the Changes tab puts on screen. */
+function parsedCounts(diff: string) {
+  const lines = parseDiff(diff).flatMap((hunk) => hunk.lines);
+  return {
+    added: lines.filter((line) => line.kind === "add").length,
+    removed: lines.filter((line) => line.kind === "del").length,
+  };
+}
 
 const diff = [
   "diff --git a/src/foo.ts b/src/foo.ts",
@@ -26,6 +36,30 @@ const diff = [
   "",
 ].join("\n");
 
+/**
+ * A markdown file losing a `---` rule and gaining a `++x` line.
+ *
+ * The removed rule and the added line read exactly like the `---`/`+++` file
+ * headers, which is what used to lose them from the count.
+ */
+const markdownRule = [
+  "diff --git a/README.md b/README.md",
+  "index 3333333..4444444 100644",
+  "--- a/README.md",
+  "+++ b/README.md",
+  "@@ -1,6 +1,6 @@",
+  " # Title",
+  " ",
+  "-Intro.",
+  "---",
+  "-After the rule.",
+  "+Intro, reworded.",
+  "++x is the flag, not a header.",
+  "+++ and this is prose as well.",
+  " Last line.",
+  "",
+].join("\n");
+
 describe("countDiffLines", () => {
   test("counts both hunks and skips the file headers", () => {
     expect(countDiffLines(diff)).toEqual({ added: 3, removed: 3 });
@@ -33,6 +67,15 @@ describe("countDiffLines", () => {
 
   test("counts nothing in an empty diff", () => {
     expect(countDiffLines("")).toEqual({ added: 0, removed: 0 });
+  });
+
+  test("counts content of its own that starts with -- or ++", () => {
+    expect(countDiffLines(markdownRule)).toEqual({ added: 3, removed: 3 });
+  });
+
+  test("agrees with the diff the Changes tab renders", () => {
+    expect(countDiffLines(markdownRule)).toEqual(parsedCounts(markdownRule));
+    expect(countDiffLines(diff)).toEqual(parsedCounts(diff));
   });
 });
 
