@@ -19,6 +19,7 @@ import {
   type AgentThreadView,
   type ThreadMessage,
 } from "./workflow-ui";
+import { useDraft } from "./drafts";
 import { shouldSendOnKey } from "./send-shortcut";
 
 /**
@@ -42,6 +43,12 @@ export interface HumanRequest {
 }
 
 export interface AgentChatProps {
+  /**
+   * The subject this conversation is about: a ticket agent, a task agent or a
+   * worker. Unsent text is kept under this key, so leaving the conversation
+   * and coming back does not throw it away.
+   */
+  draftKey: string;
   thread?: AgentThreadView;
   /** Anything this agent is waiting on a person for. */
   requests?: HumanRequest[];
@@ -81,6 +88,7 @@ const DELIVERY_NOTE: Record<NonNullable<ThreadMessage["delivery"]>, string> = {
 };
 
 export function AgentChat({
+  draftKey,
   thread,
   requests = [],
   onAnswer,
@@ -91,7 +99,7 @@ export function AgentChat({
   onStop,
   placeholder,
 }: AgentChatProps) {
-  const [draft, setDraft] = useState("");
+  const [draft, setDraft, , clearSentDraft] = useDraft(draftKey);
   const [busy, setBusy] = useState(false);
   const tail = useRef<HTMLDivElement>(null);
 
@@ -110,12 +118,16 @@ export function AgentChat({
   }, [messages.length, streaming]);
 
   async function send() {
-    const text = draft.trim();
+    const sent = draft;
+    const text = sent.trim();
     if (!text || busy) return;
     setBusy(true);
-    setDraft("");
     try {
       await onSend(text);
+      // Cleared here and nowhere else: a send that threw leaves the typed
+      // text as the only copy of it. Nothing is disabled while the send is in
+      // flight, so anything typed meanwhile was never sent and is kept.
+      clearSentDraft(sent);
     } finally {
       setBusy(false);
     }
@@ -275,14 +287,23 @@ export function HumanRequestCard({
   request: HumanRequest;
   onAnswer?: AgentChatProps["onAnswer"];
 }) {
-  const [note, setNote] = useState("");
+  // Keyed by the request, and by the task it belongs to, so a half-typed
+  // reason survives the card unmounting and is never shown against another.
+  const [note, setNote, clearNote] = useDraft(
+    `human-request:${request.taskId}:${request.id}`,
+  );
   const approval = request.kind === "approval";
+
+  async function answer(approved: boolean, text: string) {
+    await onAnswer?.(request.id, approved, text);
+    clearNote();
+  }
 
   /** The question variant's one way to answer, for the button and the key. */
   function submitAnswer() {
-    const answer = note.trim();
-    if (!answer) return;
-    void onAnswer?.(request.id, true, answer);
+    const text = note.trim();
+    if (!text) return;
+    void answer(true, text);
   }
 
   return (
@@ -295,18 +316,14 @@ export function HumanRequestCard({
         <div className="agent-ask-actions">
           <Button
             size="xs"
-            onClick={() =>
-              void onAnswer?.(request.id, true, note || "Allowed.")
-            }
+            onClick={() => void answer(true, note || "Allowed.")}
           >
             Allow
           </Button>
           <Button
             size="xs"
             variant="default"
-            onClick={() =>
-              void onAnswer?.(request.id, false, note || "Refused.")
-            }
+            onClick={() => void answer(false, note || "Refused.")}
           >
             Refuse
           </Button>
