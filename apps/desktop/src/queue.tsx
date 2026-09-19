@@ -184,6 +184,11 @@ function Log({
   );
 }
 
+/** Said on every send control, so the keystroke is discoverable. */
+function sendHint(connected: boolean) {
+  return `${connected ? "Send instruction" : "Save instruction"} · Cmd+Enter / Ctrl+Enter`;
+}
+
 function Composer({
   label,
   placeholder,
@@ -224,6 +229,7 @@ function Composer({
     <Button
       size="xs"
       type="submit"
+      title={sendHint(connected)}
       disabled={!text.trim()}
       loading={busy}
       rightSection={<IconArrowUp size={14} />}
@@ -281,8 +287,8 @@ function Composer({
         />
         {inlineSend && (
           <ActionIcon
-            aria-label={connected ? "Send instruction" : "Save instruction"}
-            title={connected ? "Send instruction" : "Save instruction"}
+            aria-label={sendHint(connected)}
+            title={sendHint(connected)}
             size="sm"
             type="submit"
             disabled={!text.trim()}
