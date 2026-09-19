@@ -1,2 +1,6 @@
 [install]
 exact = true
+
+[test]
+# Tests that render React components need a window. See the file for why.
+preload = ["./apps/desktop/src/test-dom.ts"]
