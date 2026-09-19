@@ -59,6 +59,7 @@ import { HumanRequestCard } from "./agent-chat";
 import { orderAgentTasks, orderTickets, routeSteering } from "./jev";
 import { ChangesPanel } from "./changes-panel";
 import { useTaskChanges } from "./use-task-changes";
+import { focusFile, focusFor, type FocusRequest } from "./changes-focus";
 import { diffFiles, stripDiffBodies } from "./diff";
 import { ThreadFiles } from "./thread-files";
 import type { Changes } from "./changes-panel";
@@ -627,6 +628,10 @@ export function QueueView({
   // Keyed by task id, so a tab choice never leaks from the task it was made
   // on to the next one opened.
   const [taskTabs, setTaskTabs] = useState<Record<string, string>>({});
+  // The file a thread row last asked the Changes tab for. It carries its task
+  // and a rising id, so a request never leaks to the next task opened and the
+  // same file asked for twice lands on it twice.
+  const [changesFocus, setChangesFocus] = useState<FocusRequest>();
   const [editTicket, setEditTicket] = useState(false);
   const [taskEditor, setTaskEditor] = useState<AgentTask | "new" | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<{
@@ -1657,12 +1662,20 @@ export function QueueView({
                             connected={connected}
                             quote={quote}
                             changes={changes.data}
-                            onOpenChanges={() =>
+                            onOpenChanges={(path) => {
                               setTaskTabs((current) => ({
                                 ...current,
                                 [selected.id]: "changes",
-                              }))
-                            }
+                              }));
+                              setChangesFocus((current) =>
+                                focusFile(
+                                  current,
+                                  selected.id,
+                                  path,
+                                  changes.data?.files,
+                                ),
+                              );
+                            }}
                             onSend={(text, target) =>
                               send(selected.id, text, target, selected.id)
                             }
@@ -1673,6 +1686,7 @@ export function QueueView({
                             <ChangesPanel
                               taskId={selected.id}
                               changes={changes}
+                              focus={focusFor(changesFocus, selected.id)}
                               onQuote={(text) =>
                                 setQuote((current) => ({
                                   id: (current?.id ?? 0) + 1,

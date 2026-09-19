@@ -55,6 +55,40 @@ back before the fetch, still gets its row, marked `no diff to show` and left
 unclickable rather than opening an empty tab. Every other row opens the
 Changes tab.
 
+## Where the row lands
+
+A row is a `button` with an accessible label naming the file (`Show
+apps/desktop/src/queue.tsx in Changes`), so it is reached by tab and taken by
+Enter. Pressing it turns the detail page to the Changes tab and asks that tab
+for the file: `ChangesPanel` opens the file's section whatever its seen mark
+says, scrolls it into view and moves the keyboard onto it, so the reader lands
+on the file rather than on the top of the tab.
+
+The ask is an event, not a state. `focusFile` in
+`apps/desktop/src/changes-focus.ts` stamps every request with a rising id, so
+the same file pressed twice is two requests and the second lands as the first
+did; the panel answers an id it has not answered yet. A request carries the
+task it was made on, so one worker's row never opens a file on the next worker
+opened. A row marked `no diff to show` makes no request: `focusFile` returns
+the standing request untouched when the changes command does not report the
+path, which is the same rule the row draws itself by. `changes-focus.test.ts`
+covers the three, with no app rendered.
+
+A request that arrives before its file is drawn — the tab may still be
+fetching — is kept rather than dropped, and answered by the first render that
+has the file in it.
+
+### For a human to check in the app
+
+- [ ] Tab reaches a summary row in the thread and shows a focus ring on it.
+- [ ] Enter on that row switches to the Changes tab, with that file expanded
+      and scrolled to, and the keyboard on it.
+- [ ] Going back to the thread and pressing the same row again lands on the
+      file a second time.
+- [ ] A file already ticked as seen still opens when its row is pressed.
+- [ ] A row reading `no diff to show` takes neither tab nor Enter.
+- [ ] Quote in the opened file still prefills the composer.
+
 ## Order
 
 This touches `queue.tsx` alongside LOCAL-9b1540fd and LOCAL-192f8bfc, and

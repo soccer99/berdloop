@@ -939,6 +939,15 @@
   margin-top: 10px;
   overflow: hidden;
 }
+/* The file a thread row asked for: told apart while it is read. */
+.wf-file-chosen {
+  border-color: #5d7a4f;
+}
+/* An article, so the view's ring for buttons does not reach it. */
+.wf-file:focus-visible {
+  outline: 2px solid #8fc283;
+  outline-offset: 2px;
+}
 .wf-file-head {
   display: flex;
   align-items: center;
