@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import { Button } from "@mantine/core";
 import { Logo } from "@berdloop/ui";
 import type { Project } from "@berdloop/core";
@@ -16,6 +17,12 @@ interface WorkspaceHeaderProps {
   loopTicketId: string;
   loopProject?: Project;
   onWorkersChange: (workers: number) => void;
+  /** Go up to the organization overview. */
+  onOpenOrganization: () => void;
+  /** Go up to the project's tickets. Left out when no project is open. */
+  onOpenProject?: () => void;
+  /** Go up to the ticket list, from a task inside it. */
+  onOpenTickets?: () => void;
 }
 
 export function WorkspaceHeader({
@@ -29,6 +36,9 @@ export function WorkspaceHeader({
   loopTicketId,
   loopProject,
   onWorkersChange,
+  onOpenOrganization,
+  onOpenProject,
+  onOpenTickets,
 }: WorkspaceHeaderProps) {
   const isQueue = view === "loops" || view === "queue";
   const currentPage =
@@ -56,14 +66,15 @@ export function WorkspaceHeader({
         </Button>
       </div>
       <nav className="header-path" aria-label="Breadcrumbs">
-        <span className="breadcrumb">
-          {organizationName}
-          {(isQueue || view === "tools") && projectName
-            ? ` / ${projectName}`
-            : ""}{" "}
-          /
-        </span>{" "}
-        {currentPage}
+        <Crumb onClick={onOpenOrganization}>{organizationName}</Crumb>
+        {(isQueue || view === "tools") && projectName && (
+          <Crumb onClick={onOpenProject}>{projectName}</Crumb>
+        )}
+        {/* A task sits inside the ticket list, so the list is a step of its own. */}
+        {isQueue && selectedTaskId && (
+          <Crumb onClick={onOpenTickets}>Tickets</Crumb>
+        )}
+        <span aria-current="page">{currentPage}</span>
       </nav>
       <div className="header-controls">
         <LoopBar
@@ -74,5 +85,26 @@ export function WorkspaceHeader({
         />
       </div>
     </header>
+  );
+}
+
+/**
+ * One step of the trail. Every step but the last goes somewhere, so a person
+ * can walk back up without the sidebar.
+ */
+function Crumb({
+  onClick,
+  children,
+}: {
+  onClick?: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <>
+      <button type="button" className="breadcrumb" onClick={onClick}>
+        {children}
+      </button>
+      <span className="breadcrumb-separator">/</span>
+    </>
   );
 }

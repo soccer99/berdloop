@@ -24,6 +24,7 @@ import {
   IconPlayerPlay,
   IconPlayerStop,
   IconPlus,
+  IconRefresh,
   IconSearch,
   IconSparkles,
   IconTerminal2,
@@ -31,6 +32,7 @@ import {
 } from "@tabler/icons-react";
 import {
   addAgentTask,
+  requeueAgentTask,
   type AgentTask,
   type ExternalProvider,
   type Project,
@@ -53,7 +55,7 @@ import {
 import "./workflow.css";
 import type { Runtime } from "./workflow-runtime";
 import type { ConversationSnapshot } from "./conversation-routing";
-import { HumanRequestCard } from "./agent-chat";
+import { HumanRequestCard, ToolLine } from "./agent-chat";
 import { orderAgentTasks, orderTickets, routeSteering } from "./jev";
 import { shouldSendOnKey } from "./send-shortcut";
 import { ChangesPanel } from "./changes-panel";
@@ -218,41 +220,47 @@ function Log({
           No messages yet. Instructions and agent updates appear here.
         </p>
       )}
-      {messages.map((message) => (
-        <article
-          className={`wf-message wf-message-${message.role}`}
-          key={message.id}
-        >
-          <div>
-            <strong>
-              {message.role === "user"
-                ? "You"
-                : message.role === "agent"
-                  ? "Agent"
-                  : "Activity"}
-            </strong>
-            {message.at && (
-              <time dateTime={new Date(message.at).toISOString()}>
-                {new Date(message.at).toLocaleTimeString([], {
-                  hour: "2-digit",
-                  minute: "2-digit",
-                })}
-              </time>
-            )}
-            {message.target === "all-workers" && (
-              <span>To all ticket workers</span>
-            )}
-            {message.delivery && (
-              <span>
-                {message.delivery === "saved"
-                  ? "Saved · not sent"
-                  : message.delivery}
-              </span>
-            )}
-          </div>
-          <p>{message.text}</p>
-        </article>
-      ))}
+      {messages.map((message) =>
+        // A tool call is not something anybody said. It gets one line, so a
+        // run of twenty of them still reads as one stretch of work.
+        message.role === "tool" ? (
+          <ToolLine key={message.id} name={message.text} />
+        ) : (
+          <article
+            className={`wf-message wf-message-${message.role}`}
+            key={message.id}
+          >
+            <div>
+              <strong>
+                {message.role === "user"
+                  ? "You"
+                  : message.role === "agent"
+                    ? "Agent"
+                    : "Activity"}
+              </strong>
+              {message.at && (
+                <time dateTime={new Date(message.at).toISOString()}>
+                  {new Date(message.at).toLocaleTimeString([], {
+                    hour: "2-digit",
+                    minute: "2-digit",
+                  })}
+                </time>
+              )}
+              {message.target === "all-workers" && (
+                <span>To all ticket workers</span>
+              )}
+              {message.delivery && (
+                <span>
+                  {message.delivery === "saved"
+                    ? "Saved · not sent"
+                    : message.delivery}
+                </span>
+              )}
+            </div>
+            <p>{message.text}</p>
+          </article>
+        ),
+      )}
       {streaming && (
         <div className="wf-streaming">
           <span className="connection-dot" />
@@ -891,6 +899,14 @@ export function QueueView({
       list.splice(to, 0, moved);
       return { ...current, [key]: list } as TaskWorkspace;
     });
+  }
+  function requeue(task: AgentTask) {
+    try {
+      update((current) => requeueAgentTask(current, task.id));
+      setNotice(`${task.title} goes back to a fresh worker.`);
+    } catch (cause) {
+      setNotice(String(cause));
+    }
   }
   function remove() {
     if (!deleteTarget) return;
@@ -1534,6 +1550,23 @@ export function QueueView({
                             onClick={() => setTaskEditor(selected)}
                           >
                             Edit task & prompt
+                          </Button>
+                          <Button
+                            variant="subtle"
+                            size="xs"
+                            leftSection={<IconRefresh size={13} />}
+                            // Streaming is the one honest sign that a worker
+                            // is attached. Status is not: a task whose app was
+                            // killed still reads "running" with nobody on it.
+                            disabled={
+                              !ready ||
+                              selected.status === "complete" ||
+                              thread?.streaming
+                            }
+                            title="Hand this task to a fresh worker on the next loop tick"
+                            onClick={() => requeue(selected)}
+                          >
+                            Force re-run
                           </Button>
                         </div>
                         <p>

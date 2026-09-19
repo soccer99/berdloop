@@ -91,7 +91,8 @@ export function SessionsView() {
         if (payload.runId !== active) return active;
         const label =
           payload.kind === "tool"
-            ? `· ${payload.text || "tool"}`
+            ? // The ticker is one line per event; the arguments stay in the chat.
+              `· ${payload.text.split("\n")[0] || "tool"}`
             : payload.kind === "thinking"
               ? "· thinking"
               : payload.text;

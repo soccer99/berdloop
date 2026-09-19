@@ -218,6 +218,29 @@ export function setAgentTaskStatus(
   return { ...workspace, agentTasks };
 }
 
+/**
+ * Put one task back in the queue, whatever state it stopped in.
+ *
+ * A worker that died, was stopped, or could not be started at all leaves its
+ * task `blocked`, and the loop never hands out a blocked task again. This is
+ * the way back: `ready` once its dependencies are done, `queued` while they
+ * are not, which is the same rule the task editor applies when it saves.
+ */
+export function requeueAgentTask(
+  workspace: TaskWorkspace,
+  id: string,
+  now = new Date().toISOString(),
+): TaskWorkspace {
+  const target = workspace.agentTasks.find((task) => task.id === id);
+  if (!target) throw new Error("Agent task does not exist.");
+  const waiting = target.dependencyIds.some(
+    (dependencyId) =>
+      workspace.agentTasks.find((task) => task.id === dependencyId)?.status !==
+      "complete",
+  );
+  return setAgentTaskStatus(workspace, id, waiting ? "queued" : "ready", now);
+}
+
 export function canCompleteParent(
   workspace: TaskWorkspace,
   parentTaskId: string,

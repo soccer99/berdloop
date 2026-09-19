@@ -358,6 +358,9 @@ export function HumanRequestCard({
 }
 
 function Bubble({ message }: { message: ThreadMessage }) {
+  if (message.role === "tool") {
+    return <ToolLine name={message.text} />;
+  }
   if (message.role === "system") {
     return <p className="agent-chat-system">{message.text}</p>;
   }
@@ -374,12 +377,31 @@ function Bubble({ message }: { message: ThreadMessage }) {
   );
 }
 
-/** A tool line, for a caller that wants to show what an agent reached for. */
+/**
+ * A tool line, for a caller that wants to show what an agent reached for.
+ *
+ * The first line says the tool and what it was called with. Anything after it
+ * is the full input, which opens on a click: twenty tool calls stay a list,
+ * and any one of them can still be read.
+ */
 export function ToolLine({ name }: { name: string }) {
+  const newline = name.indexOf("\n");
+  const head = newline < 0 ? name : name.slice(0, newline);
+  const detail = newline < 0 ? "" : name.slice(newline + 1);
+  if (!detail) {
+    return (
+      <span className="agent-chat-tool">
+        <IconTool size={12} /> {head}
+      </span>
+    );
+  }
   return (
-    <span className="agent-chat-tool">
-      <IconTool size={12} /> {name}
-    </span>
+    <details className="agent-chat-tool">
+      <summary>
+        <IconTool size={12} /> {head}
+      </summary>
+      <pre>{detail}</pre>
+    </details>
   );
 }
 
