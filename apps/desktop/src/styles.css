@@ -1403,6 +1403,10 @@ main {
   padding-left: 8px;
 }
 .loop-bar-workers .mantine-NumberInput-input {
+  background: transparent;
+  /* The stepper sits in a 17px section over the right edge of the input. Pad
+   * past it so the right-aligned number does not touch the arrows. */
+  padding-right: 24px;
   color: #d7e1cf;
   font-size: 13px;
   text-align: right;
@@ -1415,6 +1419,7 @@ main {
 }
 .loop-bar .loop-bar-run {
   height: auto;
+  min-height: 0;
   width: 40px;
   flex: none;
   border-radius: 0;
