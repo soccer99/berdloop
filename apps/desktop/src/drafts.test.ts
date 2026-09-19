@@ -4,6 +4,7 @@ import {
   draftStorageKey,
   draftStoragePrefix,
   nextDraftRecord,
+  packText,
   parseDraftRecord,
   pruneDrafts,
   pruneDraftsForOwners,
@@ -13,6 +14,7 @@ import {
   resolveDraftValue,
   saveDraft,
   storedDraftKeys,
+  unpackText,
   type DraftOptions,
   type DraftStorage,
 } from "./drafts";
@@ -268,6 +270,36 @@ describe("what is never written", () => {
     composer.type("");
 
     expect(stored("ticket-agent:project-1")).toBeNull();
+  });
+});
+
+describe("packing a field whose empty value is an edit", () => {
+  test("an emptied field is stored, unlike a blank one", () => {
+    expect(nextDraftRecord(packText(""), { seed: packText("alice") })).toEqual({
+      text: '""',
+      base: '"alice"',
+    });
+    expect(nextDraftRecord("", { seed: "alice" })).toBeNull();
+  });
+
+  test("an untouched field is still not a draft", () => {
+    expect(
+      nextDraftRecord(packText("alice"), { seed: packText("alice") }),
+    ).toBeNull();
+  });
+
+  test("text round-trips through packing", () => {
+    for (const value of ["", "alice", 'a "quoted" name', "two\nlines", "123"]) {
+      expect(unpackText(packText(value))).toBe(value);
+    }
+  });
+
+  test("a draft stored before the field packed is kept as it stands", () => {
+    // Nothing packed writes these, so they can only be a draft that was
+    // already sitting in storage. Losing one is the bug this module exists
+    // to stop.
+    expect(unpackText("Half a typed thought")).toBe("Half a typed thought");
+    expect(unpackText("[1,2]")).toBe("[1,2]");
   });
 });
 

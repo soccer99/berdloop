@@ -145,6 +145,81 @@ describe("moveNewTicketDrafts", () => {
     ).toBe("Seeded criteria");
   });
 
+  test("an empty form does not wipe a draft already stored for the target", () => {
+    // The repro: the draft was typed for project-c, the modal was closed, and
+    // it reopened aimed at project-a with an empty form. Pointing the select
+    // back at project-c is how that draft is reached again, so the move must
+    // not write the empty fields over it on the way.
+    type("project-c", "title", "Add the paused state check");
+    type("project-c", "criteria", "A paused task does not advance.");
+
+    moveNewTicketDrafts(
+      "project-a",
+      "project-c",
+      [
+        { field: "title", text: "" },
+        { field: "reference", text: "" },
+        { field: "criteria", text: "" },
+      ],
+      settings,
+    );
+
+    expect(shown("project-c", "title")).toBe("Add the paused state check");
+    expect(shown("project-c", "criteria")).toBe(
+      "A paused task does not advance.",
+    );
+  });
+
+  test("a seeded field carrying only its seed leaves the target's draft", () => {
+    saveDraft(
+      newTicketDraftKey("project-c", "criteria"),
+      "A paused task does not advance.",
+      { ...settings, seed: "Seeded criteria" },
+    );
+
+    moveNewTicketDrafts(
+      "project-a",
+      "project-c",
+      [{ field: "criteria", text: "Seeded criteria", seed: "Seeded criteria" }],
+      settings,
+    );
+
+    expect(
+      readDraft(newTicketDraftKey("project-c", "criteria"), {
+        ...settings,
+        seed: "Seeded criteria",
+      }),
+    ).toBe("A paused task does not advance.");
+  });
+
+  test("text on screen still wins over a draft stored for the target", () => {
+    type("project-c", "title", "The older draft");
+
+    moveNewTicketDrafts(
+      "project-a",
+      "project-c",
+      [{ field: "title", text: "What is on screen now" }],
+      settings,
+    );
+
+    expect(shown("project-c", "title")).toBe("What is on screen now");
+  });
+
+  test("the project moved away from is emptied even when nothing is written", () => {
+    type("project-a", "title", "Left behind");
+    type("project-c", "title", "Add the paused state check");
+
+    moveNewTicketDrafts(
+      "project-a",
+      "project-c",
+      [{ field: "title", text: "" }],
+      settings,
+    );
+
+    expect(shown("project-a", "title")).toBe("");
+    expect(shown("project-c", "title")).toBe("Add the paused state check");
+  });
+
   test("aiming at the project already targeted leaves the draft alone", () => {
     type("project-a", "title", "Add the paused state check");
 

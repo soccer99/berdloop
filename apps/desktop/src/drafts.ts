@@ -46,7 +46,8 @@
  * than hand callers that trap, the hook does not accept it.
  *
  * Whitespace-only text is never written, and setting a value back to empty
- * removes the stored entry.
+ * removes the stored entry. A seeded field whose *empty* value is a real edit
+ * rather than an untouched box therefore has to travel packed: see `packText`.
  *
  * `pruneDrafts(liveKeys)` removes stored drafts whose subject is gone, and
  * `pruneDraftsForOwners(liveIds)` is how the app calls it: it keeps every
@@ -301,6 +302,43 @@ export function pruneDraftsForOwners(
     return owner === null || live.has(owner);
   });
   return pruneDrafts(keep, options);
+}
+
+/**
+ * Wraps a field's text so that emptying it is still a draft.
+ *
+ * Blank text is never stored and a missing record falls back to the seed, so
+ * for most fields clearing a seeded box is indistinguishable from never having
+ * touched it, and the saved value reads back on the next mount. That is the
+ * right answer for a title or an acceptance criterion, which cannot be empty
+ * and saved. It is wrong wherever empty means something: an empty Assigned
+ * agent means the next available worker, and an empty queued prompt means
+ * derive one from the title and the criteria.
+ *
+ * Pack such a field's seed and every value written to it, and unpack what
+ * comes back. The emptied field is then stored as `""`, which is neither blank
+ * nor equal to the packed seed, so it survives the remount.
+ *
+ *     const [packed, setPacked] = useDraft(key, { seed: packText(saved) })
+ *     const value = unpackText(packed)
+ *     // setPacked(packText(next))
+ */
+export function packText(value: string) {
+  return JSON.stringify(value);
+}
+
+/**
+ * The text a `packText` value holds. `packText` always writes a JSON string,
+ * so anything else was stored before its field started packing: that is an
+ * unsent draft too, and it is handed back as it stands rather than dropped.
+ */
+export function unpackText(value: string): string {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return typeof parsed === "string" ? parsed : value;
+  } catch {
+    return value;
+  }
 }
 
 interface DraftState {

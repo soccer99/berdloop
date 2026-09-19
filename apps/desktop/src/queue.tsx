@@ -48,7 +48,7 @@ import {
 import "./workflow.css";
 import type { Runtime } from "./workflow-runtime";
 import { HumanRequestCard } from "./agent-chat";
-import { useDraft } from "./drafts";
+import { packText, unpackText, useDraft } from "./drafts";
 import {
   appliedQuote,
   forgetQuote,
@@ -1887,18 +1887,24 @@ function TaskEditor({
     `${subject}:criteria`,
     { seed: task?.criteria ?? "" },
   );
-  const [instruction, setInstruction, clearInstruction] = useDraft(
+  const [packedInstruction, setInstruction, clearInstruction] = useDraft(
     `${subject}:instruction`,
-    { seed: prompt ?? (task ? `${task.title}\n\n${task.criteria}` : "") },
+    {
+      seed: packText(
+        prompt ?? (task ? `${task.title}\n\n${task.criteria}` : ""),
+      ),
+    },
   );
   const [packedDependencies, setDependencies, clearDependencies] = useDraft(
     `${subject}:dependencies`,
     { seed: packIds(task?.dependencyIds ?? []) },
   );
-  const [assignee, setAssignee, clearAssignee] = useDraft(
+  const [packedAssignee, setAssignee, clearAssignee] = useDraft(
     `${subject}:assignee`,
-    { seed: task?.assigneeId ?? "" },
+    { seed: packText(task?.assigneeId ?? "") },
   );
+  const instruction = unpackText(packedInstruction);
+  const assignee = unpackText(packedAssignee);
   const dependencies = unpackIds(packedDependencies);
   const [error, setError] = useState("");
   // Exclude descendants as dependencies so editing cannot introduce a cycle.
@@ -1953,7 +1959,9 @@ function TaskEditor({
           minRows={5}
           autosize
           value={instruction}
-          onChange={(event) => setInstruction(event.currentTarget.value)}
+          onChange={(event) =>
+            setInstruction(packText(event.currentTarget.value))
+          }
         />
         <Textarea
           mt="md"
@@ -1977,7 +1985,7 @@ function TaskEditor({
           label="Assigned agent"
           description="Optional. Leave empty for the next available worker."
           value={assignee}
-          onChange={(event) => setAssignee(event.currentTarget.value)}
+          onChange={(event) => setAssignee(packText(event.currentTarget.value))}
         />
         {error && (
           <p role="alert" className="task-error">
