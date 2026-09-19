@@ -6,6 +6,7 @@ import {
   Modal,
   MultiSelect,
   Select,
+  Tabs,
   Textarea,
   TextInput,
 } from "@mantine/core";
@@ -17,6 +18,7 @@ import {
   IconChevronRight,
   IconChevronUp,
   IconClock,
+  IconFileDiff,
   IconGitBranch,
   IconGripVertical,
   IconMessage,
@@ -67,6 +69,12 @@ import {
 import { orderAgentTasks, orderTickets, routeSteering } from "./jev";
 import { shouldSendOnKey } from "./send-shortcut";
 import { ChangesPanel } from "./changes-panel";
+import { useTaskChanges } from "./use-task-changes";
+import { focusFile, focusFor, type FocusRequest } from "./changes-focus";
+import { stripDiffBodies, stripToolBodies } from "./diff";
+import { ThreadFiles } from "./thread-files";
+import { threadRows } from "./thread-rows";
+import type { Changes } from "./changes-panel";
 import { openExternally } from "./external-link";
 
 interface QueueProps {
@@ -195,12 +203,31 @@ function Empty({
     </div>
   );
 }
+/**
+ * The one line a task row shows for a thread's latest message.
+ *
+ * It is held to the same rule as the thread: no diff an agent pasted into its
+ * words, and for a tool call the head line alone — the tool and the file it
+ * was called with — never the input that sits under it in the thread.
+ */
+function rowPreview(message?: ThreadMessage): string {
+  if (!message) return "";
+  if (message.role === "tool")
+    return stripToolBodies(message.text).split("\n")[0]!;
+  return stripDiffBodies(message.text);
+}
+
 function Log({
   messages,
   streaming,
+  changes,
+  onOpenChanges,
 }: {
   messages: ThreadMessage[];
   streaming?: boolean;
+  /** The task's changes, for the line counts on the file rows. */
+  changes?: Changes;
+  onOpenChanges?: (path: string) => void;
 }) {
   const scroll = useRef<HTMLDivElement>(null);
   const follow = useRef(true);
@@ -208,6 +235,16 @@ function Log({
     if (follow.current && scroll.current)
       scroll.current.scrollTop = scroll.current.scrollHeight;
   }, [messages, streaming]);
+  // A diff is read in the Changes tab, never here, so whatever an agent pasted
+  // into its own text is taken out before the thread draws it and the files it
+  // named become one row each. A message left with neither words nor files is
+  // not drawn at all.
+  //
+  // A tool call is the other door a change comes through, and the usual one:
+  // a harness sends prose in an agent message and a file change as a tool
+  // call. One that wrote a file becomes that file's row; every other keeps
+  // its line, bar the change bodies in its input.
+  const shown = threadRows(messages);
   return (
     <div
       className="wf-log"
@@ -223,16 +260,27 @@ function Log({
             el.scrollHeight - el.scrollTop - el.clientHeight < 60;
       }}
     >
-      {messages.length === 0 && (
+      {shown.length === 0 && (
         <p className="wf-log-empty">
           No messages yet. Instructions and agent updates appear here.
         </p>
       )}
-      {messages.map((message) =>
-        // A tool call is not something anybody said. It gets one line, so a
-        // run of twenty of them still reads as one stretch of work.
+      {shown.map((message) =>
+        // A tool call is not something anybody said, so it gets no name and
+        // no time above it. One that wrote a file is that file's row; every
+        // other gets one line, so a run of twenty still reads as one stretch
+        // of work.
         message.role === "tool" ? (
-          <ToolLine key={message.id} name={message.text} />
+          message.files.length ? (
+            <ThreadFiles
+              key={message.id}
+              files={message.files}
+              changes={changes}
+              onOpen={onOpenChanges}
+            />
+          ) : (
+            <ToolLine key={message.id} name={message.text} />
+          )
         ) : (
           <article
             className={`wf-message wf-message-${message.role}`}
@@ -265,7 +313,12 @@ function Log({
                 </span>
               )}
             </div>
-            <p>{message.text}</p>
+            {message.text && <p>{message.text}</p>}
+            <ThreadFiles
+              files={message.files}
+              changes={changes}
+              onOpen={onOpenChanges}
+            />
           </article>
         ),
       )}
@@ -458,6 +511,8 @@ function AgentConversation({
   inlineSend,
   quote,
   onQuoteApplied,
+  changes,
+  onOpenChanges,
 }: {
   /** Subject of the unsent text, passed straight to the composer. */
   draftKey: string;
@@ -473,10 +528,18 @@ function AgentConversation({
   quote?: Quote;
   /** Told once the composer has taken the quote in, so it can be dropped. */
   onQuoteApplied?: () => void;
+  /** The task's changes, for the line counts on the file rows. */
+  changes?: Changes;
+  onOpenChanges?: (path: string) => void;
 }) {
   return (
     <>
-      <Log messages={messages} streaming={streaming} />
+      <Log
+        messages={messages}
+        streaming={streaming}
+        changes={changes}
+        onOpenChanges={onOpenChanges}
+      />
       <Composer
         draftKey={draftKey}
         label={label}
@@ -669,6 +732,13 @@ export function QueueView({
   // to undefined: counting from what is there now would hand out id 1 twice.
   const quotes = useRef(0);
   const onQuoteApplied = useCallback(() => setQuote(undefined), []);
+  // Keyed by task id, so a tab choice never leaks from the task it was made
+  // on to the next one opened.
+  const [taskTabs, setTaskTabs] = useState<Record<string, string>>({});
+  // The file a thread row last asked the Changes tab for. It carries its task
+  // and a rising id, so a request never leaks to the next task opened and the
+  // same file asked for twice lands on it twice.
+  const [changesFocus, setChangesFocus] = useState<FocusRequest>();
   const [editTicket, setEditTicket] = useState(false);
   const [taskEditor, setTaskEditor] = useState<AgentTask | "new" | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<{
@@ -696,6 +766,18 @@ export function QueueView({
   );
   const selected = tasks.find((item) => item.id === selectedTaskId);
   const thread = selected ? runtime?.threads[selected.id] : undefined;
+  const taskTab = selected ? (taskTabs[selected.id] ?? "thread") : "thread";
+  // The detail page owns the changes, so the tab label's count, the thread and
+  // the Changes tab read one value, and a shut tab does not follow the agent.
+  const changes = useTaskChanges({
+    projectId: ticket?.projectId ?? "",
+    ticket: ticket?.ticket ?? "",
+    taskId: selected?.id ?? "",
+    enabled: !!thread?.worktree,
+    streaming: thread?.streaming,
+    messageCount: thread?.messages.length ?? 0,
+    visible: taskTab === "changes",
+  });
   const mergeQueue: MergeEntry[] = ticket
     ? (runtime?.mergeQueues?.[ticket.id] ??
       tasks
@@ -1081,7 +1163,8 @@ export function QueueView({
               <RowStats thread={currentThread} now={now} />
             </small>
             <p>
-              {currentThread?.messages.at(-1)?.text ??
+              {/* The same text as the thread, so no diff leaks through here either. */}
+              {rowPreview(currentThread?.messages.at(-1)) ||
                 (item.status === "queued" && item.dependencyIds.length
                   ? "Waiting for dependencies"
                   : queued
@@ -1634,66 +1717,122 @@ export function QueueView({
                           </small>
                         )}
                       </div>
-                      {thread?.worktree && (
-                        <ChangesPanel
-                          projectId={ticket.projectId}
-                          ticket={ticket.ticket}
-                          taskId={selected.id}
-                          streaming={thread.streaming}
-                          messageCount={thread.messages.length}
-                          onQuote={(text) => {
-                            quotes.current += 1;
-                            setQuote({ id: quotes.current, text });
-                          }}
-                        />
-                      )}
-                      <div className="wf-thread-subheading">
-                        <IconMessage size={14} />
-                        Agent thread
-                        {thread?.streaming && (
-                          <Badge size="xs" color="lime" variant="light">
-                            Live
-                          </Badge>
-                        )}
-                      </div>
-                      {(runtime?.requests[selected.id] ?? []).map((request) => (
-                        <HumanRequestCard
-                          key={request.id}
-                          request={request}
-                          onAnswer={(id, approved, text) =>
-                            runtime!.answer(
-                              ticket.projectId,
-                              id,
-                              approved,
-                              text,
-                            )
-                          }
-                        />
-                      ))}
-                      <AgentConversation
-                        draftKey={`worker:${selected.id}`}
-                        messages={threadMessages(
-                          thread?.messages,
-                          savedMessages[selected.id],
-                        )}
-                        streaming={thread?.streaming}
-                        label="Message task agent"
-                        placeholder={
-                          taskActivity(
-                            selected,
-                            thread,
-                            landed.has(selected.id),
-                          ) === "queued"
-                            ? "Add context for the agent that picks up this task…"
-                            : "Give this agent new context or direction…"
+                      <Tabs
+                        // Keeping the hidden panel in the tree holds its scroll
+                        // and its seen marks; the fetching is the page's, not
+                        // the panel's, so nothing depends on this.
+                        keepMountedMode="display-none"
+                        value={taskTab}
+                        onChange={(value) =>
+                          setTaskTabs((current) => ({
+                            ...current,
+                            [selected.id]: value ?? "thread",
+                          }))
                         }
-                        connected={connected}
-                        quote={quote}
-                        onQuoteApplied={onQuoteApplied}
-                        onSend={(text, target) =>
-                          send(selected.id, text, target, selected.id)
-                        }
-                      />
+                      >
+                        <Tabs.List>
+                          <Tabs.Tab
+                            value="thread"
+                            leftSection={<IconMessage size={14} />}
+                            rightSection={
+                              thread?.streaming ? (
+                                <Badge size="xs" color="lime" variant="light">
+                                  Live
+                                </Badge>
+                              ) : undefined
+                            }
+                          >
+                            Agent thread
+                          </Tabs.Tab>
+                          <Tabs.Tab
+                            value="changes"
+                            leftSection={<IconFileDiff size={14} />}
+                            rightSection={
+                              changes.data === undefined ? undefined : (
+                                <Badge size="xs" color="gray" variant="light">
+                                  {changes.data.files.length}
+                                </Badge>
+                              )
+                            }
+                          >
+                            Changes
+                          </Tabs.Tab>
+                        </Tabs.List>
+                        <Tabs.Panel value="thread" pt="sm">
+                          {(runtime?.requests[selected.id] ?? []).map(
+                            (request) => (
+                              <HumanRequestCard
+                                key={request.id}
+                                request={request}
+                                onAnswer={(id, approved, text) =>
+                                  runtime!.answer(
+                                    ticket.projectId,
+                                    id,
+                                    approved,
+                                    text,
+                                  )
+                                }
+                              />
+                            ),
+                          )}
+                          <AgentConversation
+                            draftKey={`worker:${selected.id}`}
+                            messages={threadMessages(
+                              thread?.messages,
+                              savedMessages[selected.id],
+                            )}
+                            streaming={thread?.streaming}
+                            label="Message task agent"
+                            placeholder={
+                              taskActivity(
+                                selected,
+                                thread,
+                                landed.has(selected.id),
+                              ) === "queued"
+                                ? "Add context for the agent that picks up this task…"
+                                : "Give this agent new context or direction…"
+                            }
+                            connected={connected}
+                            quote={quote}
+                            onQuoteApplied={onQuoteApplied}
+                            changes={changes.data}
+                            onOpenChanges={(path) => {
+                              setTaskTabs((current) => ({
+                                ...current,
+                                [selected.id]: "changes",
+                              }));
+                              setChangesFocus((current) =>
+                                focusFile(
+                                  current,
+                                  selected.id,
+                                  path,
+                                  changes.data?.files,
+                                ),
+                              );
+                            }}
+                            onSend={(text, target) =>
+                              send(selected.id, text, target, selected.id)
+                            }
+                          />
+                        </Tabs.Panel>
+                        <Tabs.Panel value="changes" pt="sm">
+                          {thread?.worktree ? (
+                            <ChangesPanel
+                              taskId={selected.id}
+                              changes={changes}
+                              focus={focusFor(changesFocus, selected.id)}
+                              onQuote={(text) => {
+                                quotes.current += 1;
+                                setQuote({ id: quotes.current, text });
+                              }}
+                            />
+                          ) : (
+                            <small>
+                              No worktree yet, so there is nothing to diff.
+                            </small>
+                          )}
+                        </Tabs.Panel>
+                      </Tabs>
                       <div className="wf-thread-footer">
                         <small>
                           {thread?.worktree ??

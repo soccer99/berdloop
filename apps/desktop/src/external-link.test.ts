@@ -17,7 +17,10 @@ let tauri = false;
  * outside a Tauri window anyway.
  */
 const core = await import("@tauri-apps/api/core");
-mock.module("@tauri-apps/api/core", () => ({ ...core, isTauri: () => tauri }));
+mock.module("@tauri-apps/api/core", () => ({
+  ...core,
+  isTauri: () => tauri,
+}));
 mock.module("@tauri-apps/plugin-opener", () => ({
   openUrl: async (url: string) => {
     opened.push(url);

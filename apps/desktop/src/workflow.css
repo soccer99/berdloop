@@ -948,6 +948,15 @@
   margin-top: 10px;
   overflow: hidden;
 }
+/* The file a thread row asked for: told apart while it is read. */
+.wf-file-chosen {
+  border-color: #5d7a4f;
+}
+/* An article, so the view's ring for buttons does not reach it. */
+.wf-file:focus-visible {
+  outline: 2px solid #8fc283;
+  outline-offset: 2px;
+}
 .wf-file-head {
   display: flex;
   align-items: center;
@@ -1026,4 +1035,60 @@
 }
 .wf-diff tr.diff-picked td {
   box-shadow: inset 0 0 0 1px #6d935b;
+}
+
+/* One line per file an agent changed, standing where its diff used to be. */
+.wf-touched {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+}
+.wf-touched-row {
+  margin: 0;
+}
+.wf-touched-line {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  width: 100%;
+  padding: 2px 6px;
+  border: 0;
+  border-radius: 4px;
+  background: none;
+  text-align: left;
+  color: #9fb491;
+  font:
+    11px ui-monospace,
+    monospace;
+}
+button.wf-touched-line {
+  cursor: pointer;
+}
+button.wf-touched-line:hover {
+  background: #1e2a1d;
+  color: #c6d6b7;
+}
+.wf-touched-verb {
+  color: #7f9672;
+}
+.wf-touched-path {
+  overflow-wrap: anywhere;
+  color: #b5c6a7;
+}
+.wf-touched-counts {
+  display: flex;
+  gap: 6px;
+  margin-left: auto;
+  white-space: nowrap;
+}
+.wf-touched-added {
+  color: #8fc283;
+}
+.wf-touched-removed {
+  color: #cd9591;
+}
+.wf-touched-none {
+  margin-left: auto;
+  white-space: nowrap;
+  color: #718b63;
 }

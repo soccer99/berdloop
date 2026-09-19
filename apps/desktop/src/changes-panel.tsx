@@ -1,7 +1,9 @@
 import { Fragment, useEffect, useRef, useState } from "react";
 import { Button, Checkbox, Loader, SegmentedControl } from "@mantine/core";
-import { invoke, isTauri } from "@tauri-apps/api/core";
+import { isTauri } from "@tauri-apps/api/core";
 import { parseDiff, quoteLine, type DiffLine } from "./diff";
+import type { ChangesBase, TaskChanges } from "./use-task-changes";
+import type { FileFocus } from "./changes-focus";
 
 export interface ChangedFile {
   path: string;
@@ -16,7 +18,6 @@ export interface Changes {
   files: ChangedFile[];
 }
 
-type Base = "ticket" | "commit" | "turn";
 const bases = [
   { value: "ticket", label: "Ticket branch" },
   { value: "commit", label: "Last commit" },
@@ -44,64 +45,55 @@ function writeSeen(taskId: string, seen: Record<string, string>) {
   }
 }
 
+/**
+ * The Changes tab's body. The fetching lives in the worker detail page above
+ * it (see `useTaskChanges`), so the thread reads the same value and a shut tab
+ * never polls.
+ */
 export function ChangesPanel({
-  projectId,
-  ticket,
   taskId,
-  streaming,
-  messageCount,
+  changes,
+  focus,
   onQuote,
 }: {
-  projectId: string;
-  /** Ticket key, for example ENG-42. */
-  ticket: string;
   taskId: string;
-  streaming?: boolean;
-  messageCount: number;
+  changes: TaskChanges;
+  /**
+   * A file a row in the thread asked for. The id is what makes it an event
+   * rather than a state, so asking twice for the same file works the second
+   * time as well as the first.
+   */
+  focus?: FileFocus;
   onQuote: (text: string) => void;
 }) {
-  const [base, setBase] = useState<Base>("ticket");
-  const [changes, setChanges] = useState<Changes>();
-  const [error, setError] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [nonce, setNonce] = useState(0);
+  const { base, setBase, data, error, loading, refresh } = changes;
   const [picked, setPicked] = useState("");
+  // The one file a thread row asked for: shown open whatever its seen mark
+  // says, until another is asked for or this one is marked seen by hand.
+  const [opened, setOpened] = useState("");
   const [seen, setSeen] = useState(() => readSeen(taskId));
-  const was = useRef(false);
-  const native = isTauri();
+  const sections = useRef<Record<string, HTMLElement | null>>({});
+  const answered = useRef(0);
 
-  // Reload once the agent stops writing, not while it writes.
+  // A row is clicked in the thread: open that file, and put it under both the
+  // eye and the keyboard. The request is kept rather than dropped when the
+  // file is not drawn yet, because the tab it arrives on may still be
+  // fetching; the next render with the file in it answers it.
   useEffect(() => {
-    if (was.current && !streaming) setNonce((current) => current + 1);
-    was.current = !!streaming;
-  }, [streaming]);
+    if (!focus || focus.id === answered.current) return;
+    const section = sections.current[focus.path];
+    if (!section) return;
+    answered.current = focus.id;
+    setOpened(focus.path);
+    section.scrollIntoView({ block: "start", behavior: "smooth" });
+    section.focus({ preventScroll: true });
+  }, [focus, data]);
 
-  useEffect(() => {
-    if (!native) return;
-    let live = true;
-    setLoading(true);
-    invoke<Changes>("git_task_changes", { projectId, ticket, taskId, base })
-      .then((result) => {
-        if (!live) return;
-        setChanges(result);
-        setError("");
-      })
-      .catch((cause) => {
-        if (!live) return;
-        setChanges(undefined);
-        setError(String(cause));
-      })
-      .finally(() => {
-        if (live) setLoading(false);
-      });
-    return () => {
-      live = false;
-    };
-  }, [native, projectId, ticket, taskId, base, messageCount, nonce]);
-
-  if (!native) return null;
+  if (!isTauri()) return null;
 
   function mark(file: ChangedFile, checked: boolean) {
+    // Marking a file seen by hand closes it, even when a row opened it.
+    if (checked) setOpened((current) => (current === file.path ? "" : current));
     setSeen((current) => {
       const next = { ...current };
       if (checked) next[file.path] = file.fingerprint;
@@ -123,30 +115,38 @@ export function ChangesPanel({
           size="xs"
           data={bases}
           value={base}
-          onChange={(value) => setBase(value as Base)}
+          onChange={(value) => setBase(value as ChangesBase)}
         />
-        <Button
-          variant="subtle"
-          size="xs"
-          onClick={() => setNonce((current) => current + 1)}
-        >
+        <Button variant="subtle" size="xs" onClick={refresh}>
           Refresh
         </Button>
         {loading && <Loader size="xs" />}
-        {changes && <small>{changes.baseLabel}</small>}
+        {data && <small>{data.baseLabel}</small>}
       </div>
       {error && (
         <p className="task-error" role="alert">
           {error}
         </p>
       )}
-      {!error && !loading && changes?.files.length === 0 && (
+      {!error && !loading && data?.files.length === 0 && (
         <small>No changes against this base yet.</small>
       )}
-      {changes?.files.map((file) => {
+      {data?.files.map((file) => {
+        const chosen = opened === file.path;
         const read = seen[file.path] === file.fingerprint;
+        // A seen file is folded away, unless a thread row asked for this one.
+        const open = !read || chosen;
         return (
-          <article className="wf-file" key={file.path}>
+          <article
+            className={`wf-file${chosen ? " wf-file-chosen" : ""}`}
+            key={file.path}
+            // Focused from the thread, so a keyboard lands on the file it
+            // asked for and reads it out, not on the page it came from.
+            tabIndex={-1}
+            ref={(element) => {
+              sections.current[file.path] = element;
+            }}
+          >
             <div className="wf-file-head">
               <button
                 className="wf-file-path"
@@ -167,7 +167,7 @@ export function ChangesPanel({
                 onChange={(event) => mark(file, event.currentTarget.checked)}
               />
             </div>
-            {!read && (
+            {open && (
               <table className="wf-diff">
                 <tbody>
                   {parseDiff(file.diff).map((hunk, hunkIndex) => (

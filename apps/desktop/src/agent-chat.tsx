@@ -19,6 +19,9 @@ import {
   type AgentThreadView,
   type ThreadMessage,
 } from "./workflow-ui";
+import { ThreadFiles } from "./thread-files";
+import { threadRows, type ThreadRow } from "./thread-rows";
+import type { Changes } from "./changes-panel";
 import { useDraft } from "./drafts";
 import { shouldSendOnKey } from "./send-shortcut";
 
@@ -71,6 +74,8 @@ export interface AgentChatProps {
   onSend: (text: string) => void | Promise<void>;
   onStop?: () => void;
   placeholder?: string;
+  /** The task's changes, for the line counts on the file rows. */
+  changes?: Changes;
 }
 
 /** Said next to every send control, so the keystroke is discoverable. */
@@ -98,6 +103,7 @@ export function AgentChat({
   onSend,
   onStop,
   placeholder,
+  changes,
 }: AgentChatProps) {
   const [draft, setDraft, , clearSentDraft] = useDraft(draftKey);
   const [busy, setBusy] = useState(false);
@@ -209,8 +215,8 @@ export function AgentChat({
               "Nothing said yet. Ask for a change, or steer the work."}
           </p>
         )}
-        {messages.map((entry) => (
-          <Bubble key={entry.id} message={entry} />
+        {threadRows(messages).map((entry) => (
+          <Bubble key={entry.id} message={entry} changes={changes} />
         ))}
         {streaming && !messages.length && <Loader size="xs" />}
         <div ref={tail} />
@@ -374,16 +380,40 @@ export function HumanRequestCard({
   );
 }
 
-function Bubble({ message }: { message: ThreadMessage }) {
+function Bubble({
+  message,
+  changes,
+}: {
+  message: ThreadRow;
+  changes?: Changes;
+}) {
+  // Diffs are read in the Changes tab. This chat shows what was said about a
+  // change, and one row for each file the agent wrote; `threadRows` has
+  // already taken the hunks out, taken the change bodies out of a tool's
+  // input, and worked out which rows belong here.
+  const { text, files } = message;
   if (message.role === "tool") {
-    return <ToolLine name={message.text} />;
+    // A tool call is not something anybody said. One that wrote a file is
+    // that file's row; every other gets one line, so a run of twenty of them
+    // still reads as one stretch of work.
+    return files.length ? (
+      <ThreadFiles files={files} changes={changes} />
+    ) : (
+      <ToolLine name={text} />
+    );
   }
   if (message.role === "system") {
-    return <p className="agent-chat-system">{message.text}</p>;
+    return (
+      <>
+        {text && <p className="agent-chat-system">{text}</p>}
+        <ThreadFiles files={files} changes={changes} />
+      </>
+    );
   }
   return (
     <div className={`agent-chat-message ${message.role}`}>
-      <p>{message.text}</p>
+      {text && <p>{text}</p>}
+      <ThreadFiles files={files} changes={changes} />
       {message.delivery && message.role === "user" && (
         <small className={message.delivery === "pending" ? "warn" : "muted"}>
           {DELIVERY_NOTE[message.delivery]}
