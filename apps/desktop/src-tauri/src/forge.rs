@@ -442,10 +442,13 @@ impl Forge for Http {
                     "closed" | "locked" => "CLOSED",
                     _ => "OPEN",
                 };
-                let mergeable = if got["detailed_merge_status"].as_str() == Some("mergeable") {
-                    "CLEAN"
-                } else {
-                    "BLOCKED"
+                // A conflict is told apart from every other reason a merge
+                // request will not merge, because it is the only one work on
+                // the branch itself can clear.
+                let mergeable = match got["detailed_merge_status"].as_str().unwrap_or("") {
+                    "mergeable" => "CLEAN",
+                    "conflict" => "DIRTY",
+                    _ => "BLOCKED",
                 };
                 Ok(json!({
                     "state": state,
