@@ -277,3 +277,83 @@ function diffRunEnd(lines: string[], at: number): number {
   }
   return end;
 }
+
+/**
+ * The tool inputs that are the change itself, rather than words about it.
+ *
+ * An `Edit` call carries the file's text before and after in `old_string` and
+ * `new_string`; a `Write` call carries the whole new file in `content`. Those
+ * are the before and after of a change under another name, so they belong in
+ * the Changes tab exactly as a `@@` hunk does.
+ */
+const CHANGE_KEYS = new Set([
+  "old_string",
+  "new_string",
+  "old_str",
+  "new_str",
+  "content",
+  "new_content",
+  "new_source",
+]);
+
+/** What stands in a change body's place, so the line still says it had one. */
+const ELSEWHERE = "… read it in the Changes tab";
+
+/** A field of a pretty-printed JSON object, one per line: key, then value. */
+const JSON_FIELD = /^(\s*)"([^"]+)"(\s*:\s*)(.*)$/;
+/** A complete JSON string value, and whether a comma closes the field. */
+const JSON_STRING = /^"((?:[^"\\]|\\.)*)"(,?)$/;
+
+/**
+ * A tool line with the change bodies taken out of its input.
+ *
+ * The native side gives a tool message as its head line — `Edit · some/path`
+ * — and the whole call input pretty-printed under it, which the thread opens
+ * on a click. That input is not prose: for an `Edit` it is the file's text
+ * before and after, and for a `Bash` it may be a patch inside the command.
+ * Either way it is a diff arriving by a second door, so it is taken out here
+ * on the way to the thread, the same as one pasted into an agent's own words.
+ *
+ * The head line is left alone: it names the tool and the file, which is the
+ * one compact line this ticket wants. Every other field of the input — a
+ * description, a pattern, a path — is left exactly as it came.
+ */
+export function stripToolBodies(text: string): string {
+  const newline = text.indexOf("\n");
+  if (newline < 0) return text;
+  const head = text.slice(0, newline);
+  const detail = text
+    .slice(newline + 1)
+    .split("\n")
+    .map(stripField)
+    .join("\n");
+  // A harness that sends a raw command rather than JSON has no fields to
+  // read, so the body is swept for a diff the same way an agent's prose is.
+  return `${head}\n${stripDiffBodies(detail)}`;
+}
+
+/** One line of a pretty-printed input, with any change body taken out of it. */
+function stripField(line: string): string {
+  const field = JSON_FIELD.exec(line);
+  if (!field) return line;
+  const indent = field[1]!;
+  const key = field[2]!;
+  const colon = field[3]!;
+  const value = field[4]!;
+  if (!value.startsWith('"')) return line;
+  const quoted = JSON_STRING.exec(value);
+  // An input clamped for length ends mid-string. A change key is still a
+  // change key, so it goes; anything else is left rather than guessed at.
+  if (!quoted)
+    return CHANGE_KEYS.has(key)
+      ? `${indent}"${key}"${colon}${JSON.stringify(ELSEWHERE)}`
+      : line;
+  const comma = quoted[2]!;
+  if (CHANGE_KEYS.has(key))
+    return `${indent}"${key}"${colon}${JSON.stringify(ELSEWHERE)}${comma}`;
+  // Not a change field, but a command can still carry a patch inside it.
+  const written = JSON.parse(`"${quoted[1]!}"`) as string;
+  const kept = stripDiffBodies(written);
+  if (kept === written) return line;
+  return `${indent}"${key}"${colon}${JSON.stringify(kept)}${comma}`;
+}

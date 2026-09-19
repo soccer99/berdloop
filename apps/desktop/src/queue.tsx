@@ -63,7 +63,7 @@ import { shouldSendOnKey } from "./send-shortcut";
 import { ChangesPanel } from "./changes-panel";
 import { useTaskChanges } from "./use-task-changes";
 import { focusFile, focusFor, type FocusRequest } from "./changes-focus";
-import { diffFiles, stripDiffBodies } from "./diff";
+import { diffFiles, stripDiffBodies, stripToolBodies } from "./diff";
 import { ThreadFiles } from "./thread-files";
 import type { Changes } from "./changes-panel";
 import { openExternally } from "./external-link";
@@ -194,6 +194,20 @@ function Empty({
     </div>
   );
 }
+/**
+ * The one line a task row shows for a thread's latest message.
+ *
+ * It is held to the same rule as the thread: no diff an agent pasted into its
+ * words, and for a tool call the head line alone — the tool and the file it
+ * was called with — never the input that sits under it in the thread.
+ */
+function rowPreview(message?: ThreadMessage): string {
+  if (!message) return "";
+  if (message.role === "tool")
+    return stripToolBodies(message.text).split("\n")[0]!;
+  return stripDiffBodies(message.text);
+}
+
 function Log({
   messages,
   streaming,
@@ -216,12 +230,20 @@ function Log({
   // into its own text is taken out before the thread draws it and the files it
   // named become one row each. A message that was nothing but a diff keeps its
   // rows; one with neither words nor files left is not drawn at all.
+  //
+  // A tool call is the other door a change comes through: its input holds an
+  // Edit's before and after, or a patch inside a Bash command. It is drawn as
+  // a tool line rather than prose, so it keeps its whole text bar the bodies.
   const shown = messages
-    .map((message) => ({
-      ...message,
-      text: stripDiffBodies(message.text),
-      files: diffFiles(message.text),
-    }))
+    .map((message) =>
+      message.role === "tool"
+        ? { ...message, text: stripToolBodies(message.text), files: [] }
+        : {
+            ...message,
+            text: stripDiffBodies(message.text),
+            files: diffFiles(message.text),
+          },
+    )
     .filter((message) => message.text || message.files.length);
   return (
     <div
@@ -1091,7 +1113,7 @@ export function QueueView({
             </small>
             <p>
               {/* The same text as the thread, so no diff leaks through here either. */}
-              {stripDiffBodies(currentThread?.messages.at(-1)?.text ?? "") ||
+              {rowPreview(currentThread?.messages.at(-1)) ||
                 (item.status === "queued" && item.dependencyIds.length
                   ? "Waiting for dependencies"
                   : queued

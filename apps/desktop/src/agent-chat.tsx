@@ -19,7 +19,7 @@ import {
   type AgentThreadView,
   type ThreadMessage,
 } from "./workflow-ui";
-import { diffFiles, stripDiffBodies } from "./diff";
+import { diffFiles, stripDiffBodies, stripToolBodies } from "./diff";
 import { ThreadFiles } from "./thread-files";
 import type { Changes } from "./changes-panel";
 import { shouldSendOnKey } from "./send-shortcut";
@@ -370,9 +370,11 @@ function Bubble({
   message: ThreadMessage;
   changes?: Changes;
 }) {
-  // A tool call is not something anybody said. It gets one line, not prose.
+  // A tool call is not something anybody said. It gets one line, never prose,
+  // and the input that opens under it has its change bodies taken out first:
+  // an Edit's before and after is a diff by another name.
   if (message.role === "tool") {
-    return <ToolLine name={message.text} />;
+    return <ToolLine name={stripToolBodies(message.text)} />;
   }
   // Diffs are read in the Changes tab. This chat shows what was said about a
   // change, so a hunk pasted into the text goes before the bubble is drawn,
