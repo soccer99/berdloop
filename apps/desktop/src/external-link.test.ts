@@ -1,5 +1,4 @@
 import { describe, expect, mock, test } from "bun:test";
-import * as core from "@tauri-apps/api/core";
 
 /**
  * One markup, two builds. A link to a pull request has to reach the person's
@@ -9,10 +8,17 @@ import * as core from "@tauri-apps/api/core";
 const opened: string[] = [];
 let tauri = false;
 
-// A module mock is global to the whole test run, so this one has to keep
-// every other export of the module: a test file loaded after this one still
-// needs the real invoke.
-mock.module("@tauri-apps/api/core", () => ({ ...core, isTauri: () => tauri }));
+/**
+ * `mock.module` replaces the module for the whole test process, not just
+ * this file, and the order test files run in differs between macOS and
+ * Linux. Keep every other export, or whichever file happens to load
+ * `invoke` after this one fails to find it.
+ */
+const core = await import("@tauri-apps/api/core");
+mock.module("@tauri-apps/api/core", () => ({
+  ...core,
+  isTauri: () => tauri,
+}));
 mock.module("@tauri-apps/plugin-opener", () => ({
   openUrl: async (url: string) => {
     opened.push(url);

@@ -1133,6 +1133,15 @@ export default function App() {
             onWorkersChange={(workers) =>
               loopProject && saveProjectRecord({ ...loopProject, workers })
             }
+            onOpenOrganization={() => {
+              setProjectId("");
+              setSelectedId("");
+              setView("organization");
+            }}
+            onOpenProject={
+              project ? () => selectProject(project.id) : undefined
+            }
+            onOpenTickets={() => setSelectedId("")}
           />
         }
         navigation={

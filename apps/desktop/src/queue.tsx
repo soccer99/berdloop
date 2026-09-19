@@ -26,6 +26,7 @@ import {
   IconPlayerPlay,
   IconPlayerStop,
   IconPlus,
+  IconRefresh,
   IconSearch,
   IconSparkles,
   IconTerminal2,
@@ -33,6 +34,7 @@ import {
 } from "@tabler/icons-react";
 import {
   addAgentTask,
+  requeueAgentTask,
   type AgentTask,
   type ExternalProvider,
   type Project,
@@ -55,8 +57,9 @@ import {
 import "./workflow.css";
 import type { Runtime } from "./workflow-runtime";
 import type { ConversationSnapshot } from "./conversation-routing";
-import { HumanRequestCard } from "./agent-chat";
+import { HumanRequestCard, ToolLine } from "./agent-chat";
 import { orderAgentTasks, orderTickets, routeSteering } from "./jev";
+import { shouldSendOnKey } from "./send-shortcut";
 import { ChangesPanel } from "./changes-panel";
 import { useTaskChanges } from "./use-task-changes";
 import { focusFile, focusFor, type FocusRequest } from "./changes-focus";
@@ -240,46 +243,52 @@ function Log({
           No messages yet. Instructions and agent updates appear here.
         </p>
       )}
-      {shown.map((message) => (
-        <article
-          className={`wf-message wf-message-${message.role}`}
-          key={message.id}
-        >
-          <div>
-            <strong>
-              {message.role === "user"
-                ? "You"
-                : message.role === "agent"
-                  ? "Agent"
-                  : "Activity"}
-            </strong>
-            {message.at && (
-              <time dateTime={new Date(message.at).toISOString()}>
-                {new Date(message.at).toLocaleTimeString([], {
-                  hour: "2-digit",
-                  minute: "2-digit",
-                })}
-              </time>
-            )}
-            {message.target === "all-workers" && (
-              <span>To all ticket workers</span>
-            )}
-            {message.delivery && (
-              <span>
-                {message.delivery === "saved"
-                  ? "Saved · not sent"
-                  : message.delivery}
-              </span>
-            )}
-          </div>
-          {message.text && <p>{message.text}</p>}
-          <ThreadFiles
-            files={message.files}
-            changes={changes}
-            onOpen={onOpenChanges}
-          />
-        </article>
-      ))}
+      {shown.map((message) =>
+        // A tool call is not something anybody said. It gets one line, so a
+        // run of twenty of them still reads as one stretch of work.
+        message.role === "tool" ? (
+          <ToolLine key={message.id} name={message.text} />
+        ) : (
+          <article
+            className={`wf-message wf-message-${message.role}`}
+            key={message.id}
+          >
+            <div>
+              <strong>
+                {message.role === "user"
+                  ? "You"
+                  : message.role === "agent"
+                    ? "Agent"
+                    : "Activity"}
+              </strong>
+              {message.at && (
+                <time dateTime={new Date(message.at).toISOString()}>
+                  {new Date(message.at).toLocaleTimeString([], {
+                    hour: "2-digit",
+                    minute: "2-digit",
+                  })}
+                </time>
+              )}
+              {message.target === "all-workers" && (
+                <span>To all ticket workers</span>
+              )}
+              {message.delivery && (
+                <span>
+                  {message.delivery === "saved"
+                    ? "Saved · not sent"
+                    : message.delivery}
+                </span>
+              )}
+            </div>
+            {message.text && <p>{message.text}</p>}
+            <ThreadFiles
+              files={message.files}
+              changes={changes}
+              onOpen={onOpenChanges}
+            />
+          </article>
+        ),
+      )}
       {streaming && (
         <div className="wf-streaming">
           <span className="connection-dot" />
@@ -288,6 +297,11 @@ function Log({
       )}
     </div>
   );
+}
+
+/** Said on every send control, so the keystroke is discoverable. */
+function sendHint(connected: boolean) {
+  return `${connected ? "Send instruction" : "Save instruction"} · Cmd+Enter / Ctrl+Enter`;
 }
 
 function Composer({
@@ -331,6 +345,7 @@ function Composer({
     <Button
       size="xs"
       type="submit"
+      title={sendHint(connected)}
       disabled={!text.trim()}
       loading={busy}
       rightSection={<IconArrowUp size={14} />}
@@ -366,11 +381,30 @@ function Composer({
           maxRows={7}
           value={text}
           onChange={(event) => setText(event.currentTarget.value)}
+          onKeyDown={(event) => {
+            if (
+              !shouldSendOnKey(
+                {
+                  key: event.key,
+                  metaKey: event.metaKey,
+                  ctrlKey: event.ctrlKey,
+                  shiftKey: event.shiftKey,
+                  isComposing: event.nativeEvent.isComposing,
+                },
+                { text, busy },
+              )
+            )
+              return;
+            event.preventDefault();
+            // Through the form, so onSubmit's error handling, busy flag and
+            // clear-on-success run exactly as they do for the send button.
+            event.currentTarget.form?.requestSubmit();
+          }}
         />
         {inlineSend && (
           <ActionIcon
-            aria-label={connected ? "Send instruction" : "Save instruction"}
-            title={connected ? "Send instruction" : "Save instruction"}
+            aria-label={sendHint(connected)}
+            title={sendHint(connected)}
             size="sm"
             type="submit"
             disabled={!text.trim()}
@@ -394,8 +428,8 @@ function Composer({
           ) : (
             <small>
               {connected
-                ? "Instructions stay with this thread."
-                : "Saved locally until agents are connected."}
+                ? "Instructions stay with this thread. Cmd+Enter (Ctrl+Enter) sends."
+                : "Saved locally until agents are connected. Cmd+Enter (Ctrl+Enter) saves."}
             </small>
           )}
           {!inlineSend && sendButton}
@@ -922,6 +956,14 @@ export function QueueView({
       list.splice(to, 0, moved);
       return { ...current, [key]: list } as TaskWorkspace;
     });
+  }
+  function requeue(task: AgentTask) {
+    try {
+      update((current) => requeueAgentTask(current, task.id));
+      setNotice(`${task.title} goes back to a fresh worker.`);
+    } catch (cause) {
+      setNotice(String(cause));
+    }
   }
   function remove() {
     if (!deleteTarget) return;
@@ -1566,6 +1608,23 @@ export function QueueView({
                             onClick={() => setTaskEditor(selected)}
                           >
                             Edit task & prompt
+                          </Button>
+                          <Button
+                            variant="subtle"
+                            size="xs"
+                            leftSection={<IconRefresh size={13} />}
+                            // Streaming is the one honest sign that a worker
+                            // is attached. Status is not: a task whose app was
+                            // killed still reads "running" with nobody on it.
+                            disabled={
+                              !ready ||
+                              selected.status === "complete" ||
+                              thread?.streaming
+                            }
+                            title="Hand this task to a fresh worker on the next loop tick"
+                            onClick={() => requeue(selected)}
+                          >
+                            Force re-run
                           </Button>
                         </div>
                         <p>
