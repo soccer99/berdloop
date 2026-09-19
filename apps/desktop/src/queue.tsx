@@ -611,9 +611,9 @@ export function QueueView({
     setStep("work");
     setNotice("");
   }, [selectedTicketId]);
-  useEffect(() => {
-    setSearch("");
-  }, [projectId]);
+  // No effect clears the search box when the project changes. The draft is
+  // keyed by the project, so another project's filter is never shown, and
+  // blanking it here would write an empty value over the draft being read.
   useEffect(() => {
     if (selectedTaskId && window.matchMedia("(max-width: 800px)").matches) {
       threadPanel.current?.scrollIntoView({ block: "start" });
