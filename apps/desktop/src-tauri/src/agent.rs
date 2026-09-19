@@ -214,24 +214,88 @@ fn text_of(value: &serde_json::Value, key: &str) -> Option<String> {
     value.get(key).and_then(|v| v.as_str()).map(str::to_string)
 }
 
+/// The keys worth putting on the line itself, most telling first. A Bash call
+/// says its command, a file tool says its file; anything else falls back to the
+/// whole input, so a tool this list has never heard of still says something.
+const TOOL_SUMMARY_KEYS: [&str; 8] = [
+    "command",
+    "file_path",
+    "path",
+    "pattern",
+    "url",
+    "query",
+    "description",
+    "prompt",
+];
+
 /// The keys a file-changing tool call uses to name the file it wrote.
 ///
-/// Claude Code's Edit, MultiEdit and Write carry `file_path`, NotebookEdit
-/// carries `notebook_path`, and Codex's patch items carry `path`. A tool that
-/// names no file — a Bash line that writes by itself — leaves no row, because
-/// nothing here can tell what it touched.
+/// Narrower than `TOOL_SUMMARY_KEYS` on purpose: that list says what to show
+/// on any tool line, while this one is only read from a tool already known to
+/// write, so a Read or a Grep never claims to have changed the file it named.
 const TOOL_PATH_KEYS: [&str; 3] = ["file_path", "notebook_path", "path"];
+
+/// A tool line: "Name · what it was called with", then the full input below.
+///
+/// The window shows the first line and opens the rest on a click, so a run of
+/// tool calls still reads as a list while any one of them can be read in full.
+fn tool_label(name: &str, input: Option<&serde_json::Value>) -> String {
+    let Some(input) = input.filter(|value| {
+        value.as_object().is_some_and(|fields| !fields.is_empty())
+            || (!value.is_null() && !value.is_object())
+    }) else {
+        return name.to_string();
+    };
+    let detail = serde_json::to_string_pretty(input).unwrap_or_default();
+    let summary = TOOL_SUMMARY_KEYS
+        .iter()
+        .find_map(|key| text_of(input, key))
+        .unwrap_or_else(|| detail.clone());
+    format!(
+        "{name} · {}\n{}",
+        one_line(&summary, 120),
+        clamp(&detail, 4000)
+    )
+}
+
+/// The first line of something, short enough to sit in a list.
+fn one_line(text: &str, limit: usize) -> String {
+    let first = text.lines().next().unwrap_or("").trim();
+    let rest = text.lines().count() > 1;
+    let mut out = clamp(first, limit);
+    if rest && !out.ends_with('…') {
+        out.push('…');
+    }
+    out
+}
+
+fn clamp(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    text.chars().take(limit).collect::<String>() + "…"
+}
+
+/// What a tool line is classified by: its name and arguments, never the full
+/// input, so a command that merely mentions "edit" is not counted as one.
+fn tool_head(label: &str) -> &str {
+    label.split('\n').next().unwrap_or(label)
+}
 
 /// The files one line of a CLI's JSON stream says the agent wrote.
 ///
-/// Read apart from `parse_line` because it answers a different question. That
-/// one builds the chunks the chat displays; this one records which files were
-/// written, in the order the agent wrote them. The thread shows those as one
-/// row each, which is the only place a change is named now that the diff
-/// itself is read in the Changes tab.
+/// A harness only ever sends prose in an agent message: a file change arrives
+/// as a tool call. So this is where a change to a file is found, and the
+/// thread draws each one as that file's summary row instead of a plain tool
+/// line, now that the diff itself is read in the Changes tab.
 ///
-/// Each entry is the tool's name and the path it wrote.
-fn edited_paths(harness: &str, line: &serde_json::Value) -> Vec<(String, String)> {
+/// Read apart from `parse_line` because it answers a different question: that
+/// one builds what the chat displays, this one says which of those tool lines
+/// wrote a file. Each entry carries the position of its tool call among this
+/// line's tool calls, which is what pairs it back to the right line. Position
+/// is used rather than the label because `is_edit` reads a label by substring,
+/// and a Bash command that merely mentions writing would take the wrong path.
+fn edited_paths(harness: &str, line: &serde_json::Value) -> Vec<(usize, String)> {
     let mut out = Vec::new();
     if harness == "Codex" || harness == "codex" {
         if line.get("type").and_then(|v| v.as_str()) != Some("item.completed") {
@@ -245,15 +309,11 @@ fn edited_paths(harness: &str, line: &serde_json::Value) -> Vec<(String, String)
             .or_else(|| item.get("type"))
             .and_then(|v| v.as_str())
             .unwrap_or("item");
+        // One item is one tool line, so anything found here belongs to it.
         if !is_edit(kind) {
             return out;
         }
-        // Codex names one file on the item, or several under `changes`, keyed
-        // by path. Both are read, so a patch over two files is two rows.
-        out.extend(tool_paths(item).into_iter().map(|p| (kind.to_string(), p)));
-        if let Some(changes) = item.get("changes").and_then(|v| v.as_object()) {
-            out.extend(changes.keys().map(|p| (kind.to_string(), p.clone())));
-        }
+        out.extend(tool_path(item).map(|path| (0, path)));
         return out;
     }
     if line.get("type").and_then(|v| v.as_str()) != Some("assistant") {
@@ -263,10 +323,13 @@ fn edited_paths(harness: &str, line: &serde_json::Value) -> Vec<(String, String)
         .get("message")
         .and_then(|m| m.get("content"))
         .and_then(|c| c.as_array());
+    let mut at = 0;
     for block in blocks.into_iter().flatten() {
         if block.get("type").and_then(|v| v.as_str()) != Some("tool_use") {
             continue;
         }
+        let here = at;
+        at += 1;
         let Some(name) = text_of(block, "name") else {
             continue;
         };
@@ -276,19 +339,20 @@ fn edited_paths(harness: &str, line: &serde_json::Value) -> Vec<(String, String)
         let Some(input) = block.get("input") else {
             continue;
         };
-        out.extend(tool_paths(input).into_iter().map(|p| (name.clone(), p)));
+        out.extend(tool_path(input).map(|path| (here, path)));
     }
     out
 }
 
-/// The first path a tool's arguments name, if they name one at all.
-fn tool_paths(input: &serde_json::Value) -> Vec<String> {
+/// The file a writing tool's arguments name, if they name one at all.
+///
+/// A tool that names none — a Bash line that writes by itself — leaves no
+/// row, because nothing here can tell what it touched.
+fn tool_path(input: &serde_json::Value) -> Option<String> {
     TOOL_PATH_KEYS
         .iter()
         .find_map(|key| text_of(input, key))
         .filter(|path| !path.trim().is_empty())
-        .into_iter()
-        .collect()
 }
 
 /// Turn one line of a CLI's JSON stream into zero or more display chunks.
@@ -320,7 +384,8 @@ fn parse_claude(line: &serde_json::Value, out: &mut Vec<(&'static str, String)>)
                     }
                     Some("thinking") => out.push(("thinking", String::new())),
                     Some("tool_use") => {
-                        out.push(("tool", text_of(block, "name").unwrap_or_default()));
+                        let name = text_of(block, "name").unwrap_or_default();
+                        out.push(("tool", tool_label(&name, block.get("input"))));
                     }
                     _ => {}
                 }
@@ -351,7 +416,15 @@ fn parse_codex(line: &serde_json::Value, out: &mut Vec<(&'static str, String)>) 
                 }
                 "reasoning" => out.push(("thinking", String::new())),
                 _ => {
-                    let label = text_of(item, "command").unwrap_or_else(|| kind.to_string());
+                    let label = match text_of(item, "command") {
+                        Some(command) => format!(
+                            "{} · {}\n{}",
+                            kind,
+                            one_line(&command, 120),
+                            clamp(&command, 4000)
+                        ),
+                        None => kind.to_string(),
+                    };
                     out.push(("tool", label));
                 }
             }
@@ -732,6 +805,9 @@ pub fn agent_start(
                         thread.session_id = Some(session.clone());
                         thread.revision += 1;
                     }
+                    // Which tool line of this stream line we are on, so a
+                    // path found above lands on the call that wrote it.
+                    let mut tool_at = 0;
                     for (kind, text) in &chunks {
                         match *kind {
                             "text" if !text.is_empty() => thread.append("agent", text.clone()),
@@ -744,19 +820,30 @@ pub fn agent_start(
                                 },
                             ),
                             "tool" => {
-                                thread.activity = activity_of(text).into();
-                                if is_edit(text) {
+                                let head = tool_head(text);
+                                thread.activity = activity_of(head).into();
+                                if is_edit(head) {
                                     thread.edits += 1;
                                 }
-                                thread.revision += 1;
+                                let path = written
+                                    .iter()
+                                    .find(|(at, _)| *at == tool_at)
+                                    .map(|(_, path)| path.clone());
+                                tool_at += 1;
+                                // The thread showed only the agent's prose, so
+                                // a worker that spent ten minutes running
+                                // commands looked idle. Its own role keeps it
+                                // out of the prose and lets the window draw it
+                                // as a tool line, or, where the call wrote a
+                                // file, as that file's one summary row.
+                                if text.is_empty() {
+                                    thread.revision += 1;
+                                } else {
+                                    thread.append_tool(text.clone(), path);
+                                }
                             }
                             _ => {}
                         }
-                    }
-                    // After the line's own text, so a file row sits under the
-                    // words the agent wrote before reaching for the tool.
-                    for (tool, path) in &written {
-                        thread.touched(tool, path.clone());
                     }
                     publish(&app_handle, thread);
                 }
@@ -1423,7 +1510,7 @@ mod tests {
         assert!(!is_edit("merge-wait"));
     }
 
-    fn written(harness: &str, raw: &str) -> Vec<(String, String)> {
+    fn written(harness: &str, raw: &str) -> Vec<(usize, String)> {
         edited_paths(harness, &serde_json::from_str(raw).unwrap())
     }
 
@@ -1436,10 +1523,7 @@ mod tests {
                     {"type":"tool_use","name":"Edit","input":{"file_path":"src/a.ts"}},
                     {"type":"tool_use","name":"Edit","input":{"file_path":"src/b.ts"}}]}}"#,
             ),
-            [
-                ("Edit".to_string(), "src/a.ts".to_string()),
-                ("Edit".to_string(), "src/b.ts".to_string()),
-            ]
+            [(0, "src/a.ts".to_string()), (1, "src/b.ts".to_string())]
         );
     }
 
@@ -1455,6 +1539,24 @@ mod tests {
     }
 
     #[test]
+    fn an_edit_is_placed_by_its_tool_call_and_not_by_its_turn_to_write() {
+        // The Bash line mentions writing, so anything pairing a path to a tool
+        // line by name alone would hand it the Edit's file. The position says
+        // otherwise: the third tool call is the one that wrote.
+        assert_eq!(
+            written(
+                "Claude Code",
+                r#"{"type":"assistant","message":{"content":[
+                    {"type":"text","text":"on it"},
+                    {"type":"tool_use","name":"Bash","input":{"command":"bun run write:docs"}},
+                    {"type":"tool_use","name":"Read","input":{"file_path":"src/a.ts"}},
+                    {"type":"tool_use","name":"Edit","input":{"file_path":"src/b.ts"}}]}}"#,
+            ),
+            [(2, "src/b.ts".to_string())]
+        );
+    }
+
+    #[test]
     fn a_notebook_edit_names_its_own_key() {
         assert_eq!(
             written(
@@ -1462,19 +1564,18 @@ mod tests {
                 r#"{"type":"assistant","message":{"content":[
                     {"type":"tool_use","name":"NotebookEdit","input":{"notebook_path":"run.ipynb"}}]}}"#,
             ),
-            [("NotebookEdit".to_string(), "run.ipynb".to_string())]
+            [(0, "run.ipynb".to_string())]
         );
     }
 
     #[test]
-    fn a_codex_patch_names_every_file_it_changed() {
+    fn a_codex_patch_names_the_file_it_changed() {
         assert_eq!(
             written(
                 "Codex",
-                r#"{"type":"item.completed","item":{"item_type":"file_change",
-                    "changes":{"src/a.ts":{"kind":"update"}}}}"#,
+                r#"{"type":"item.completed","item":{"item_type":"file_change","path":"src/a.ts"}}"#,
             ),
-            [("file_change".to_string(), "src/a.ts".to_string())]
+            [(0, "src/a.ts".to_string())]
         );
     }
 
@@ -1488,6 +1589,22 @@ mod tests {
         );
         assert_eq!(session.as_deref(), Some("s1"));
         assert_eq!(out, [("text", "hello".into()), ("tool", "Bash".into())]);
+    }
+
+    #[test]
+    fn a_tool_line_carries_its_arguments() {
+        let (out, _) = chunks(
+            "Claude Code",
+            r#"{"type":"assistant","message":{"content":[
+                {"type":"tool_use","name":"Bash","input":{"command":"git status\ngit log","description":"look"}}]}}"#,
+        );
+        let (kind, label) = &out[0];
+        assert_eq!(*kind, "tool");
+        // The line itself says the command; the rest is the whole input, below.
+        assert_eq!(label.lines().next().unwrap(), "Bash · git status…");
+        assert!(label.contains("\"description\": \"look\""));
+        // Classification reads the line, never the arguments under it.
+        assert!(!is_edit(tool_head(label)));
     }
 
     #[test]
@@ -1521,7 +1638,7 @@ mod tests {
             "Codex",
             r#"{"type":"item.completed","item":{"item_type":"command_execution","command":"ls -la"}}"#,
         );
-        assert_eq!(out, [("tool", "ls -la".into())]);
+        assert_eq!(out, [("tool", "command_execution · ls -la\nls -la".into())]);
     }
     #[cfg(unix)]
     fn live_fixture(program: &str, delivery: &str) -> Live {

@@ -1,10 +1,17 @@
 import { describe, expect, test } from "bun:test";
-import { lastSaid, threadRows } from "./thread-rows";
+import { threadRows } from "./thread-rows";
 import type { ThreadMessage } from "./workflow-ui";
 
-/** A tool call the harness reported, as the thread stores it. */
+/**
+ * A tool call the harness reported, as the thread stores it.
+ *
+ * The text is the line the native side builds: the tool, what it was called
+ * with, and its whole input under that. A `path` is set only where the call
+ * wrote a file.
+ */
 function tool(id: string, name: string, path?: string): ThreadMessage {
-  return { id, role: "tool", text: name, path };
+  const label = path ? `${name} · ${path}` : name;
+  return { id, role: "tool", text: `${label}\n{\n  "run": 1\n}`, path };
 }
 
 function said(id: string, text: string): ThreadMessage {
@@ -23,9 +30,16 @@ describe("threadRows", () => {
     ]);
   });
 
-  test("a tool message carries no words into the thread", () => {
+  test("a call that wrote a file is its row and not also a tool line", () => {
     const [row] = threadRows([tool("1", "Write", "src/new.ts")]);
     expect(row?.text).toBe("");
+    expect(row?.files).toEqual([{ path: "src/new.ts", status: "M" }]);
+  });
+
+  test("a call that wrote nothing keeps its line and gains no row", () => {
+    const [row] = threadRows([tool("1", "Bash")]);
+    expect(row?.text.split("\n")[0]).toBe("Bash");
+    expect(row?.files).toEqual([]);
   });
 
   test("a file edited again keeps its first row and gains no second", () => {
@@ -35,10 +49,6 @@ describe("threadRows", () => {
       tool("3", "Edit", "src/b.ts"),
     ]);
     expect(rows.map((row) => row.id)).toEqual(["1", "3"]);
-  });
-
-  test("a tool that named no file leaves nothing behind", () => {
-    expect(threadRows([tool("1", "Bash")])).toEqual([]);
   });
 
   test("words are kept, and a diff pasted into them becomes a row", () => {
@@ -82,22 +92,5 @@ describe("threadRows", () => {
     const rows = threadRows([said("1", "I read the file and it looked fine.")]);
     expect(rows[0]?.text).toBe("I read the file and it looked fine.");
     expect(rows[0]?.files).toEqual([]);
-  });
-});
-
-describe("lastSaid", () => {
-  test("reads back past the file rows to the last words", () => {
-    expect(
-      lastSaid([
-        said("1", "Editing both files now."),
-        tool("2", "Edit", "src/a.ts"),
-        tool("3", "Edit", "src/b.ts"),
-      ]),
-    ).toBe("Editing both files now.");
-  });
-
-  test("a thread that has only touched files says nothing", () => {
-    expect(lastSaid([tool("1", "Edit", "src/a.ts")])).toBe("");
-    expect(lastSaid()).toBe("");
   });
 });

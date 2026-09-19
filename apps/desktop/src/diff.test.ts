@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { diffFiles, parseDiff, quoteLine, stripDiffBodies } from "./diff";
+import {
+  diffFiles,
+  parseDiff,
+  quoteLine,
+  stripDiffBodies,
+  stripToolBodies,
+} from "./diff";
 
 describe("parseDiff", () => {
   test("numbers the lines of every hunk", () => {
@@ -339,5 +345,111 @@ describe("diffFiles", () => {
 
   test("a bullet list that looks like prose names no file", () => {
     expect(diffFiles("- one\n- two\n--- a rule\n")).toEqual([]);
+  });
+});
+
+/** A tool line as the native side builds it: head, then the whole input. */
+function toolLine(name: string, input: unknown): string {
+  const detail = JSON.stringify(input, null, 2);
+  return `${name} · ${String((input as { file_path?: string }).file_path ?? "")}\n${detail}`;
+}
+
+describe("stripToolBodies", () => {
+  test("an Edit's before and after never reach the thread", () => {
+    const line = toolLine("Edit", {
+      file_path: "apps/desktop/src/queue.tsx",
+      old_string: "function Log({\n  messages,\n}) {\n  return null;\n}",
+      new_string:
+        "function Log({\n  messages,\n  changes,\n}) {\n  return null;\n}",
+    });
+    const out = stripToolBodies(line);
+    // The head line still says what was called, and on which file.
+    expect(out.split("\n")[0]).toBe("Edit · apps/desktop/src/queue.tsx");
+    // Neither side of the change is in it, under any escaping.
+    expect(out).not.toContain("function Log");
+    expect(out).not.toContain("return null");
+    expect(out).not.toContain("changes,");
+    // The file path is kept: it is what the line is about.
+    expect(out).toContain('"file_path": "apps/desktop/src/queue.tsx"');
+    expect(out).toContain('"old_string": "… read it in the Changes tab"');
+    expect(out).toContain('"new_string": "… read it in the Changes tab"');
+  });
+
+  test("a Write's whole new file goes the same way", () => {
+    const out = stripToolBodies(
+      toolLine("Write", {
+        file_path: "src/new.ts",
+        content: "export const answer = 42;\n",
+      }),
+    );
+    expect(out).not.toContain("answer = 42");
+    expect(out).toContain('"content": "… read it in the Changes tab"');
+  });
+
+  test("a MultiEdit's nested edits go too", () => {
+    const out = stripToolBodies(
+      toolLine("MultiEdit", {
+        file_path: "src/foo.ts",
+        edits: [{ old_string: "const a = 1;", new_string: "const a = 2;" }],
+      }),
+    );
+    expect(out).not.toContain("const a =");
+  });
+
+  test("an input clamped mid-string still loses its change body", () => {
+    // The native side cuts the pretty-printed input at 4000 characters, so
+    // the last field can end without its closing quote.
+    const line = 'Edit · src/foo.ts\n{\n  "old_string": "const secret = 1;…';
+    const out = stripToolBodies(line);
+    expect(out).not.toContain("const secret");
+    expect(out).toContain('"old_string": "… read it in the Changes tab"');
+  });
+
+  test("a patch carried inside a Bash command is taken out of it", () => {
+    const out = stripToolBodies(
+      toolLine("Bash", {
+        command:
+          "git apply <<'EOF'\n--- a/src/foo.ts\n+++ b/src/foo.ts\n@@ -1 +1 @@\n-old();\n+new();\nEOF",
+        description: "apply the patch",
+      }),
+    );
+    expect(out).not.toContain("@@ -1 +1 @@");
+    expect(out).not.toContain("-old();");
+    expect(out).not.toContain("+new();");
+    // What was said around it survives, and so does the other field.
+    expect(out).toContain("git apply");
+    expect(out).toContain('"description": "apply the patch"');
+  });
+
+  test("a raw command, not JSON, is swept the same way", () => {
+    // Codex sends the command itself under the head line, not an object.
+    const out = stripToolBodies(
+      [
+        "command_execution · git apply",
+        "git apply <<'EOF'",
+        "--- a/src/foo.ts",
+        "+++ b/src/foo.ts",
+        "@@ -1 +1 @@",
+        "-old();",
+        "+new();",
+        "EOF",
+      ].join("\n"),
+    );
+    expect(out).not.toContain("@@");
+    expect(out).not.toContain("+new();");
+    expect(out).toContain("git apply");
+  });
+
+  test("a tool line with no input is left exactly as it came", () => {
+    expect(stripToolBodies("Bash")).toBe("Bash");
+  });
+
+  test("the fields that are not a change body are untouched", () => {
+    const line = toolLine("Grep", {
+      pattern: "old_string",
+      path: "apps/desktop/src",
+      description: "find the callers",
+    });
+    expect(stripToolBodies(line)).toBe(line);
   });
 });

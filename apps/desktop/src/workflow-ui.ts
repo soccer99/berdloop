@@ -4,11 +4,16 @@ import type { AgentActivity, AgentTask, Task } from "@berdloop/core";
 export type { AgentActivity };
 export interface ThreadMessage {
   id: string;
-  /** A `tool` message is a file the agent wrote, not something said. */
+  /** `tool` is one thing the agent reached for, drawn as a line, not prose. */
   role: "user" | "agent" | "system" | "tool";
-  /** What was said, or on a `tool` message the name of the tool. */
+  /** What was said, or on a `tool` message the tool and its arguments. */
   text: string;
-  /** The file a `tool` message's tool call wrote. */
+  /**
+   * The file a `tool` message's tool call wrote, when it wrote one.
+   *
+   * Such a call is drawn as that file's summary row rather than a tool line,
+   * because a change to a file is what the thread is meant to show.
+   */
   path?: string;
   at?: string | number;
   delivery?: "saved" | "pending" | "delivered" | "applied" | "failed";

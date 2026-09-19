@@ -213,21 +213,21 @@ impl Conversation {
         self.revision += 1;
     }
 
-    /// Record a file the agent wrote, in its place in the thread.
+    /// A tool line, and the file it wrote where it wrote one.
     ///
-    /// A diff is read in the Changes tab now, so a file change reaches the
-    /// chat as this and nothing else: the tool that wrote it and the path it
-    /// wrote, which the thread draws as one row. The counts are not here
-    /// because the repository knows them and the tool call does not.
-    pub fn touched(&mut self, tool: &str, path: String) {
+    /// A diff is read in the Changes tab now, so the path is how a change to
+    /// a file reaches the chat at all: the thread draws such a call as that
+    /// file's one summary row rather than a plain tool line. The counts are
+    /// not here because the repository knows them and a tool call does not.
+    pub fn append_tool(&mut self, text: String, path: Option<String>) {
         self.messages.push(Message {
             id: uuid::Uuid::new_v4().to_string(),
             role: "tool".into(),
-            text: tool.into(),
+            text,
             at: crate::human::now_ms(),
             delivery: None,
             target: None,
-            path: Some(path),
+            path,
         });
         self.trim();
         self.revision += 1;
